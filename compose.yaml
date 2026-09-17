@@ -1,0 +1,34 @@
+# Homelab deployment for proxy-auto-rotate-forwarder.
+# The pool file is mounted read-only; override the path or values via
+# environment as needed. Secrets live only in configs/proxies.txt (git-ignored).
+services:
+  proxy:
+    build:
+      context: .
+      args:
+        VERSION: dev
+    container_name: proxy
+    ports:
+      - "8080:8080"       # forward proxy (HTTP absolute-URI + CONNECT)
+      - "127.0.0.1:8081:8081" # admin (healthz, status) — localhost only
+    environment:
+      LISTEN_ADDR: ":8080"
+      # Bind inside the container on all interfaces; the ports mapping below
+      # still makes the admin listener reachable from the host localhost only.
+      ADMIN_ADDR: ":8081"
+      PROXIES_FILE: /app/configs/proxies.txt
+      ROTATE_MODE: round-robin
+      MAX_RETRIES: "3"
+      COOLDOWN_BASE: 1s
+      COOLDOWN_MAX: 10m
+      CONNECT_TIMEOUT: 10s
+      LOG_LEVEL: info
+    volumes:
+      - ./configs/proxies.txt:/app/configs/proxies.txt:ro
+    healthcheck:
+      test: ["CMD", "/app/proxy-auto-rotate-forwarder", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped

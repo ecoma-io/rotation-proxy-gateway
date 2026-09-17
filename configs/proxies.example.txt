@@ -1,0 +1,12 @@
+# One upstream proxy per line. Blank lines and #-comments are ignored.
+# Formats:
+#   http://host:port
+#   http://user:pass@host:port
+#   https://host:port            (TLS to the upstream proxy)
+#   socks5://host:port
+#   socks5://user:pass@host:port
+#
+# Copy to configs/proxies.txt (gitignored - it carries credentials) and
+# reload at runtime with SIGHUP; cooldown state is kept for unchanged URLs.
+http://proxy1.example.com:8080
+socks5://user:pass@proxy2.example.com:1080
