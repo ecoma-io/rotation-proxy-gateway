@@ -14,8 +14,8 @@ import (
 // EndRotation or MarkStale returns it to serving; in-flight requests picked
 // before BeginRotation keep running and drain on their own.
 func (p *Proxy) BeginRotation(phase RotationState) {
+	p.rotating.Store(true)
 	p.mu.Lock()
-	p.rotating = true
 	p.rotationState = phase
 	p.nextRetryIn = 0
 	p.mu.Unlock()
@@ -25,8 +25,11 @@ func (p *Proxy) BeginRotation(phase RotationState) {
 // verifying) of a rotation already begun. It is a no-op once the route left
 // the rotating set, so a stale procedure can never resurrect the flag.
 func (p *Proxy) SetRotationPhase(phase RotationState) {
+	if !p.rotating.Load() {
+		return
+	}
 	p.mu.Lock()
-	if p.rotating {
+	if p.rotating.Load() {
 		p.rotationState = phase
 	}
 	p.mu.Unlock()
@@ -38,13 +41,13 @@ func (p *Proxy) SetRotationPhase(phase RotationState) {
 // left to MarkRotated.
 func (p *Proxy) EndRotation(ip string, at time.Time) {
 	p.mu.Lock()
-	p.rotating = false
 	p.rotationState = RotationIdle
 	p.lastIP = ip
 	p.lastRotationAt = at
 	p.nextRetryIn = 0
 	p.consecutiveSameIP = 0
 	p.mu.Unlock()
+	p.rotating.Store(false)
 }
 
 // MarkStale returns a route to serving after a rotation that did not change
@@ -53,12 +56,12 @@ func (p *Proxy) EndRotation(ip string, at time.Time) {
 // the next rotation attempt.
 func (pl *Pool) MarkStale(p *Proxy, nextRetryIn time.Duration, consecutiveSameIP int) {
 	p.mu.Lock()
-	p.rotating = false
 	p.rotationState = RotationStale
 	p.nextRetryIn = nextRetryIn
 	p.consecutiveSameIP = consecutiveSameIP
-	p.usedSeq = pl.nextSeq()
 	p.mu.Unlock()
+	p.usedSeq.Store(pl.nextSeq())
+	p.rotating.Store(false)
 }
 
 // MarkRotated clears dial-failure health accumulated against the previous
@@ -68,9 +71,9 @@ func (pl *Pool) MarkStale(p *Proxy, nextRetryIn time.Duration, consecutiveSameIP
 func (p *Proxy) MarkRotated() {
 	p.mu.Lock()
 	p.consecutiveFailures = 0
-	p.cooldownUntil = time.Time{}
 	p.lastDialError = ""
 	p.mu.Unlock()
+	p.cooldownUntil.Store(0)
 }
 
 // AbandonRotation returns a route to serving when its rotation procedure is
@@ -87,9 +90,9 @@ func (p *Proxy) AbandonRotation() {
 			p.rotationState = RotationIdle
 		}
 	}
-	p.rotating = false
 	p.nextRetryIn = 0
 	p.mu.Unlock()
+	p.rotating.Store(false)
 }
 
 // LastIPs returns the last verified egress IP of every manual route other than

@@ -34,22 +34,30 @@ type Proxy struct {
 	Kind   config.EgressKind
 	Origin config.RouteOrigin
 
+	// Pick-path state is lock-free. PickFor scans every route on every
+	// request, so these fields are atomics; the pool mutex only serializes
+	// the choose-and-mark step that keeps LRU order exact. Drain-critical
+	// pairing lives here too: markPicked raises inFlight before it publishes
+	// the pick sequence, so once a pick is visible at all, its in-flight
+	// holder is already counted.
+	usedSeq       atomic.Uint64
+	inFlight      atomic.Int64
+	cooldownUntil atomic.Int64 // dial cooldown deadline, UnixNano; 0 = none
+	authBlocked   atomic.Bool
+	rotating      atomic.Bool
+
 	mu                  sync.Mutex
 	consecutiveFailures int
-	cooldownUntil       time.Time
 	lastDialError       string
 	authFailures        uint64
-	authBlocked         bool
 	lastAuthError       string
-	usedSeq             uint64
 	successes           uint64
 	failures            uint64
 
-	// Rotation bookkeeping (manual routes only). rotating excludes the route
-	// from new picks while a rotation procedure holds it.
-	rotating          bool
+	// Rotation bookkeeping (manual routes only): the lifecycle phase shown by
+	// /status plus the stale-serving counters. Mutated only by the rotation
+	// engine; serving paths read pick eligibility through the atomics above.
 	rotationState     RotationState
-	inFlight          int
 	lastIP            string
 	lastRotationAt    time.Time
 	nextRetryIn       time.Duration
@@ -74,45 +82,30 @@ func effectiveOrigin(origin config.RouteOrigin) config.RouteOrigin {
 	return origin
 }
 
-func (p *Proxy) available(now time.Time) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return !p.authBlocked && !p.rotating && !now.Before(p.cooldownUntil)
+// availableAt reports whether the route may take a new pick at UnixNano time
+// nowNano. cooldownUntil 0 means no cooldown and is always available, which
+// also covers test clocks pinned at time.Unix(0, 0).
+func (p *Proxy) availableAt(nowNano int64) bool {
+	cu := p.cooldownUntil.Load()
+	return !p.authBlocked.Load() && !p.rotating.Load() && (cu == 0 || nowNano >= cu)
 }
 
-func (p *Proxy) cooldownUntilTime() time.Time {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.cooldownUntil
-}
+func (p *Proxy) cooldownNano() int64 { return p.cooldownUntil.Load() }
 
-func (p *Proxy) authBlockedNow() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.authBlocked
-}
+func (p *Proxy) authBlockedNow() bool { return p.authBlocked.Load() }
 
-func (p *Proxy) lastUsedSequence() uint64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.usedSeq
-}
+func (p *Proxy) lastUsedSequence() uint64 { return p.usedSeq.Load() }
 
-// markPicked records the pick sequence and one in-flight holder in a single
-// lock hold so a concurrent drain observer can never see a picked route with
-// no in-flight count.
+// markPicked records the pick sequence and one in-flight holder. The
+// in-flight increment lands before the sequence store: any observer that can
+// already see the route as picked (a bumped usedSeq) therefore also sees the
+// in-flight count, so a rotation drain can never miss its holder.
 func (p *Proxy) markPicked(seq uint64) {
-	p.mu.Lock()
-	p.usedSeq = seq
-	p.inFlight++
-	p.mu.Unlock()
+	p.inFlight.Add(1)
+	p.usedSeq.Store(seq)
 }
 
-func (p *Proxy) rotatingNow() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.rotating
-}
+func (p *Proxy) rotatingNow() bool { return p.rotating.Load() }
 
 // Status is the exported health view of one proxy. Proxy is the redacted
 // host:port (credentials never leave the process).
@@ -220,23 +213,25 @@ func (pl *Pool) nextSeq() uint64 {
 func (pl *Pool) PickFor(exclude map[*Proxy]bool, allow func(*Proxy) bool) *Proxy {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
-	now := pl.Now()
+	nowNano := pl.Now().UnixNano()
 
 	allowed := func(p *Proxy) bool { return allow == nil || allow(p) }
 	var avail []*Proxy
 	for _, e := range pl.entries {
-		if allowed(e) && !exclude[e] && e.available(now) {
+		if allowed(e) && !exclude[e] && e.availableAt(nowNano) {
 			avail = append(avail, e)
 		}
 	}
 	if len(avail) == 0 {
 		var best *Proxy
+		var bestCooldown int64
 		for _, e := range pl.entries {
 			if !allowed(e) || exclude[e] || e.authBlockedNow() || e.rotatingNow() {
 				continue
 			}
-			if best == nil || e.cooldownUntilTime().Before(best.cooldownUntilTime()) {
-				best = e
+			cu := e.cooldownNano()
+			if best == nil || cu < bestCooldown {
+				best, bestCooldown = e, cu
 			}
 		}
 		if best != nil {
@@ -260,20 +255,20 @@ func (pl *Pool) PickFor(exclude map[*Proxy]bool, allow func(*Proxy) bool) *Proxy
 // released exactly once when its request or tunnel finishes; releasing a route
 // that holds nothing is harmless.
 func (p *Proxy) Release() {
-	p.mu.Lock()
-	if p.inFlight > 0 {
-		p.inFlight--
+	for {
+		n := p.inFlight.Load()
+		if n <= 0 {
+			return
+		}
+		if p.inFlight.CompareAndSwap(n, n-1) {
+			return
+		}
 	}
-	p.mu.Unlock()
 }
 
 // InFlight reports how many picked requests or tunnels currently hold the
 // route. The rotation engine drains to zero before rotating.
-func (p *Proxy) InFlight() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.inFlight
-}
+func (p *Proxy) InFlight() int { return int(p.inFlight.Load()) }
 
 // ReportSuccess records a successful use and clears any endpoint dial cooldown.
 // It does not clear an authentication block: unchanged credentials cannot be
@@ -281,12 +276,12 @@ func (p *Proxy) InFlight() int {
 func (pl *Pool) ReportSuccess(p *Proxy) {
 	seq := pl.nextSeq()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.consecutiveFailures = 0
-	p.cooldownUntil = time.Time{}
 	p.lastDialError = ""
 	p.successes++
-	p.usedSeq = seq
+	p.mu.Unlock()
+	p.cooldownUntil.Store(0)
+	p.usedSeq.Store(seq)
 }
 
 // ReportFailure records an upstream endpoint TCP dial failure and puts the
@@ -298,15 +293,17 @@ func (pl *Pool) ReportFailure(p *Proxy, err error) time.Duration {
 	nowFunc := pl.Now
 	pl.mu.Unlock()
 	now := nowFunc()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.consecutiveFailures++
-	p.failures++
-	cd := saturatingCooldown(base, max, p.consecutiveFailures)
-	p.cooldownUntil = now.Add(cd)
-	if err != nil {
-		p.lastDialError = sanitize.ErrorString(err)
-	}
+	cd := func() time.Duration {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.consecutiveFailures++
+		p.failures++
+		if err != nil {
+			p.lastDialError = sanitize.ErrorString(err)
+		}
+		return saturatingCooldown(base, max, p.consecutiveFailures)
+	}()
+	p.cooldownUntil.Store(now.Add(cd).UnixNano())
 	return cd
 }
 
@@ -344,12 +341,12 @@ func saturatingCooldown(base, max time.Duration, failures int) time.Duration {
 // separate from endpoint dial health and never changes cooldown.
 func (pl *Pool) ReportAuthBlocked(p *Proxy, err error) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.authFailures++
-	p.authBlocked = true
 	if err != nil {
 		p.lastAuthError = sanitizeAuthError(err)
 	}
+	p.mu.Unlock()
+	p.authBlocked.Store(true)
 }
 
 // sanitizeAuthError stores only the fixed safe labels produced by the SOCKS
@@ -378,28 +375,29 @@ func containsToken(haystack, needle string) bool {
 func (pl *Pool) Snapshot() []Status {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
-	now := pl.Now()
+	nowNano := pl.Now().UnixNano()
 	out := make([]Status, 0, len(pl.entries))
 	for _, e := range pl.entries {
 		e.mu.Lock()
-		cooling := now.Before(e.cooldownUntil)
+		cu := e.cooldownNano()
+		cooling := cu != 0 && nowNano < cu
 		cooldown := "0s"
 		if cooling {
-			cooldown = e.cooldownUntil.Sub(now).Truncate(time.Millisecond).String()
+			cooldown = time.Duration(cu - nowNano).Truncate(time.Millisecond).String()
 		}
 		out = append(out, Status{
 			Proxy:               e.URL.Host,
 			Kind:                e.Kind,
 			Origin:              string(e.Origin),
-			Available:           !e.authBlocked && !e.rotating && !cooling,
-			InFlight:            e.inFlight,
+			Available:           !e.authBlocked.Load() && !e.rotating.Load() && !cooling,
+			InFlight:            int(e.inFlight.Load()),
 			ConsecutiveFailures: e.consecutiveFailures,
 			CooldownFor:         cooldown,
 			Successes:           e.successes,
 			Failures:            e.failures,
 			LastDialError:       e.lastDialError,
 			AuthFailures:        e.authFailures,
-			AuthBlocked:         e.authBlocked,
+			AuthBlocked:         e.authBlocked.Load(),
 			LastAuthError:       e.lastAuthError,
 			Rotation:            e.rotationStatus(),
 		})
