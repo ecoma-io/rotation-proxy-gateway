@@ -15,14 +15,6 @@ import (
 	"time"
 )
 
-// RotateMode selects how the pool walks its entries.
-type RotateMode string
-
-const (
-	RoundRobin RotateMode = "round-robin"
-	Random     RotateMode = "random"
-)
-
 const (
 	DefaultListenAddr     = ":8080"
 	DefaultAdminAddr      = "127.0.0.1:8081"
@@ -39,7 +31,6 @@ type Config struct {
 	ListenAddr          string
 	AdminAddr           string // admin listener (health, status); always on
 	ProxiesFile         string
-	Mode                RotateMode
 	MaxRetries          int
 	CooldownBase        time.Duration
 	CooldownMax         time.Duration
@@ -58,7 +49,6 @@ func Load() (*Config, error) {
 		ListenAddr:          DefaultListenAddr,
 		AdminAddr:           DefaultAdminAddr,
 		ProxiesFile:         DefaultProxiesFile,
-		Mode:                RoundRobin,
 		MaxRetries:          DefaultMaxRetries,
 		CooldownBase:        DefaultCooldownBase,
 		CooldownMax:         DefaultCooldownMax,
@@ -73,9 +63,6 @@ func Load() (*Config, error) {
 	envStr("ADMIN_ADDR", &cfg.AdminAddr)
 	envStr("PROXIES_FILE", &cfg.ProxiesFile)
 	envStr("LOG_LEVEL", &cfg.LogLevel)
-	if v, ok := os.LookupEnv("ROTATE_MODE"); ok && v != "" {
-		cfg.Mode = RotateMode(v)
-	}
 	errs = append(errs,
 		envInt("MAX_RETRIES", &cfg.MaxRetries),
 		envDuration("COOLDOWN_BASE", &cfg.CooldownBase),
@@ -95,11 +82,6 @@ func Load() (*Config, error) {
 
 func (c *Config) validate() error {
 	var errs []error
-	switch c.Mode {
-	case RoundRobin, Random:
-	default:
-		errs = append(errs, fmt.Errorf("ROTATE_MODE must be %q or %q, got %q", RoundRobin, Random, c.Mode))
-	}
 	if c.MaxRetries < 1 {
 		errs = append(errs, fmt.Errorf("MAX_RETRIES must be >= 1, got %d", c.MaxRetries))
 	}

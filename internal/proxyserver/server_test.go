@@ -120,13 +120,13 @@ func defaultCfg() *config.Config {
 	}
 }
 
-func newForwarder(t *testing.T, mode config.RotateMode, ups ...*fakeUpstream) (*httptest.Server, *pool.Pool) {
+func newForwarder(t *testing.T, ups ...*fakeUpstream) (*httptest.Server, *pool.Pool) {
 	t.Helper()
 	urls := make([]*url.URL, 0, len(ups))
 	for _, up := range ups {
 		urls = append(urls, up.URL)
 	}
-	pl := pool.New(urls, mode, 30*time.Second, time.Minute)
+	pl := pool.New(urls, 30*time.Second, time.Minute)
 	return newForwarderCfg(t, pl, defaultCfg()), pl
 }
 
@@ -190,7 +190,7 @@ func TestRetryStatus(t *testing.T) {
 func TestPlainHTTPForward(t *testing.T) {
 	target := startEchoTarget(t)
 	up := newFakeUpstream(t, 0)
-	ts, pl := newForwarder(t, config.RoundRobin, up)
+	ts, pl := newForwarder(t, up)
 
 	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
 	if err != nil {
@@ -211,7 +211,7 @@ func TestRotatesPastDeadUpstream(t *testing.T) {
 	target := startEchoTarget(t)
 	dead := newFakeUpstream(t, 503)
 	good := newFakeUpstream(t, 0)
-	ts, pl := newForwarder(t, config.RoundRobin, dead, good)
+	ts, pl := newForwarder(t, dead, good)
 
 	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
 	if err != nil {
@@ -238,7 +238,7 @@ func TestRetryableStatusExhaustedPassesThrough(t *testing.T) {
 	up1 := newFakeUpstream(t, 429)
 	up2 := newFakeUpstream(t, 429)
 	up3 := newFakeUpstream(t, 429)
-	ts, pl := newForwarder(t, config.RoundRobin, up1, up2, up3)
+	ts, pl := newForwarder(t, up1, up2, up3)
 
 	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
 	if err != nil {
@@ -267,7 +267,7 @@ func TestRetryableStatusExhaustedPassesThrough(t *testing.T) {
 func TestNonRetryablePassthrough(t *testing.T) {
 	target := startEchoTarget(t)
 	up := newFakeUpstream(t, 404)
-	ts, pl := newForwarder(t, config.RoundRobin, up)
+	ts, pl := newForwarder(t, up)
 
 	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
 	if err != nil {
@@ -289,7 +289,7 @@ func TestPOSTReplayOnRotation(t *testing.T) {
 	target := startEchoBodyTarget(t)
 	dead := newFakeUpstream(t, 503)
 	good := newFakeUpstream(t, 0)
-	ts, _ := newForwarder(t, config.RoundRobin, dead, good)
+	ts, _ := newForwarder(t, dead, good)
 
 	resp, err := proxiedClient(t, ts.URL).Post("http://"+target+"/", "text/plain", strings.NewReader("payload-123"))
 	if err != nil {
@@ -308,7 +308,7 @@ func TestStreamModeNoRetry(t *testing.T) {
 	good := newFakeUpstream(t, 0)
 
 	urls := []*url.URL{dead.URL, good.URL}
-	pl := pool.New(urls, config.RoundRobin, 30*time.Second, time.Minute)
+	pl := pool.New(urls, 30*time.Second, time.Minute)
 	cfg := defaultCfg()
 	cfg.MaxBodyBuffer = 16
 	ts := newForwarderCfg(t, pl, cfg)
@@ -329,7 +329,7 @@ func TestStreamModeNoRetry(t *testing.T) {
 func TestResponseHopByHopStripped(t *testing.T) {
 	target := startEchoTarget(t)
 	up := newFakeUpstream(t, 404) // response carries Proxy-Authorization + Connection
-	ts, _ := newForwarder(t, config.RoundRobin, up)
+	ts, _ := newForwarder(t, up)
 
 	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
 	if err != nil {
@@ -379,7 +379,7 @@ func TestConnectTunnel(t *testing.T) {
 	targetHostPort := tu.Host
 
 	up := newFakeUpstream(t, 0)
-	ts, _ := newForwarder(t, config.RoundRobin, up)
+	ts, _ := newForwarder(t, up)
 
 	conn, br, resp := connectThrough(t, ts.URL, targetHostPort)
 	defer conn.Close()
@@ -422,7 +422,7 @@ func TestConnectRetriesPastBadUpstream(t *testing.T) {
 	bad := newFakeUpstream(t, 0)
 	bad.auth = "Basic bm9wZTpub3Bl" // any request without creds gets 407
 	good := newFakeUpstream(t, 0)
-	ts, _ := newForwarder(t, config.RoundRobin, bad, good)
+	ts, _ := newForwarder(t, bad, good)
 
 	conn, _, resp := connectThrough(t, ts.URL, tu.Host)
 	defer conn.Close()
@@ -442,7 +442,7 @@ func TestConnectExhausted(t *testing.T) {
 	up2.auth = badAuth
 	up3 := newFakeUpstream(t, 0)
 	up3.auth = badAuth
-	ts, pl := newForwarder(t, config.RoundRobin, up1, up2, up3)
+	ts, pl := newForwarder(t, up1, up2, up3)
 
 	conn, _, resp := connectThrough(t, ts.URL, "127.0.0.1:443")
 	defer conn.Close()
@@ -463,7 +463,7 @@ func TestConnectExhausted(t *testing.T) {
 
 func TestAdminEndpoints(t *testing.T) {
 	up := newFakeUpstream(t, 0)
-	pl := pool.New([]*url.URL{up.URL}, config.RoundRobin, 30*time.Second, time.Minute)
+	pl := pool.New([]*url.URL{up.URL}, 30*time.Second, time.Minute)
 	s := New(pl, defaultCfg(), testLogger(), "9.9.9-test")
 
 	admin := httptest.NewServer(s.AdminMux())
@@ -499,7 +499,7 @@ func TestStreamBodyForwardedIntact(t *testing.T) {
 	target := startEchoBodyTarget(t)
 	good := newFakeUpstream(t, 0)
 
-	pl := pool.New([]*url.URL{good.URL}, config.RoundRobin, 30*time.Second, time.Minute)
+	pl := pool.New([]*url.URL{good.URL}, 30*time.Second, time.Minute)
 	cfg := defaultCfg()
 	cfg.MaxBodyBuffer = 16
 	ts := newForwarderCfg(t, pl, cfg)

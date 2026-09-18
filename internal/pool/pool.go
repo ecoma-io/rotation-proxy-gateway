@@ -3,12 +3,9 @@
 package pool
 
 import (
-	"math/rand/v2"
 	"net/url"
 	"sync"
 	"time"
-
-	"proxy-auto-rotate-forwarder/internal/config"
 )
 
 // Proxy is one upstream proxy plus its health state.
@@ -60,15 +57,13 @@ type Status struct {
 	LastError           string `json:"lastError,omitempty"`
 }
 
-// Pool is a set of upstream proxies with rotation and cooldown handling.
-// All methods are safe for concurrent use.
+// Pool is a set of upstream proxies with least-recently-used round-robin
+// rotation and cooldown handling. All methods are safe for concurrent use.
 type Pool struct {
 	mu      sync.Mutex
 	entries []*Proxy
-	mode    config.RotateMode
 	base    time.Duration
 	max     time.Duration
-	rng     *rand.Rand
 	seq     uint64 // pick sequence driving least-recently-used rotation
 
 	// Now is the clock used for cooldowns; tests replace it.
@@ -76,17 +71,15 @@ type Pool struct {
 }
 
 // New builds a pool from parsed proxy URLs.
-func New(urls []*url.URL, mode config.RotateMode, base, max time.Duration) *Pool {
+func New(urls []*url.URL, base, max time.Duration) *Pool {
 	entries := make([]*Proxy, 0, len(urls))
 	for _, u := range urls {
 		entries = append(entries, &Proxy{URL: u})
 	}
 	return &Pool{
 		entries: entries,
-		mode:    mode,
 		base:    base,
 		max:     max,
-		rng:     rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0)),
 		Now:     time.Now,
 	}
 }
@@ -97,11 +90,10 @@ func (pl *Pool) nextSeq() uint64 {
 }
 
 // Pick returns the next proxy to try, excluding entries already tried for
-// the current request. Round-robin mode picks the least recently used
-// available entry (stable order on ties); random mode picks uniformly. When
-// every non-excluded entry is cooling down it returns the one that recovers
-// soonest (degraded beats down). It returns nil only when exclude covers the
-// whole pool.
+// the current request. It picks the least recently used available entry
+// (stable order on ties). When every non-excluded entry is cooling down it
+// returns the one that recovers soonest (degraded beats down). It returns nil
+// only when exclude covers the whole pool.
 func (pl *Pool) Pick(exclude map[*Proxy]bool) *Proxy {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
@@ -126,17 +118,11 @@ func (pl *Pool) Pick(exclude map[*Proxy]bool) *Proxy {
 		return best
 	}
 
-	var chosen *Proxy
-	switch pl.mode {
-	case config.Random:
-		chosen = avail[pl.rng.IntN(len(avail))]
-	default: // round-robin
-		chosen = avail[0]
-		chosenSeq := chosen.lastUsedSequence()
-		for _, e := range avail[1:] {
-			if s := e.lastUsedSequence(); s < chosenSeq {
-				chosen, chosenSeq = e, s
-			}
+	chosen := avail[0]
+	chosenSeq := chosen.lastUsedSequence()
+	for _, e := range avail[1:] {
+		if s := e.lastUsedSequence(); s < chosenSeq {
+			chosen, chosenSeq = e, s
 		}
 	}
 	chosen.markUsed(pl.nextSeq())

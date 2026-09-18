@@ -17,7 +17,6 @@ services:
       # still makes the admin listener reachable from the host localhost only.
       ADMIN_ADDR: ":8081"
       PROXIES_FILE: /app/configs/proxies.txt
-      ROTATE_MODE: round-robin
       MAX_RETRIES: "3"
       COOLDOWN_BASE: 1s
       COOLDOWN_MAX: 10m

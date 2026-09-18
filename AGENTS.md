@@ -38,7 +38,6 @@ real environment. See `.env.example` for every knob:
 |`LISTEN_ADDR`|`:8080`|proxy listener (HTTP + CONNECT)|
 |`ADMIN_ADDR`|`127.0.0.1:8081`|admin listener (always on; must differ from `LISTEN_ADDR`)|
 |`PROXIES_FILE`|`configs/proxies.txt`|pool file|
-|`ROTATE_MODE`|`round-robin`|`round-robin` (true LRU by pick sequence) or `random`|
 |`MAX_RETRIES`|`3`|attempts across **distinct** proxies|
 |`COOLDOWN_BASE`|`30s`|first-failure cooldown; doubles per consecutive failure, capped|
 |`COOLDOWN_MAX`|`10m`|cooldown ceiling|
@@ -49,6 +48,7 @@ real environment. See `.env.example` for every knob:
 
 ## Behavior notes
 
+- The pool always selects the available proxy least recently used by pick sequence (true round-robin); it has no rotation-mode setting.
 - Retry only on connection failure or target status 408/429/5xx. If every
   attempt hit a retryable status, the **last** response is passed through
   (a real 429 beats a synthetic 502); with no response at all the client gets
@@ -88,7 +88,7 @@ entrypoint binary itself (no shell in the image).
 ## Layout
 
 - `internal/config` — env + `.env` loading, pool file parser
-- `internal/pool` — LRU/random rotation, failure cooldowns, live `Reload`
+- `internal/pool` — fixed LRU round-robin rotation, failure cooldowns, live `Reload`
 - `internal/proxyserver` — upstream dialers (HTTP CONNECT, SOCKS5) and the
   forward proxy handler
 - `cmd/proxy-auto-rotate-forwarder` — entrypoint, signals, admin endpoints

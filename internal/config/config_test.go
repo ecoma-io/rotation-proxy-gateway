@@ -9,7 +9,7 @@ import (
 )
 
 func TestDefaults(t *testing.T) {
-	for _, k := range []string{"LISTEN_ADDR", "ADMIN_ADDR", "PROXIES_FILE", "LOG_LEVEL", "ROTATE_MODE",
+	for _, k := range []string{"LISTEN_ADDR", "ADMIN_ADDR", "PROXIES_FILE", "LOG_LEVEL",
 		"MAX_RETRIES", "COOLDOWN_BASE", "COOLDOWN_MAX", "CONNECT_TIMEOUT", "MAX_BODY_BUFFER", "UPSTREAM_TLS_INSECURE"} {
 		t.Setenv(k, "") // treated as unset
 	}
@@ -25,9 +25,6 @@ func TestDefaults(t *testing.T) {
 	}
 	if cfg.ProxiesFile != DefaultProxiesFile {
 		t.Errorf("ProxiesFile = %q, want %q", cfg.ProxiesFile, DefaultProxiesFile)
-	}
-	if cfg.Mode != RoundRobin {
-		t.Errorf("Mode = %q, want %q", cfg.Mode, RoundRobin)
 	}
 	if cfg.MaxRetries != DefaultMaxRetries {
 		t.Errorf("MaxRetries = %d, want %d", cfg.MaxRetries, DefaultMaxRetries)
@@ -48,7 +45,6 @@ func TestDefaults(t *testing.T) {
 
 func TestEnvOverrides(t *testing.T) {
 	t.Setenv("LISTEN_ADDR", ":9999")
-	t.Setenv("ROTATE_MODE", "random")
 	t.Setenv("MAX_RETRIES", "5")
 	t.Setenv("COOLDOWN_BASE", "1s")
 	t.Setenv("COOLDOWN_MAX", "2m")
@@ -61,7 +57,7 @@ func TestEnvOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.ListenAddr != ":9999" || cfg.AdminAddr != DefaultAdminAddr || cfg.Mode != Random ||
+	if cfg.ListenAddr != ":9999" || cfg.AdminAddr != DefaultAdminAddr ||
 		cfg.MaxRetries != 5 || cfg.CooldownBase != time.Second || cfg.CooldownMax != 2*time.Minute ||
 		cfg.ConnectTimeout != 3*time.Second || cfg.MaxBodyBuffer != 1024 ||
 		!cfg.UpstreamTLSInsecure || cfg.LogLevel != "debug" {
@@ -73,7 +69,6 @@ func TestInvalidValues(t *testing.T) {
 	cases := []struct {
 		name, key, val, wantInErr string
 	}{
-		{"bad mode", "ROTATE_MODE", "bogus", "ROTATE_MODE"},
 		{"zero retries", "MAX_RETRIES", "0", "MAX_RETRIES"},
 		{"bad retries", "MAX_RETRIES", "many", "MAX_RETRIES"},
 		{"bad duration", "COOLDOWN_BASE", "soon", "COOLDOWN_BASE"},

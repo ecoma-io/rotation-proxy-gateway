@@ -6,8 +6,6 @@ import (
 	"reflect"
 	"testing"
 	"time"
-
-	"proxy-auto-rotate-forwarder/internal/config"
 )
 
 func mustURL(t *testing.T, raw string) *url.URL {
@@ -25,20 +23,20 @@ type clock struct{ now time.Time }
 func (c *clock) NowFunc() time.Time      { return c.now }
 func (c *clock) advance(d time.Duration) { c.now = c.now.Add(d) }
 
-func newTestPool(t *testing.T, c *clock, mode config.RotateMode, urls ...string) *Pool {
+func newTestPool(t *testing.T, c *clock, urls ...string) *Pool {
 	t.Helper()
 	parsed := make([]*url.URL, 0, len(urls))
 	for _, u := range urls {
 		parsed = append(parsed, mustURL(t, u))
 	}
-	pl := New(parsed, mode, 30*time.Second, time.Minute)
+	pl := New(parsed, 30*time.Second, time.Minute)
 	pl.Now = c.NowFunc
 	return pl
 }
 
 func TestRoundRobinCyclesAll(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, config.RoundRobin, "http://a:1", "http://b:2", "http://c:3")
+	pl := newTestPool(t, c, "http://a:1", "http://b:2", "http://c:3")
 	var got []string
 	for range 6 {
 		got = append(got, pl.Pick(nil).URL.Host)
@@ -51,7 +49,7 @@ func TestRoundRobinCyclesAll(t *testing.T) {
 
 func TestFailureCooldownSkipAndRevive(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, config.RoundRobin, "http://a:1", "http://b:2")
+	pl := newTestPool(t, c, "http://a:1", "http://b:2")
 
 	first := pl.Pick(nil)
 	if first.URL.Host != "a:1" {
@@ -70,7 +68,7 @@ func TestFailureCooldownSkipAndRevive(t *testing.T) {
 
 func TestCooldownExponentialCap(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, config.RoundRobin, "http://a:1")
+	pl := newTestPool(t, c, "http://a:1")
 	p := pl.Pick(nil)
 
 	if cd := pl.ReportFailure(p, nil); cd != 30*time.Second {
@@ -86,21 +84,9 @@ func TestCooldownExponentialCap(t *testing.T) {
 	}
 }
 
-func TestRandomModeCoversPool(t *testing.T) {
-	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, config.Random, "http://a:1", "http://b:2", "http://c:3")
-	seen := map[string]bool{}
-	for range 60 {
-		seen[pl.Pick(nil).URL.Host] = true
-	}
-	if len(seen) != 3 {
-		t.Fatalf("random picks covered %d of 3 proxies: %v", len(seen), seen)
-	}
-}
-
 func TestExhaustedReturnsNil(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, config.RoundRobin, "http://a:1")
+	pl := newTestPool(t, c, "http://a:1")
 	p := pl.Pick(nil)
 	if got := pl.Pick(map[*Proxy]bool{p: true}); got != nil {
 		t.Fatalf("Pick(all excluded) = %v, want nil", got)
@@ -109,7 +95,7 @@ func TestExhaustedReturnsNil(t *testing.T) {
 
 func TestAllCoolingPicksSoonestRecovery(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, config.RoundRobin, "http://a:1", "http://b:2")
+	pl := newTestPool(t, c, "http://a:1", "http://b:2")
 
 	pl.ReportFailure(pl.entries[0], nil) // a: cooldown until +30s
 	pl.ReportFailure(pl.entries[1], nil)
@@ -123,7 +109,7 @@ func TestAllCoolingPicksSoonestRecovery(t *testing.T) {
 
 func TestReloadCarriesCooldown(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, config.RoundRobin, "http://a:1", "http://b:2")
+	pl := newTestPool(t, c, "http://a:1", "http://b:2")
 	pl.ReportFailure(pl.entries[0], nil) // a cooling
 
 	pl.Reload([]*url.URL{mustURL(t, "http://a:1"), mustURL(t, "http://b:2")})
@@ -139,7 +125,7 @@ func TestReloadCarriesCooldown(t *testing.T) {
 
 func TestSnapshotFields(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, config.RoundRobin, "http://a:1", "http://b:2")
+	pl := newTestPool(t, c, "http://a:1", "http://b:2")
 	pl.ReportFailure(pl.entries[0], errors.New("boom"))
 
 	snap := pl.Snapshot()

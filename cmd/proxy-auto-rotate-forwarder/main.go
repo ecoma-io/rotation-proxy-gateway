@@ -75,7 +75,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load proxies: %w", err)
 	}
-	pl := pool.New(urls, cfg.Mode, cfg.CooldownBase, cfg.CooldownMax)
+	pl := pool.New(urls, cfg.CooldownBase, cfg.CooldownMax)
 	srv := proxyserver.New(pl, cfg, log, version)
 
 	proxySrv := &http.Server{
@@ -95,7 +95,7 @@ func run() error {
 
 	errCh := make(chan error, 2)
 	go func() {
-		log.Info("proxy listening", "addr", cfg.ListenAddr, "upstreams", len(urls), "mode", string(cfg.Mode), "version", version)
+		log.Info("proxy listening", "addr", cfg.ListenAddr, "upstreams", len(urls), "version", version)
 		if err := proxySrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
