@@ -144,9 +144,12 @@ it performs target TLS inside the SOCKS tunnel before writing the request.
 Every successful target response is forwarded once. A `407`, `408`, `429`, or
 `5xx` response does not cause rotation or dial cooldown.
 
-Request bodies up to `MAX_BODY_BUFFER` are replayable for an endpoint dial or
-SOCKS authentication fallback. Larger bodies stream once; they cannot safely be
-retried after the forwarder has begun consuming them.
+Known-length request bodies larger than `MAX_BODY_BUFFER` start streaming to
+the selected route immediately, without an initial body buffer. Bodies up to the
+limit are replayable for an endpoint dial or SOCKS authentication fallback. For
+unknown-length bodies, the forwarder probes up to the limit so small bodies keep
+that replay safety; a body found to exceed the limit then streams once. A streamed
+body cannot safely be retried after the forwarder has begun consuming it.
 
 Each ordinary request uses its own SOCKS tunnel rather than a reused HTTP
 transport connection. This makes the boundary between endpoint TCP-dial errors
@@ -189,8 +192,8 @@ and their operational comments live directly in `compose.yaml`.
 | `COOLDOWN_MAX` | `10m` | Maximum endpoint TCP-dial cooldown |
 | `CONNECT_TIMEOUT` | `10s` | Timeout for SOCKS endpoint dial and SOCKS setup |
 | `TARGET_TLS_INSECURE` | `false` | Skip certificate verification for HTTPS targets reached through SOCKS; avoid in production |
-| `MAX_BODY_BUFFER` | `64MiB` | Maximum request body buffered for dial/auth fallback replay |
-| `LOG_LEVEL` | `info` | `debug` adds request-flow events; `info`, `warn`, and `error` progressively filter them |
+| `MAX_BODY_BUFFER` | `64MiB` | Maximum request body buffered for dial/auth fallback replay; known-larger bodies stream immediately |
+| `LOG_LEVEL` | `info` | Application default; `debug` adds request-flow events, while `info`, `warn`, and `error` progressively filter them. The supplied Compose deployment overrides this to `warn`. |
 
 ## Admin and observability
 
@@ -229,6 +232,12 @@ request URLs/queries, headers, or bodies. `cooldown` is emitted only for
 explicit. `error_kind=auth_route` is an authentication block; `setup` is a
 post-dial terminal error; `no_route` means all eligible routes were exhausted.
 
+The supplied `compose.yaml` uses `LOG_LEVEL=warn`, so healthy operations do not
+write a per-request line in the homelab deployment. It retains fallback and
+terminal-failure warnings; temporarily override it with `info` or `debug` when
+per-request tracing is needed. Compose uses the Docker `json-file` driver with
+three 10 MiB files, limiting this container's stored logs to 30 MiB.
+
 For example, `LOG_LEVEL=debug` makes a fallback easy to correlate:
 
 ```text
@@ -264,7 +273,9 @@ The Docker image is a static binary in `scratch` plus the CA bundle needed to
 verify HTTPS targets. The container healthcheck invokes the binary's
 `healthcheck` subcommand directly; there is no shell in the runtime image.
 `compose.yaml` maps the proxy on host port `8080` and binds the admin port to
-`127.0.0.1:8081` only.
+`127.0.0.1:8081` only. It uses `LOG_LEVEL=warn` and bounded Docker `json-file`
+logging (three 10 MiB files); set `LOG_LEVEL=info` or `LOG_LEVEL=debug`
+temporarily when detailed successful-request logs are needed.
 
 ## Non-goals
 

@@ -373,6 +373,95 @@ func TestPOSTReplaysOnlyAfterDialFailure(t *testing.T) {
 	}
 }
 
+type stagedBody struct {
+	first   []byte
+	release <-chan struct{}
+	rest    []byte
+
+	mu       sync.Mutex
+	read     bool
+	released bool
+}
+
+func (b *stagedBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.read {
+		b.read = true
+		n := copy(p, b.first)
+		b.first = b.first[n:]
+		return n, nil
+	}
+	if !b.released {
+		b.mu.Unlock()
+		<-b.release
+		b.mu.Lock()
+		b.released = true
+	}
+	if len(b.rest) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, b.rest)
+	b.rest = b.rest[n:]
+	return n, nil
+}
+
+func (b *stagedBody) Close() error { return nil }
+
+func TestKnownLargePOSTStreamsBeforeFullBodyIsAvailable(t *testing.T) {
+	allowRest := make(chan struct{})
+	payload := "streamed-payload"
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		w.Write(b)
+	}))
+	defer target.Close()
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
+	closed.Close()
+	good := startSocks5Proxy(t, socksOptions{})
+	pl := pool.New([]*url.URL{dead, good.URL}, time.Second, time.Minute)
+	cfg := defaultCfg()
+	cfg.MaxBodyBuffer = 4
+	forwarder := New(pl, cfg, testLogger(), "test")
+
+	body := &stagedBody{first: []byte(payload[:4]), rest: []byte(payload[4:]), release: allowRest}
+	req := httptest.NewRequest(http.MethodPost, target.URL+"/", body)
+	req.ContentLength = int64(len(payload))
+	rw := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		forwarder.ServeHTTP(rw, req)
+		close(done)
+	}()
+
+	select {
+	case <-good.hits:
+	case <-time.After(time.Second):
+		t.Fatal("SOCKS setup did not begin before the full body was available")
+	}
+	close(allowRest)
+	<-done
+
+	resp := rw.Result()
+	defer resp.Body.Close()
+	got, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(got) != payload {
+		t.Fatalf("status=%d body=%q", resp.StatusCode, got)
+	}
+	snap := pl.Snapshot()
+	if snap[0].Failures != 1 || snap[1].Successes != 1 {
+		t.Fatalf("pool state=%+v", snap)
+	}
+}
+
 func TestRequestBodyBufferBoundaries(t *testing.T) {
 	for _, tc := range []struct {
 		name string

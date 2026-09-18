@@ -106,22 +106,27 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 	}
 	log.Debug("request start", "method", r.Method, "target", target)
 
-	// Buffer the body up to the cap. When it is larger, its buffered prefix is
-	// replayable only until a route succeeds in establishing SOCKS setup.
+	// Known-large bodies can stream immediately. Unknown-length bodies are
+	// buffered up to the cap so small bodies remain replayable after an endpoint
+	// dial or SOCKS authentication fallback. A buffered prefix of a larger
+	// unknown-length body is replayable only until SOCKS setup succeeds.
 	var body []byte
-	streamMode := false
-	b, err := io.ReadAll(io.LimitReader(r.Body, s.cfg.MaxBodyBuffer+1))
-	if err != nil {
-		r.Body.Close()
-		http.Error(w, "failed to read request body", http.StatusBadRequest)
-		log.Warn("request rejected", "target", target, "error_kind", "body_read", "error", logErrorValue(err))
-		return
-	}
-	if int64(len(b)) > s.cfg.MaxBodyBuffer {
-		streamMode = true
-	} else {
+	streamMode := r.ContentLength > s.cfg.MaxBodyBuffer
+	directStream := streamMode
+	if !streamMode {
+		b, err := io.ReadAll(io.LimitReader(r.Body, s.cfg.MaxBodyBuffer+1))
+		if err != nil {
+			r.Body.Close()
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			log.Warn("request rejected", "target", target, "error_kind", "body_read", "error", logErrorValue(err))
+			return
+		}
 		body = b
-		r.Body.Close()
+		if int64(len(body)) > s.cfg.MaxBodyBuffer {
+			streamMode = true
+		} else {
+			r.Body.Close()
+		}
 	}
 	log.Debug("request body mode", "target", target, "body_mode", bodyLogMode(streamMode))
 	stripHopByHop(r.Header)
@@ -144,7 +149,11 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 		attempts = attemptNumber
 		out := buildOutbound(r, body)
 		if streamMode {
-			out.Body = io.NopCloser(io.MultiReader(bytes.NewReader(b), r.Body))
+			if directStream {
+				out.Body = r.Body
+			} else {
+				out.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
+			}
 			out.ContentLength = r.ContentLength
 		}
 		resp, err := s.roundTripViaSOCKS(r.Context(), p, out)

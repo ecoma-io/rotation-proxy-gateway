@@ -53,8 +53,8 @@ deployment, `compose.yaml` documents every supported variable beside its value.
 |`COOLDOWN_MAX`|`10m`|maximum SOCKS endpoint TCP dial cooldown|
 |`CONNECT_TIMEOUT`|`10s`|timeout for SOCKS endpoint dial and setup|
 |`TARGET_TLS_INSECURE`|`false`|skip HTTPS **target** certificate verification through SOCKS; never use casually|
-|`MAX_BODY_BUFFER`|64MiB|request bodies replayed only for a dial/auth fallback; larger bodies stream once|
-|`LOG_LEVEL`|`info`|`debug` adds request-flow events; `info`/`warn`/`error` filter progressively|
+|`MAX_BODY_BUFFER`|64MiB|request bodies replayed only for a dial/auth fallback; known-larger bodies stream immediately|
+|`LOG_LEVEL`|`info`|application default; `debug` adds request-flow events, while `info`/`warn`/`error` filter progressively. Compose overrides this to `warn`.|
 
 ## Behavior notes
 
@@ -90,8 +90,11 @@ docker compose up -d --build && curl http://127.0.0.1:8081/status
 ```
 
 `compose.yaml` maps host 8080 → proxy and 127.0.0.1:8081 → admin
-(localhost-only); the pool file is mounted `:ro`, and the container healthcheck
-calls the binary's own `healthcheck` subcommand (no shell in the scratch image).
+(localhost-only); the pool file is mounted `:ro`, application logging defaults
+to `warn` in Compose, and Docker retains at most three 10 MiB `json-file` logs.
+Set `LOG_LEVEL=info` or `debug` temporarily for detailed request tracing. The
+container healthcheck calls the binary's own `healthcheck` subcommand (no shell
+in the scratch image).
 
 `Dockerfile` builds a static binary into a `scratch` image plus the CA bundle
 for HTTPS target verification; `HEALTHCHECK` works because `healthcheck` is a

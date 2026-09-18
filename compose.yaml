@@ -35,8 +35,14 @@ services:
       # Buffered request-body limit in bytes for safe dial/auth fallback replay.
       # Larger bodies stream once and cannot be retried after consumption.
       MAX_BODY_BUFFER: "67108864"
-      # Application log threshold: debug, info, warn, or error.
-      LOG_LEVEL: debug
+      # Homelab default: suppress healthy per-request logs while retaining
+      # fallback and terminal-failure warnings. Override with info/debug to investigate.
+      LOG_LEVEL: warn
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - ./proxies.txt:/app/proxies.txt:ro
     healthcheck:
