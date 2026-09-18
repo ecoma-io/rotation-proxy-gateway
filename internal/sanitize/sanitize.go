@@ -17,7 +17,26 @@ const redacted = "[redacted]@"
 // Sanitize returns bounded diagnostic text with URL userinfo redacted and
 // terminal controls and ANSI sequences neutralized.
 func Sanitize(s string) string {
+	if !needsSanitizing(s) {
+		return s
+	}
 	return bound(cleanControls(redactUserinfo(s)))
+}
+
+// needsSanitizing reports whether any stage of Sanitize would change s, so the
+// clean common case skips every intermediate string copy. The control scan is
+// byte-wise on purpose: multi-byte UTF-8 sequences never contain bytes below
+// 0x20 or 0x7f, and every control rune encodes as one such byte.
+func needsSanitizing(s string) bool {
+	if len(s) > MaxLength {
+		return true // bound() truncates
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == 0x7f {
+			return true // stripANSI consumes ESC; cleanControls rewrites controls
+		}
+	}
+	return strings.Contains(s, "://") // redactUserinfo only rewrites URL tokens
 }
 
 // ErrorString sanitizes err.Error(), returning "" for nil.
