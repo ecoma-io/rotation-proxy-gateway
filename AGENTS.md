@@ -1,4 +1,4 @@
-# proxy-auto-rotate-forwarder
+# rotation-proxy-gateway
 
 Go HTTP forward proxy that routes plain absolute-URI requests and inbound
 `CONNECT` tunnels through a health-aware pool of **SOCKS5-only** routes. It
@@ -8,17 +8,18 @@ runs three inbound proxy listener views over one shared route-health pool:
 - v4 egress (`30122` by default): `kind: v4` routes only
 - v6 egress (`30123` by default): `kind: v6` routes only
 
-The always-on admin listener defaults to `127.0.0.1:30120`. The authoritative
-behavior contract is [`README.md`](README.md).
+The always-on admin listener defaults to `0.0.0.0:30120`; operators control
+network exposure through Docker port publishing, network policy, and firewalls.
+The authoritative behavior contract is [`README.md`](README.md).
 
 ## Build and test
 
 ```bash
 gofmt -w . && go vet ./... && go test -race ./...
-go build -ldflags "-X main.version=0.1.0-dev" -o bin/paf ./cmd/proxy-auto-rotate-forwarder
+go build -ldflags "-X main.version=0.1.0-dev" -o bin/rpgw ./cmd/rotation-proxy-gateway
 ```
 
-The toolchain pins Go ≥ 1.25; development used Go 1.26.4. Viper is used for
+The source supports Go ≥ 1.25; Docker builds with Go 1.27. Viper is used for
 runtime YAML loading and fsnotify-backed watching. Style rules: use
 `math/rand/v2` (never `math/rand`) and `for range n` loops.
 
@@ -30,11 +31,11 @@ credentials; never log, commit, or bake it into an image.
 
 ```bash
 CONFIG_FILE=config.yaml \
-ADMIN_ADDR=127.0.0.1:30120 \
+ADMIN_ADDR=0.0.0.0:30120 \
 MIXED_LISTEN_ADDR=:30121 \
 V4_LISTEN_ADDR=:30122 \
 V6_LISTEN_ADDR=:30123 \
-./bin/paf
+./bin/rpgw
 ```
 
 Environment variables are bootstrap-only and require restart:
@@ -42,7 +43,7 @@ Environment variables are bootstrap-only and require restart:
 | Env | Default | Meaning |
 |---|---:|---|
 | `CONFIG_FILE` | `config.yaml` | Runtime YAML path |
-| `ADMIN_ADDR` | `127.0.0.1:30120` | Private admin listener |
+| `ADMIN_ADDR` | `0.0.0.0:30120` | Admin listener; network policy controls exposure |
 | `MIXED_LISTEN_ADDR` | `:30121` | Mixed v4/v6 egress listener |
 | `V4_LISTEN_ADDR` | `:30122` | IPv4-egress-only listener |
 | `V6_LISTEN_ADDR` | `:30123` | IPv6-egress-only listener |
@@ -70,9 +71,10 @@ Read [`README.md`](README.md) before changing failure classification.
 - The pool selects the usable **eligible** route least recently used by pick
   sequence. It is a single shared pool: cooldown/auth state is visible through
   both dedicated and mixed listeners.
-- Endpoint DNS/TCP failure is `proxy_connect_error`: cooldown then a distinct
-  eligible fallback. SOCKS auth failure blocks the route and may fall back, but
-  never creates dial cooldown.
+- Endpoint DNS/TCP failure is `proxy_connect`: cooldown then a distinct
+  eligible fallback. SOCKS auth failure is `auth_route`, blocks the route, and
+  may fall back, but never creates dial cooldown. Post-dial errors are `setup`;
+  exhausting eligible routes is `no_route`.
 - Errors after endpoint TCP dial succeeds—including SOCKS target-connect,
   target TLS, write/read, malformed response, cancellation, and broken tunnel—
   do not alter health and are not retried.
@@ -89,36 +91,38 @@ Read [`README.md`](README.md) before changing failure classification.
   `upstream` are host-only. `debug` shows flow, `info` terminal successes, and
   `warn` fallback/terminal failures.
 - Reload preserves runtime pool state only for unchanged URL+kind. Changed URL
-  userinfo or kind creates a new route state.
-- Shutdown order: drain all proxy listeners (10s) → admin → hijacked tunnels.
+  userinfo or kind creates a new route state. Validated configuration and its
+  reconfigured pool snapshot publish as one atomic generation; in-flight
+  operations finish on their original generation.
+- Shutdown order: each proxy listener gets 10s → admin gets 10s → hijacked tunnels.
 
 ## Admin
 
 ```bash
-curl http://127.0.0.1:30120/healthz # body "ok"
+curl http://127.0.0.1:30120/healthz # body "ok\n"
 curl http://127.0.0.1:30120/status  # global + per-listener counters, safe pool state
-ADMIN_ADDR=127.0.0.1:30120 ./bin/paf healthcheck
-./bin/paf version
+ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
+./bin/rpgw version
 ```
 
 ## Docker
 
 ```bash
-docker build -t paf:dev --build-arg VERSION=0.1.0-dev .
-docker run --rm paf:dev version
+docker build -t rpgw:dev --build-arg VERSION=0.1.0-dev .
+docker run --rm rpgw:dev version
 # Copy config.example.yaml to config.yaml and add routes first.
 docker compose up -d --build
 curl http://127.0.0.1:30120/status
 ```
 
-`compose.yaml` maps host 30121/30122/30123 to mixed/v4/v6 proxy listeners and
-maps `127.0.0.1:30120` to admin. It mounts `config.yaml` read-only, defaults to
+`compose.yaml` publishes host 30120/30121/30122/30123 for the admin/mixed/v4/v6
+listeners on all host interfaces. It mounts `config.yaml` read-only, defaults to
 bounded `json-file` logs, and uses the binary `healthcheck` subcommand (no shell
 in the scratch image).
 
 ## Layout
 
 - `internal/config` — bootstrap environment, Viper YAML validation, route parsing
-- `internal/pool` — LRU filtering, cooldown/auth state, live route reload
+- `internal/pool` — LRU filtering, cooldown/auth state, immutable generation snapshots
 - `internal/proxyserver` — SOCKS5 dialing plus inbound HTTP/CONNECT forwarding
-- `cmd/proxy-auto-rotate-forwarder` — lifecycle, signals, watcher, admin endpoints
+- `cmd/rotation-proxy-gateway` — lifecycle, signals, watcher, admin endpoints

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"proxy-auto-rotate-forwarder/internal/pool"
+	"rotation-proxy-gateway/internal/pool"
 )
 
 func TestLogValuesRedactCredentialsAndRequestDetails(t *testing.T) {

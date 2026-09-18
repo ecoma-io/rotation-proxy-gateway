@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"proxy-auto-rotate-forwarder/internal/config"
+	"rotation-proxy-gateway/internal/config"
 )
 
 func kindedPool(t *testing.T) *Pool {
@@ -36,7 +36,7 @@ func TestPickForRestrictsKindAndPreservesMixedVisibility(t *testing.T) {
 		t.Fatalf("v4 pick = %+v", v4a)
 	}
 	pl.ReportAuthBlocked(v4a, errors.New("endpoint rejected credentials"))
-	mixed := pl.Pick(nil)
+	mixed := pl.PickFor(nil, nil)
 	if mixed == nil || mixed.Kind != config.EgressV6 {
 		t.Fatalf("mixed pick after v4 auth block = %+v, want v6 route", mixed)
 	}
@@ -58,27 +58,28 @@ func TestPickForCoolingFallbackDoesNotCrossKind(t *testing.T) {
 	}
 }
 
-func TestReloadRoutesResetsChangedKindAndSnapshotIsSafe(t *testing.T) {
+func TestReconfigureResetsChangedKindAndSnapshotIsSafe(t *testing.T) {
 	pl := kindedPool(t)
 	old := pl.PickFor(nil, only(config.EgressV4))
 	pl.ReportFailure(old, errors.New("refused"))
-	pl.ReloadRoutes([]config.RouteSpec{
+	next := pl.Reconfigure([]config.RouteSpec{
 		{URL: old.URL, Kind: config.EgressV6},
-	})
-	got := pl.Pick(nil)
+	}, time.Second, time.Minute)
+	got := next.PickFor(nil, nil)
 	if got == old {
 		t.Fatal("route with changed kind retained health identity")
 	}
-	snap := pl.Snapshot()
+	snap := next.Snapshot()
 	if len(snap) != 1 || snap[0].Kind != config.EgressV6 || snap[0].Failures != 0 || snap[0].Proxy != "v4a.test:1080" {
 		t.Fatalf("snapshot = %+v", snap)
 	}
 }
 
-func TestSetCooldownsAffectsFutureFailures(t *testing.T) {
-	pl := kindedPool(t)
-	pl.SetCooldowns(3*time.Second, 3*time.Second)
-	p := pl.Pick(nil)
+func TestReconfigureAppliesCooldownsToFutureFailures(t *testing.T) {
+	pl := kindedPool(t).Reconfigure([]config.RouteSpec{
+		{URL: mustURL(t, "socks5://v4a.test:1080"), Kind: config.EgressV4},
+	}, 3*time.Second, 3*time.Second)
+	p := pl.PickFor(nil, nil)
 	if got := pl.ReportFailure(p, nil); got != 3*time.Second {
 		t.Fatalf("cooldown = %s, want 3s", got)
 	}

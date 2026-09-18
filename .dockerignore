@@ -1,6 +1,5 @@
 # Deployment credentials are bind-mounted at runtime and must not enter builds.
 config.yaml
-proxies.txt
 
 # Local development artifacts do not belong in the build context.
 .git

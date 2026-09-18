@@ -1,26 +1,22 @@
-# Homelab deployment for proxy-auto-rotate-forwarder.
+# Homelab deployment for rotation-proxy-gateway.
 # config.yaml is a root-level, Git-ignored credential-bearing runtime file.
 # Copy config.example.yaml first; it is mounted read-only and never baked into
 # the image or committed.
 services:
-  proxy:
+  rpgw:
     build:
       context: .
       args:
-        VERSION: dev
-    container_name: proxy
+        VERSION: 0.1.0-dev
+    container_name: rpgw
     ports:
       - "30121:30121" # mixed IPv4/IPv6 egress forward proxy
       - "30122:30122" # IPv4-egress forward proxy
       - "30123:30123" # IPv6-egress forward proxy
-      - "127.0.0.1:30120:30120" # admin: healthz and status, localhost only
+      - "30120:30120" # admin: healthz and status
     environment:
       # Bootstrap-only settings: changes require a container restart.
       CONFIG_FILE: /app/config.yaml
-      ADMIN_ADDR: ":30120"
-      MIXED_LISTEN_ADDR: ":30121"
-      V4_LISTEN_ADDR: ":30122"
-      V6_LISTEN_ADDR: ":30123"
     logging:
       driver: json-file
       options:
@@ -29,7 +25,7 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     healthcheck:
-      test: ["CMD", "/app/proxy-auto-rotate-forwarder", "healthcheck"]
+      test: ["CMD", "/app/rotation-proxy-gateway", "healthcheck"]
       interval: 30s
       timeout: 5s
       start_period: 15s

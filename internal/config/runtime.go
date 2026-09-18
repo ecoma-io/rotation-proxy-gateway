@@ -7,7 +7,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -16,7 +15,7 @@ import (
 
 const (
 	DefaultConfigFile       = "config.yaml"
-	DefaultRuntimeAdminAddr = "127.0.0.1:30120"
+	DefaultRuntimeAdminAddr = "0.0.0.0:30120"
 	DefaultMixedListenAddr  = ":30121"
 	DefaultV4ListenAddr     = ":30122"
 	DefaultV6ListenAddr     = ":30123"
@@ -60,30 +59,6 @@ type RuntimeConfig struct {
 	MaxBodyBuffer     int64
 	LogLevel          string
 	Routes            []RouteSpec
-}
-
-// Store atomically publishes immutable runtime configuration snapshots. A
-// request loads once at its start so a reload cannot alter its retry/body/TLS
-// policy mid-operation.
-type Store struct {
-	value atomic.Pointer[RuntimeConfig]
-}
-
-func NewStore(initial *RuntimeConfig) *Store {
-	s := &Store{}
-	s.Store(initial)
-	return s
-}
-
-func (s *Store) Load() *RuntimeConfig {
-	return s.value.Load()
-}
-
-func (s *Store) Store(cfg *RuntimeConfig) {
-	if cfg == nil {
-		panic("config.Store cannot publish nil runtime config")
-	}
-	s.value.Store(cfg)
 }
 
 type fileConfig struct {
@@ -372,7 +347,7 @@ func (c *RuntimeConfig) validate() error {
 	}
 	seen := make(map[string]struct{}, len(c.Routes))
 	for _, route := range c.Routes {
-		id := canonicalRouteID(route.URL)
+		id := CanonicalRouteID(route.URL)
 		if _, duplicate := seen[id]; duplicate {
 			errs = append(errs, errors.New("proxies.auto contains a duplicate route"))
 		}

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"proxy-auto-rotate-forwarder/internal/pool"
-	"proxy-auto-rotate-forwarder/internal/sanitize"
+	"rotation-proxy-gateway/internal/pool"
+	"rotation-proxy-gateway/internal/sanitize"
 )
 
 const maxLogErrorLength = 512

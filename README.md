@@ -1,6 +1,6 @@
-# proxy-auto-rotate-forwarder
+# rotation-proxy-gateway
 
-`proxy-auto-rotate-forwarder` is a Go HTTP forward proxy that accepts stable
+`rotation-proxy-gateway` is a Go HTTP forward proxy that accepts stable
 inbound HTTP proxy endpoints and routes traffic through a health-aware pool of
 **SOCKS5-only** upstream routes. It supports ordinary absolute-form HTTP
 requests and inbound `CONNECT` tunnels.
@@ -10,11 +10,11 @@ requests and inbound `CONNECT` tunnels.
 
 ## Inbound endpoints
 
-The process starts one private admin listener and up to three proxy listeners:
+The process starts one admin listener and up to three proxy listeners:
 
 | Endpoint | Default | Purpose |
 |---|---:|---|
-| Admin | `127.0.0.1:30120` | `/healthz` and `/status`; keep private |
+| Admin | `0.0.0.0:30120` | `/healthz` and `/status`; operator controls network exposure |
 | Mixed proxy | `:30121` | Selects both v4- and v6-egress routes |
 | IPv4 proxy | `:30122` | Selects only `kind: v4` routes |
 | IPv6 proxy | `:30123` | Selects only `kind: v6` routes |
@@ -37,8 +37,8 @@ cp config.example.yaml config.yaml # add real static SOCKS routes
 MIXED_LISTEN_ADDR=:30121 \
 V4_LISTEN_ADDR=:30122 \
 V6_LISTEN_ADDR=:30123 \
-ADMIN_ADDR=127.0.0.1:30120 \
-go run ./cmd/proxy-auto-rotate-forwarder
+ADMIN_ADDR=0.0.0.0:30120 \
+go run ./cmd/rotation-proxy-gateway
 
 curl -x http://127.0.0.1:30121 https://example.com/
 curl http://127.0.0.1:30120/status
@@ -58,7 +58,7 @@ at least one proxy listener must remain enabled.
 | Variable | Default | Meaning |
 |---|---:|---|
 | `CONFIG_FILE` | `config.yaml` | Runtime YAML file path |
-| `ADMIN_ADDR` | `127.0.0.1:30120` | Always-on private admin listener |
+| `ADMIN_ADDR` | `0.0.0.0:30120` | Always-on admin listener; network policy controls exposure |
 | `MIXED_LISTEN_ADDR` | `:30121` | Mixed v4/v6 egress listener |
 | `V4_LISTEN_ADDR` | `:30122` | v4-egress-only listener |
 | `V6_LISTEN_ADDR` | `:30123` | v6-egress-only listener |
@@ -122,15 +122,17 @@ Viper watches the runtime YAML file. The process also retains `SIGHUP` as a
 manual and bind-mount-safe reload trigger:
 
 ```bash
-kill -HUP "$(pgrep -f proxy-auto-rotate-forwarder)"
+kill -HUP "$(pgrep -f rotation-proxy-gateway)"
 # Docker:
-docker kill -s HUP proxy
+docker kill -s HUP rpgw
 ```
 
 Each reload parses and validates a complete new configuration before changing
 any serving state. A syntax error, partial write, invalid route, or invalid
 runtime setting logs a sanitized warning and retains the last-known-good config
-and pool.
+and pool. Validated configuration and its reconfigured pool snapshot publish as
+one atomic generation: every request and CONNECT operation loads that generation
+once, while in-flight operations finish on their original snapshot.
 
 The following settings apply to new client operations without restart:
 
@@ -149,17 +151,18 @@ and counter state. Changing userinfo or kind creates a fresh route state.
 
 ### Definitions
 
-- **`proxy_connect_error`**: DNS resolution or TCP dialing of the configured
-  SOCKS endpoint fails.
-- **`auth_route_error`**: a connected SOCKS endpoint cannot authenticate the
+- **`proxy_connect`**: DNS resolution or TCP dialing of the configured SOCKS
+  endpoint fails.
+- **`auth_route`**: a connected SOCKS endpoint cannot authenticate the
   configured route.
-- **Post-dial setup/target outcome**: every other error after the endpoint TCP
-  dial succeeds, including SOCKS framing/target replies, TLS, writes, reads,
-  malformed responses, cancellation, and established-tunnel failures.
+- **`setup`**: every other error after the endpoint TCP dial succeeds, including
+  SOCKS framing/target replies, TLS, writes, reads, malformed responses,
+  cancellation, and established-tunnel failures.
+- **`no_route`**: no eligible untried route remains.
 
 | Outcome | Pool handling | Request handling |
 |---|---|---|
-| SOCKS endpoint DNS/TCP dial fails | Record `proxy_connect_error`, exponential cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
+| SOCKS endpoint DNS/TCP dial fails | Record `proxy_connect`, exponential cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
 | SOCKS endpoint cannot authenticate | Auth-block the route; no dial cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
 | SOCKS setup/target error after TCP dial | No health mutation and no retry | Sanitized `502` |
 | Target TLS, HTTP write/read, malformed response | No health mutation and no retry | `502` unless client cancelled |
@@ -197,10 +200,10 @@ that point do not alter route health.
 ## Admin and observability
 
 ```bash
-curl http://127.0.0.1:30120/healthz # body: ok
+curl http://127.0.0.1:30120/healthz # body: ok\n
 curl http://127.0.0.1:30120/status
-ADMIN_ADDR=127.0.0.1:30120 ./bin/paf healthcheck
-./bin/paf version
+ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
+./bin/rpgw version
 ```
 
 `/status` keeps `version`, `uptime`, global `requests`, global `rotations`, and
@@ -221,11 +224,13 @@ docker compose up -d --build
 curl http://127.0.0.1:30120/status
 ```
 
-Compose publishes ports `30121` (mixed), `30122` (v4), and `30123` (v6), while
-publishing admin `30120` to host loopback only. The image remains a static
-binary in `scratch` with CA certificates and no shell; its healthcheck invokes
-the binary subcommand directly. Compose retains at most three 10 MiB JSON log
-files.
+Compose publishes ports `30120` (admin), `30121` (mixed), `30122` (v4), and
+`30123` (v6) on all host interfaces. The admin process listener deliberately
+binds all interfaces inside its network namespace; operators control exposure
+through Docker port publishing, Docker networks, and firewall policy. The image
+remains a static binary in `scratch` with CA certificates and no shell; its
+healthcheck invokes the binary subcommand directly. Compose retains at most
+three 10 MiB JSON log files.
 
 ## Migration from `proxies.txt`
 
@@ -235,15 +240,16 @@ detection from the SOCKS hostname/IP. `proxies.txt` is no longer loaded.
 
 ## Build and verification
 
-Go 1.25 or newer is required. The project now uses Viper for YAML loading and
-file watching.
+The source supports Go 1.25 or newer. Docker builds with Go 1.27. The project
+uses Viper for YAML loading and file watching.
 
 ```bash
 gofmt -w .
 go vet ./...
 go test -race ./...
-go build -ldflags "-X main.version=0.1.0-dev" -o bin/paf ./cmd/proxy-auto-rotate-forwarder
+go build -ldflags "-X main.version=0.1.0-dev" -o bin/rpgw ./cmd/rotation-proxy-gateway
 ```
 
-Graceful shutdown drains proxy requests for up to ten seconds, drains admin,
-then closes hijacked CONNECT tunnels that `http.Server.Shutdown` does not track.
+Graceful shutdown gives each enabled proxy listener its own ten-second drain
+window, then gives the admin listener a separate ten-second window, and finally
+closes hijacked CONNECT tunnels that `http.Server.Shutdown` does not track.

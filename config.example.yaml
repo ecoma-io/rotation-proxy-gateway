@@ -1,4 +1,4 @@
-# Runtime configuration for proxy-auto-rotate-forwarder.
+# Runtime configuration for rotation-proxy-gateway.
 # The process watches this file and also accepts SIGHUP for a validated reload.
 # Copy it to config.yaml, replace the example routes, then start the service.
 # config.yaml is intentionally ignored because it normally contains credentials.

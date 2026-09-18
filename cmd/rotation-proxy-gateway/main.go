@@ -1,4 +1,4 @@
-// Command proxy-auto-rotate-forwarder runs a SOCKS5-backed HTTP forward proxy
+// Command rotation-proxy-gateway runs a SOCKS5-backed HTTP forward proxy
 // with v4, v6, and mixed egress listener views plus an always-on admin listener.
 package main
 
@@ -19,14 +19,14 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
-	"proxy-auto-rotate-forwarder/internal/config"
-	"proxy-auto-rotate-forwarder/internal/pool"
-	"proxy-auto-rotate-forwarder/internal/proxyserver"
-	"proxy-auto-rotate-forwarder/internal/sanitize"
+	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/pool"
+	"rotation-proxy-gateway/internal/proxyserver"
+	"rotation-proxy-gateway/internal/sanitize"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=...".
-var version = "dev"
+var version = "0.1.0-dev"
 
 const (
 	shutdownGrace  = 10 * time.Second
@@ -76,7 +76,7 @@ func healthcheck() int {
 func healthcheckURL(addr string) string {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		host, port = addr, ""
+		panic(fmt.Sprintf("healthcheckURL requires a validated host:port address: %q", addr))
 	}
 	switch host {
 	case "", "0.0.0.0":
@@ -123,8 +123,10 @@ func run() error {
 
 	log, level := setupDynamicLogger(runtimeCfg.LogLevel)
 	warnUnavailableKindListeners(log, runtimeCfg, bootstrap)
-	store := config.NewStore(runtimeCfg)
-	pl := pool.NewRoutes(runtimeCfg.Routes, runtimeCfg.CooldownBase, runtimeCfg.CooldownMax)
+	// The store publishes one immutable generation (validated config + pool
+	// snapshot). Handlers load it once per operation; reload builds the next
+	// pool snapshot and swaps the whole generation atomically.
+	store := pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.Routes, runtimeCfg.CooldownBase, runtimeCfg.CooldownMax))
 
 	listeners := make([]runningListener, 0, 3)
 	listenerViews := make(map[string]*proxyserver.Server, 3)
@@ -132,7 +134,7 @@ func run() error {
 		if addr == "" {
 			return
 		}
-		srv := proxyserver.NewRuntime(pl, store, log, version, name, kinds...)
+		srv := proxyserver.NewRuntime(store, log, version, name, kinds...)
 		listeners = append(listeners, runningListener{
 			name:   name,
 			server: srv,
@@ -154,7 +156,7 @@ func run() error {
 	started := time.Now()
 	adminSrv := &http.Server{
 		Addr:              bootstrap.AdminAddr,
-		Handler:           proxyserver.AdminMux(version, started, pl, listenerViews),
+		Handler:           proxyserver.AdminMux(version, started, store, listenerViews),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
@@ -204,10 +206,10 @@ func run() error {
 			log.Warn("reload failed; keeping previous configuration", "source", source, "error", sanitize.ErrorString(err))
 			return
 		}
-		// All validation is complete before any mutable serving state changes.
-		pl.ReloadRoutes(next.Routes)
-		pl.SetCooldowns(next.CooldownBase, next.CooldownMax)
-		store.Store(next)
+		// LoadRuntime fully validates before Publish builds the next pool
+		// snapshot and swaps the whole generation. Invalid input keeps the
+		// previous generation (and its route health) serving untouched.
+		store.Publish(next)
 		level.Set(parseSlogLevel(next.LogLevel))
 		warnUnavailableKindListeners(log, next, bootstrap)
 		log.Info("configuration reloaded", "source", source, "upstreams", len(next.Routes))
@@ -251,15 +253,19 @@ func run() error {
 }
 
 func shutdownAll(listeners []runningListener, adminSrv *http.Server) {
-	sctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-	defer cancel()
 	for _, listener := range listeners {
-		listener.http.Shutdown(sctx) //nolint:errcheck // best-effort
+		shutdownServer(listener.http)
 	}
-	adminSrv.Shutdown(sctx) //nolint:errcheck // best-effort
+	shutdownServer(adminSrv)
 	for _, listener := range listeners {
 		listener.server.CloseTunnels() // Shutdown ignores hijacked CONNECT conns
 	}
+}
+
+func shutdownServer(server *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+	server.Shutdown(ctx) //nolint:errcheck // best-effort
 }
 
 func parseSlogLevel(level string) slog.Level {

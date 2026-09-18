@@ -19,8 +19,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"proxy-auto-rotate-forwarder/internal/config"
-	"proxy-auto-rotate-forwarder/internal/pool"
+	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/pool"
 )
 
 var hopByHopHeaders = map[string]bool{
@@ -53,9 +53,7 @@ func stripHopByHop(h http.Header) {
 
 // Server is the inbound HTTP forward-proxy handler.
 type Server struct {
-	pool     *pool.Pool
-	cfg      *config.Config // legacy static configuration; superseded by runtime when set
-	runtime  *config.Store
+	store    *pool.Store
 	log      *slog.Logger
 	version  string
 	listener string
@@ -83,15 +81,11 @@ func (s *Server) ListenerStatus() ListenerStatus {
 	}
 }
 
-// New builds a mixed proxy Server using the original static configuration API.
-// It is retained for existing embedders and tests.
-func New(pl *pool.Pool, cfg *config.Config, log *slog.Logger, version string) *Server {
-	return newServer(pl, cfg, nil, log, version, "mixed", nil)
-}
-
 // NewRuntime builds a listener-specific proxy Server whose new requests use
-// atomic runtime configuration snapshots.
-func NewRuntime(pl *pool.Pool, runtime *config.Store, log *slog.Logger, version, listener string, allowed ...config.EgressKind) *Server {
+// atomic runtime generations. Every request loads its generation once so route
+// picks, health reports, and request settings stay within one snapshot even
+// when a reload publishes a new generation in parallel.
+func NewRuntime(store *pool.Store, log *slog.Logger, version, listener string, allowed ...config.EgressKind) *Server {
 	allow := func(p *pool.Proxy) bool {
 		for _, kind := range allowed {
 			if p.Kind == kind {
@@ -100,14 +94,8 @@ func NewRuntime(pl *pool.Pool, runtime *config.Store, log *slog.Logger, version,
 		}
 		return len(allowed) == 0
 	}
-	return newServer(pl, nil, runtime, log, version, listener, allow)
-}
-
-func newServer(pl *pool.Pool, cfg *config.Config, runtime *config.Store, log *slog.Logger, version, listener string, allow func(*pool.Proxy) bool) *Server {
 	return &Server{
-		pool:      pl,
-		cfg:       cfg,
-		runtime:   runtime,
+		store:     store,
 		log:       log.With("listener", listener),
 		version:   version,
 		listener:  listener,
@@ -118,43 +106,13 @@ func newServer(pl *pool.Pool, cfg *config.Config, runtime *config.Store, log *sl
 	}
 }
 
-func (s *Server) runtimeConfig() *config.RuntimeConfig {
-	if s.runtime != nil {
-		return s.runtime.Load()
-	}
-	return nil
+// generation loads the current immutable runtime snapshot.
+func (s *Server) generation() *pool.Generation {
+	return s.store.Load()
 }
 
-func (s *Server) maxRetries() int {
-	if cfg := s.runtimeConfig(); cfg != nil {
-		return cfg.MaxRetries
-	}
-	return s.cfg.MaxRetries
-}
-
-func (s *Server) maxBodyBuffer() int64 {
-	if cfg := s.runtimeConfig(); cfg != nil {
-		return cfg.MaxBodyBuffer
-	}
-	return s.cfg.MaxBodyBuffer
-}
-
-func (s *Server) dialTimeout() time.Duration {
-	if cfg := s.runtimeConfig(); cfg != nil {
-		return cfg.DialTimeout
-	}
-	return s.cfg.ConnectTimeout
-}
-
-func (s *Server) targetTLSInsecure() bool {
-	if cfg := s.runtimeConfig(); cfg != nil {
-		return cfg.TargetTLSInsecure
-	}
-	return s.cfg.TargetTLSInsecure
-}
-
-func (s *Server) pick(exclude map[*pool.Proxy]bool) *pool.Proxy {
-	return s.pool.PickFor(exclude, s.allow)
+func (s *Server) pick(gen *pool.Generation, exclude map[*pool.Proxy]bool) *pool.Proxy {
+	return gen.Pool.PickFor(exclude, s.allow)
 }
 
 type requestSettings struct {
@@ -164,23 +122,24 @@ type requestSettings struct {
 	targetTLSInsecure bool
 }
 
-// settings snapshots all mutable runtime values once per operation so a reload
-// cannot change retry, body, timeout, or TLS policy part-way through it.
-func (s *Server) settings() requestSettings {
-	if cfg := s.runtimeConfig(); cfg != nil {
-		return requestSettings{
-			maxRetries:        cfg.MaxRetries,
-			maxBodyBuffer:     cfg.MaxBodyBuffer,
-			dialTimeout:       cfg.DialTimeout,
-			targetTLSInsecure: cfg.TargetTLSInsecure,
-		}
-	}
+// generationSettings derives request-scoped values from one loaded generation
+// so a reload cannot change retry, body, timeout, or TLS policy part-way
+// through an operation.
+func generationSettings(gen *pool.Generation) requestSettings {
+	cfg := gen.Config
 	return requestSettings{
-		maxRetries:        s.cfg.MaxRetries,
-		maxBodyBuffer:     s.cfg.MaxBodyBuffer,
-		dialTimeout:       s.cfg.ConnectTimeout,
-		targetTLSInsecure: s.cfg.TargetTLSInsecure,
+		maxRetries:        cfg.MaxRetries,
+		maxBodyBuffer:     cfg.MaxBodyBuffer,
+		dialTimeout:       cfg.DialTimeout,
+		targetTLSInsecure: cfg.TargetTLSInsecure,
 	}
+}
+
+// settings reports the current generation's request values. Tests use it to
+// assert publication; serving paths load the generation once and derive the
+// settings from that same snapshot.
+func (s *Server) settings() requestSettings {
+	return generationSettings(s.generation())
 }
 
 func (s *Server) roundTripWithSettings(ctx context.Context, p *pool.Proxy, out *http.Request, settings requestSettings) (*http.Response, error) {
@@ -236,8 +195,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleHTTP forwards a plain absolute-form request through a SOCKS5 route.
+// It loads one generation for the whole operation so route picks, health
+// reports, and request settings stay consistent across reloads.
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Logger) {
-	settings := s.settings()
+	gen := s.generation()
+	settings := generationSettings(gen)
 	start := time.Now()
 	target := httpTargetLogValue(r.URL)
 	if !r.URL.IsAbs() || r.Host == "" {
@@ -288,7 +250,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 			log.Debug("request canceled", "target", target, "attempts", attempt)
 			return
 		}
-		p := s.pick(exclude)
+		p := s.pick(gen, exclude)
 		if p == nil {
 			break
 		}
@@ -321,7 +283,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 			}
 			switch {
 			case isProxyDialError(err):
-				cooldown := s.pool.ReportFailure(p, err)
+				cooldown := gen.Pool.ReportFailure(p, err)
 				exclude[p] = true
 				s.rotations.Add(1)
 				log.Warn("upstream dial failed", "target", target, "upstream", upstreamLogValue(p),
@@ -329,7 +291,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 					"error", logErrorValue(err), "cooldown", cooldown.String())
 				continue
 			case isProxyAuthError(err):
-				s.pool.ReportAuthBlocked(p, err)
+				gen.Pool.ReportAuthBlocked(p, err)
 				exclude[p] = true
 				s.rotations.Add(1)
 				log.Warn("upstream auth failed", "target", target, "upstream", upstreamLogValue(p),
@@ -357,7 +319,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 			log.Debug("request canceled", "target", target, "attempts", attemptNumber)
 			return
 		}
-		s.pool.ReportSuccess(p)
+		gen.Pool.ReportSuccess(p)
 		s.writeResponse(w, resp)
 		log.Info("request", "method", r.Method, "target", target, "upstream", upstreamLogValue(p),
 			"status", resp.StatusCode, "attempts", attemptNumber, "duration", logDuration(time.Since(start)))
@@ -397,46 +359,6 @@ func buildOutbound(r *http.Request, body []byte) *http.Request {
 	out.Body = nil
 	out.ContentLength = 0
 	return out
-}
-
-// roundTripViaSOCKS establishes a SOCKS tunnel and exchanges one HTTP request.
-// Only errors returned from dialVia can be ProxyDialError or ProxyAuthError.
-func (s *Server) roundTripViaSOCKS(ctx context.Context, p *pool.Proxy, out *http.Request) (*http.Response, error) {
-	target, err := targetAddress(out.URL)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := s.dial(ctx, p.URL, target, s.dialTimeout())
-	if err != nil {
-		return nil, err
-	}
-	fail := func(err error) (*http.Response, error) {
-		conn.Close()
-		return nil, err
-	}
-	if out.URL.Scheme == "https" {
-		host := out.URL.Hostname()
-		tlsConn := tls.Client(conn, &tls.Config{
-			ServerName:         host,
-			InsecureSkipVerify: s.targetTLSInsecure(),
-		})
-		hsCtx, cancel := context.WithTimeout(ctx, s.dialTimeout())
-		err := tlsConn.HandshakeContext(hsCtx)
-		cancel()
-		if err != nil {
-			return fail(fmt.Errorf("target TLS handshake: %w", err))
-		}
-		conn = tlsConn
-	}
-	if err := out.Write(conn); err != nil {
-		return fail(fmt.Errorf("write target request: %w", err))
-	}
-	resp, err := http.ReadResponse(bufio.NewReader(conn), out)
-	if err != nil {
-		return fail(fmt.Errorf("read target response: %w", err))
-	}
-	resp.Body = &connReadCloser{ReadCloser: resp.Body, conn: conn}
-	return resp, nil
 }
 
 func targetAddress(u *url.URL) (string, error) {
@@ -484,9 +406,12 @@ func (s *Server) writeResponse(w http.ResponseWriter, resp *http.Response) {
 }
 
 // handleTunnel relays an inbound CONNECT tunnel through the SOCKS5 pool.
-// Retries occur only before the SOCKS target connection succeeds.
+// Retries occur only before the SOCKS target connection succeeds. It loads
+// one generation for the whole operation so route picks and health reports
+// stay consistent across reloads.
 func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.Logger) {
-	settings := s.settings()
+	gen := s.generation()
+	settings := generationSettings(gen)
 	start := time.Now()
 	target := r.URL.Host
 	if _, _, err := net.SplitHostPort(target); err != nil {
@@ -528,7 +453,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 			clientConn.Close()
 			return
 		}
-		p := s.pick(exclude)
+		p := s.pick(gen, exclude)
 		if p == nil {
 			break
 		}
@@ -541,7 +466,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 			}
 			switch {
 			case isProxyDialError(err):
-				cooldown := s.pool.ReportFailure(p, err)
+				cooldown := gen.Pool.ReportFailure(p, err)
 				exclude[p] = true
 				s.rotations.Add(1)
 				log.Warn("upstream dial failed", "target", logTarget, "upstream", upstreamLogValue(p),
@@ -549,7 +474,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 					"error", logErrorValue(err), "cooldown", cooldown.String())
 				continue
 			case isProxyAuthError(err):
-				s.pool.ReportAuthBlocked(p, err)
+				gen.Pool.ReportAuthBlocked(p, err)
 				exclude[p] = true
 				s.rotations.Add(1)
 				log.Warn("upstream auth failed", "target", logTarget, "upstream", upstreamLogValue(p),
@@ -565,7 +490,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 				return
 			}
 		}
-		s.pool.ReportSuccess(p)
+		gen.Pool.ReportSuccess(p)
 		upstream, chosen = up, p
 		break
 	}
@@ -621,13 +546,14 @@ func (s *Server) CloseTunnels() {
 
 // AdminMux serves the health and status endpoints for the admin listener.
 func (s *Server) AdminMux() *http.ServeMux {
-	return AdminMux(s.version, s.startTime, s.pool, map[string]*Server{s.listener: s})
+	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s})
 }
 
 // AdminMux serves aggregate health/status for all proxy listener views sharing
-// a pool. Existing status fields remain global totals; listeners adds safe
-// per-listener counters.
-func AdminMux(version string, started time.Time, pl *pool.Pool, listeners map[string]*Server) *http.ServeMux {
+// a runtime generation store. Existing status fields remain global totals;
+// listeners adds safe per-listener counters. The pool snapshot comes from the
+// current generation so /status changes atomically with serving behavior.
+func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -649,7 +575,7 @@ func AdminMux(version string, started time.Time, pl *pool.Pool, listeners map[st
 			"requests":  requests,
 			"rotations": rotations,
 			"listeners": perListener,
-			"pool":      pl.Snapshot(),
+			"pool":      store.Load().Pool.Snapshot(),
 		})
 	})
 	return mux

@@ -1,0 +1,310 @@
+package e2e_test
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func proxyAddrs(st *Status) []string {
+	out := make([]string, 0, len(st.Pool))
+	for _, e := range st.Pool {
+		out = append(out, e.Proxy)
+	}
+	return out
+}
+
+func TestE2E_ReloadAddsRoute(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	first := NewSocksSim(t, SocksOK, "", "")
+	second := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{{Proxy: first.RouteValue(), Kind: "v4"}})
+	g := NewGateway(t, cfg)
+
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+
+	cfg.Routes = append(cfg.Routes, RouteConfig{Proxy: second.RouteValue(), Kind: "v6"})
+	g.SignalReload(cfg, []string{first.Addr, second.Addr})
+
+	// Both families now serve through their dedicated listeners.
+	GetVia(t, ProxyClient(g.V4Addr), target.URL+"/", "e2e-echo:/")
+	GetVia(t, ProxyClient(g.V6Addr), target.URL+"/", "e2e-echo:/")
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+}
+
+func TestE2E_ReloadRemovesRoute(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	keep := NewSocksSim(t, SocksOK, "", "")
+	drop := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{
+		{Proxy: keep.RouteValue(), Kind: "v4"},
+		{Proxy: drop.RouteValue(), Kind: "v4"},
+	})
+	g := NewGateway(t, cfg)
+
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+
+	cfg.Routes = cfg.Routes[:1]
+	g.SignalReload(cfg, []string{keep.Addr})
+
+	// The survivor keeps serving; shrinking 2->1 does not break the pool.
+	for range 5 {
+		GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+	}
+}
+
+func TestE2E_ReloadShrinksToOtherFamily(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	v4 := NewSocksSim(t, SocksOK, "", "")
+	v6 := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{
+		{Proxy: v4.RouteValue(), Kind: "v4"},
+		{Proxy: v6.RouteValue(), Kind: "v6"},
+	})
+	g := NewGateway(t, cfg)
+
+	GetVia(t, ProxyClient(g.V4Addr), target.URL+"/", "e2e-echo:/")
+
+	// Drop the v4 route entirely: mixed and v6 keep working, v4 returns the
+	// ordinary no-route 502 while staying live.
+	cfg.Routes = []RouteConfig{{Proxy: v6.RouteValue(), Kind: "v6"}}
+	g.SignalReload(cfg, []string{v6.Addr})
+
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+	GetVia(t, ProxyClient(g.V6Addr), target.URL+"/", "e2e-echo:/")
+	resp, err := ProxyClient(g.V4Addr).Get(target.URL + "/")
+	if err != nil {
+		t.Fatalf("v4 GET: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("v4 status=%d, want 502", resp.StatusCode)
+	}
+}
+
+func TestE2E_InvalidReloadKeepsServing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	socks := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{{Proxy: socks.RouteValue(), Kind: "v4"}})
+	g := NewGateway(t, cfg)
+
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+	before, err := g.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := map[string]string{
+		"malformed yaml": "log-level: [unclosed\nmax-retries: nope\n",
+		"duplicate route": fmt.Sprintf(`log-level: info
+max-retries: 3
+cooldown: {base: 5s, max: 1m}
+dial-timeout: 5s
+global: {target-tls-insecure: false, max-body-buffer: 67108864}
+proxies:
+  auto:
+    - {proxy: '%s', kind: v4}
+    - {proxy: '%s', kind: v4}
+  manual: []
+`, socks.RouteValue(), socks.RouteValue()),
+		"missing kind": fmt.Sprintf(`log-level: info
+max-retries: 3
+cooldown: {base: 5s, max: 1m}
+dial-timeout: 5s
+global: {target-tls-insecure: false, max-body-buffer: 67108864}
+proxies:
+  auto:
+    - {proxy: '%s'}
+  manual: []
+`, socks.RouteValue()),
+		"empty pool": `log-level: info
+max-retries: 3
+cooldown: {base: 5s, max: 1m}
+dial-timeout: 5s
+global: {target-tls-insecure: false, max-body-buffer: 67108864}
+proxies:
+  auto: []
+  manual: []
+`,
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			g.SignalRawReload(raw, []string{socks.Addr})
+			// Old config still serves.
+			GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+		})
+	}
+
+	st, _ := g.Status()
+	if len(st.Pool) != len(before.Pool) || st.Pool[0].Proxy != before.Pool[0].Proxy {
+		t.Fatalf("pool changed after invalid reloads: %+v", st.Pool)
+	}
+	if out := g.Logs(); !strings.Contains(out, "reload failed") {
+		t.Fatalf("logs missing reload failure warning:\n%s", out)
+	}
+}
+
+func TestE2E_ReloadChangedCredsResetState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	socks := NewSocksSim(t, SocksAuthRequired, "e2e-user", "e2e-right-pass")
+	target := NewEchoTarget(t)
+	wrong := fmt.Sprintf("socks5://e2e-user:e2e-wrong-pass@%s", socks.Addr)
+	right := fmt.Sprintf("socks5://e2e-user:e2e-right-pass@%s", socks.Addr)
+	cfg := defaultGatewayConfig([]RouteConfig{
+		{Proxy: wrong, Kind: "v4"},
+		{Proxy: deadRouteValue(t), Kind: "v4"}, // second route keeps requests alive
+	})
+	// Large cooldown base so the dead route stays out of the way.
+	g := NewGateway(t, cfg)
+
+	// Burn the wrong-creds route into an auth block via the good... actually
+	// the dead route never answers, so force order: request until auth block.
+	st := g.WaitForCondition(10*time.Second, "auth block on wrong-creds route", func(st *Status) bool {
+		_, _ = ProxyClient(g.MixedAddr).Get(target.URL + "/")
+		for _, e := range st.Pool {
+			if e.AuthBlocked {
+				return true
+			}
+		}
+		return false
+	})
+	_ = st
+
+	// Fix the password: same host:port but different userinfo is a new route
+	// identity with fresh state, so requests succeed again.
+	cfg.Routes = []RouteConfig{{Proxy: right, Kind: "v4"}}
+	g.SignalReload(cfg, []string{socks.Addr})
+
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+	st, _ = g.Status()
+	if st.Pool[0].AuthBlocked || st.Pool[0].Successes < 1 {
+		t.Fatalf("fixed-creds route should be fresh and successful: %+v", st.Pool[0])
+	}
+}
+
+func TestE2E_ReloadChangedKindResetsState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	socks := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{{Proxy: socks.RouteValue(), Kind: "v4"}})
+	g := NewGateway(t, cfg)
+
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+	before, _ := g.Status()
+	if before.Pool[0].Successes != 1 {
+		t.Fatalf("pool=%+v", before.Pool)
+	}
+
+	// Same URL, new kind: fresh route state, counters reset.
+	cfg.Routes = []RouteConfig{{Proxy: socks.RouteValue(), Kind: "v6"}}
+	g.SignalReload(cfg, []string{socks.Addr})
+
+	st, _ := g.Status()
+	if st.Pool[0].Kind != "v6" || st.Pool[0].Successes != 0 {
+		t.Fatalf("kind change should reset state: %+v", st.Pool[0])
+	}
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+}
+
+func TestE2E_ReloadPreservesHealthForUnchangedRoutes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	good := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{
+		{Proxy: deadRouteValue(t), Kind: "v4"},
+		{Proxy: good.RouteValue(), Kind: "v4"},
+	})
+	g := NewGateway(t, cfg)
+
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+	st := g.WaitForCondition(5*time.Second, "dial failure recorded", func(st *Status) bool {
+		return len(st.Pool) == 2 && st.Pool[0].Failures == 1
+	})
+	deadFailures := st.Pool[0].Failures
+
+	// Same URL+kind routes, only log-level changes: health must survive.
+	cfg.LogLevel = "debug"
+	g.SignalReload(cfg, proxyAddrs(st))
+
+	st, _ = g.Status()
+	if st.Pool[0].Failures != deadFailures || st.Pool[0].CooldownFor == "0s" {
+		t.Fatalf("reload dropped dial health: %+v", st.Pool[0])
+	}
+	if st.Pool[1].Successes != 1 {
+		t.Fatalf("reload dropped success counters: %+v", st.Pool[1])
+	}
+}
+
+func TestE2E_ReloadDoesNotDropInFlight(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	first := NewSocksSim(t, SocksOK, "", "")
+	second := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{{Proxy: first.RouteValue(), Kind: "v4"}})
+	g := NewGateway(t, cfg)
+
+	var failures atomic.Uint64
+	var done atomic.Bool
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client := ProxyClient(g.MixedAddr)
+			for !done.Load() {
+				resp, err := client.Get(target.URL + "/load")
+				if err != nil {
+					failures.Add(1)
+					continue
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusOK || string(body) != "e2e-echo:/load" {
+					failures.Add(1)
+				}
+			}
+		}()
+	}
+
+	// Reload several times (grow, shrink, grow) while load is in flight.
+	time.Sleep(200 * time.Millisecond)
+	cfg.Routes = append(cfg.Routes, RouteConfig{Proxy: second.RouteValue(), Kind: "v4"})
+	g.SignalReload(cfg, []string{first.Addr, second.Addr})
+	cfg.Routes = cfg.Routes[:1]
+	g.SignalReload(cfg, []string{first.Addr})
+	cfg.Routes = append(cfg.Routes, RouteConfig{Proxy: second.RouteValue(), Kind: "v4"})
+	g.SignalReload(cfg, []string{first.Addr, second.Addr})
+	done.Store(true)
+	wg.Wait()
+
+	if got := failures.Load(); got != 0 {
+		t.Fatalf("reload dropped %d in-flight requests; logs:\n%s", got, g.Logs())
+	}
+}

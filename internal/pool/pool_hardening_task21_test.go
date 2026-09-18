@@ -2,19 +2,20 @@ package pool
 
 import (
 	"errors"
-	"net/url"
 	"sync"
 	"testing"
 	"time"
+
+	"rotation-proxy-gateway/internal/config"
 )
 
-func mustParseAll(t *testing.T, raws ...string) []*url.URL {
+func mustRouteSpecs(t *testing.T, raws ...string) []config.RouteSpec {
 	t.Helper()
-	out := make([]*url.URL, 0, len(raws))
-	for _, r := range raws {
-		out = append(out, mustURL(t, r))
+	routes := make([]config.RouteSpec, 0, len(raws))
+	for _, raw := range raws {
+		routes = append(routes, config.RouteSpec{URL: mustURL(t, raw), Kind: config.EgressV4})
 	}
-	return out
+	return routes
 }
 
 // Defect 1: ReportSuccess must hold pl.mu around nextSeq.
@@ -27,7 +28,7 @@ func TestHardeningConcurrentReportSuccessRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 50; j++ {
-				p := pl.Pick(nil)
+				p := pl.PickFor(nil, nil)
 				if p == nil {
 					return
 				}
@@ -49,7 +50,7 @@ func TestHardeningAllCoolingFallbackMarksUsed(t *testing.T) {
 
 	seqBeforeA := pl.entries[0].lastUsedSequence()
 	seqBeforeB := pl.entries[1].lastUsedSequence()
-	got := pl.Pick(nil)
+	got := pl.PickFor(nil, nil)
 	if got == nil || got.URL.Host != "a.test:1080" {
 		t.Fatalf("pick with all cooling = %v, want a.test:1080 (soonest recovery)", got)
 	}
@@ -59,7 +60,7 @@ func TestHardeningAllCoolingFallbackMarksUsed(t *testing.T) {
 	// Second fallback pick with both still cooling must rotate to the other route
 	// now that the first fallback choice is marked most-recently used... but both
 	// are cooling so earliest-recovery still wins; at minimum seq must keep advancing.
-	second := pl.Pick(nil)
+	second := pl.PickFor(nil, nil)
 	if second == nil {
 		t.Fatalf("second fallback pick = nil, want earliest recovery route")
 	}
@@ -95,56 +96,46 @@ func TestHardeningCooldownSaturatesNeverNegative(t *testing.T) {
 	}
 }
 
-// Defect 5a: reload retains exact canonical URLs with state, reorders, resets changed creds.
-func TestHardeningReloadRetainsCanonicalState(t *testing.T) {
+// Reconfigure retains canonical URL+kind state, preserves order, and resets changed credentials.
+func TestReconfigureRetainsCanonicalState(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newTestPool(t, c, "socks5://TEST-user:TEST-pass@a.test:1080", "socks5://b.test:1080", "socks5://c.test:1080")
 	pl.ReportSuccess(pl.entries[0])
 	pl.ReportFailure(pl.entries[1], errors.New("TEST dial refused"))
-	// Advance pick sequence so entries have distinct usedSeq.
-	pl.Pick(nil)
-	pl.Pick(nil)
+	pl.PickFor(nil, nil)
+	pl.PickFor(nil, nil)
 
 	oldA := pl.entries[0]
 	oldB := pl.entries[1]
-	pl.Reload(mustParseAll(t,
+	next := pl.Reconfigure(mustRouteSpecs(t,
 		"socks5://c.test:1080",
 		"socks5://b.test:1080",
 		"socks5://TEST-user:TEST-pass@a.test:1080",
-	))
-	if len(pl.entries) != 3 {
-		t.Fatalf("reload len = %d, want 3", len(pl.entries))
+	), 30*time.Second, time.Minute)
+	if len(next.entries) != 3 {
+		t.Fatalf("reconfigure len = %d, want 3", len(next.entries))
 	}
-	// Reordering: c first, then b, then a — pointers preserved.
-	if pl.entries[0].URL.Host != "c.test:1080" || pl.entries[1].URL.Host != "b.test:1080" {
-		t.Fatalf("reload order = %s %s %s, want c b a",
-			pl.entries[0].URL.Host, pl.entries[1].URL.Host, pl.entries[2].URL.Host)
+	if next.entries[0].URL.Host != "c.test:1080" || next.entries[1].URL.Host != "b.test:1080" {
+		t.Fatalf("reconfigure order = %s %s %s, want c b a", next.entries[0].URL.Host, next.entries[1].URL.Host, next.entries[2].URL.Host)
 	}
-	if pl.entries[1] != oldB {
-		t.Fatalf("reordered b.test:1080 lost identity/state")
+	if next.entries[1] != oldB || next.entries[2] != oldA {
+		t.Fatal("canonical unchanged routes lost identity/state")
 	}
-	if pl.entries[2] != oldA {
-		t.Fatalf("reordered a.test:1080 lost identity/state")
-	}
-	if snap := pl.Snapshot(); snap[1].Failures != 1 || snap[2].Successes != 1 {
-		t.Fatalf("reload lost state: %+v", snap)
+	if snap := next.Snapshot(); snap[1].Failures != 1 || snap[2].Successes != 1 {
+		t.Fatalf("reconfigure lost state: %+v", snap)
 	}
 
-	// Changed credentials reset.
-	pl.Reload(mustParseAll(t, "socks5://TEST-user:TEST-other@a.test:1080"))
-	if len(pl.entries) != 1 {
-		t.Fatalf("reload len = %d, want 1", len(pl.entries))
+	changed := next.Reconfigure(mustRouteSpecs(t, "socks5://TEST-user:TEST-other@a.test:1080"), 30*time.Second, time.Minute)
+	if len(changed.entries) != 1 || changed.entries[0] == oldA {
+		t.Fatal("changed credentials reused old route object, want fresh state")
 	}
-	if pl.entries[0] == oldA {
-		t.Fatalf("changed credentials reused old route object, want fresh state")
-	}
-	snap := pl.Snapshot()
+	snap := changed.Snapshot()
 	if snap[0].Successes != 0 || snap[0].Failures != 0 || snap[0].AuthBlocked {
 		t.Fatalf("changed-credential route not fresh: %+v", snap[0])
 	}
 }
 
-// Defect 5b: concurrent Pick/Report*/Snapshot/Reload is race-free.
+// Defect 5b: concurrent PickFor/Report*/Snapshot/Reconfigure is race-free.
 func TestHardeningConcurrentPoolRaceFree(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newTestPool(t, c, "socks5://a.test:1080", "socks5://b.test:1080")
@@ -160,7 +151,7 @@ func TestHardeningConcurrentPoolRaceFree(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 25; j++ {
-				_ = pl.Pick(nil)
+				_ = pl.PickFor(nil, nil)
 			}
 		}()
 		go func() {
@@ -186,24 +177,6 @@ func TestHardeningConcurrentPoolRaceFree(t *testing.T) {
 			for j := 0; j < 25; j++ {
 				pl.ReportAuthBlocked(routes[j%2%len(routes)], authErr)
 				_ = pl.Snapshot()
-			}
-		}()
-	}
-	wg.Wait()
-	// Reload racing with readers.
-	ra, rb := mustURL(t, "socks5://a.test:1080"), mustURL(t, "socks5://b.test:1080")
-	for i := 0; i < 2; i++ {
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 10; j++ {
-				pl.Reload([]*url.URL{ra, rb})
-			}
-		}()
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 20; j++ {
-				_ = pl.Pick(nil)
 			}
 		}()
 	}

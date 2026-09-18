@@ -115,6 +115,32 @@ func TestLoadRuntimeDurationErrorsDoNotLeakYAMLValue(t *testing.T) {
 	}
 }
 
+func TestLoadRuntimeRejectsInvalidRuntimeValues(t *testing.T) {
+	for _, tc := range []struct {
+		name, old, replacement, want string
+	}{
+		{"invalid log level", "log-level: debug", "log-level: DEBUG", "log-level must be one of"},
+		{"zero retries", "max-retries: 4", "max-retries: 0", "max-retries must be >= 1"},
+		{"cooldown ordering", "  base: 2s\n  max: 1m", "  base: 2m\n  max: 1s", "must not exceed"},
+		{"non-positive timeout", "dial-timeout: 7s", "dial-timeout: 0s", "dial-timeout must be positive"},
+		{"negative body buffer", "  max-body-buffer: 42", "  max-body-buffer: -1", "global.max-body-buffer must be >= 0"},
+		{"nested unknown key", "  target-tls-insecure: true", "  target-tls-insecure: true\n  unknown: value", "invalid keys"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := strings.Replace(validRuntimeConfig, tc.old, tc.replacement, 1)
+			_, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+			for _, secret := range []string{"secret", "other-secret"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("error leaked %q: %v", secret, err)
+				}
+			}
+		})
+	}
+}
+
 func TestLoadRuntimeRejectsDuplicateRegardlessOfKind(t *testing.T) {
 	content := strings.Replace(validRuntimeConfig,
 		"    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6",
@@ -244,27 +270,9 @@ func TestValidListenerHostname(t *testing.T) {
 	}
 }
 
-func TestRuntimeStoreRejectsNilSnapshot(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("NewStore(nil) did not panic")
-		}
-	}()
-	NewStore(nil)
-}
-
-func TestRuntimeStorePublishesSnapshots(t *testing.T) {
-	initial := &RuntimeConfig{MaxRetries: 1}
-	store := NewStore(initial)
-	if got := store.Load(); got != initial {
-		t.Fatal("store did not load initial snapshot")
-	}
-	next := &RuntimeConfig{MaxRetries: 2}
-	store.Store(next)
-	if got := store.Load(); got != next {
-		t.Fatal("store did not publish new snapshot")
-	}
-}
+// The atomic generation store lives in internal/pool (which already imports
+// this package); its nil-rejection, publication, and in-flight snapshot
+// behavior is covered by internal/pool/generation_test.go.
 
 func TestWatchRuntimeReportsFileChange(t *testing.T) {
 	path := writeRuntimeConfig(t, validRuntimeConfig)

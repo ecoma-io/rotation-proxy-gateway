@@ -11,19 +11,20 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"proxy-auto-rotate-forwarder/internal/pool"
+	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/pool"
 )
 
 // Test-first: AdminMux /status currently can expose raw arbitrary errors.
 func TestStatusLeakProof(t *testing.T) {
 	u, _ := url.Parse("socks5://proxy.test:1080")
-	pl := pool.New([]*url.URL{u}, 30*time.Second, time.Minute)
-	p := pl.Pick(nil)
+	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, 30*time.Second, time.Minute)
+	p := pl.PickFor(nil, nil)
 	raw := errors.New("dial socks5://TESTUSER:TESTP/ss?w@rd@proxy.test:1080: refused\x1b[31m" + strings.Repeat("z", 600))
 	pl.ReportFailure(p, raw)
 	pl.ReportAuthBlocked(p, errors.New("auth sees socks5://TESTUSER2:TESTP2@proxy.test:1080 \x1b[1m"+strings.Repeat("y", 600)))
 
-	s := New(pl, defaultCfg(), testLogger(), "test")
+	s := newRuntimeServer(pl, defaultRuntime(), testLogger())
 	admin := httptest.NewServer(s.AdminMux())
 	defer admin.Close()
 	resp, err := http.Get(admin.URL + "/status")

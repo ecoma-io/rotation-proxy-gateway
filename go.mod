@@ -1,4 +1,4 @@
-module proxy-auto-rotate-forwarder
+module rotation-proxy-gateway
 
 go 1.25
 

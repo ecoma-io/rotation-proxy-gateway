@@ -7,10 +7,11 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"proxy-auto-rotate-forwarder/internal/config"
-	"proxy-auto-rotate-forwarder/internal/sanitize"
+	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/sanitize"
 )
 
 // Proxy is one upstream SOCKS route plus its health state.
@@ -84,20 +85,10 @@ type Pool struct {
 	entries []*Proxy
 	base    time.Duration
 	max     time.Duration
-	seq     uint64 // pick sequence driving least-recently-used rotation
+	seq     *atomic.Uint64 // shared pick sequence across immutable generations
 
 	// Now is the clock used for cooldowns; tests replace it.
 	Now func() time.Time
-}
-
-// New builds an unrestricted pool from parsed proxy URLs. It remains for
-// callers that do not use kinded routes; every route is treated as v4.
-func New(urls []*url.URL, base, max time.Duration) *Pool {
-	routes := make([]config.RouteSpec, 0, len(urls))
-	for _, u := range urls {
-		routes = append(routes, config.RouteSpec{URL: u, Kind: config.EgressV4})
-	}
-	return NewRoutes(routes, base, max)
 }
 
 // NewRoutes builds a pool from validated, kinded static routes.
@@ -110,19 +101,43 @@ func NewRoutes(routes []config.RouteSpec, base, max time.Duration) *Pool {
 		entries: entries,
 		base:    base,
 		max:     max,
+		seq:     &atomic.Uint64{},
 		Now:     time.Now,
 	}
 }
 
-func (pl *Pool) nextSeq() uint64 {
-	pl.seq++
-	return pl.seq
+// Reconfigure returns a new immutable route-list snapshot. Route health is
+// retained only for canonical URL+kind matches; existing in-flight operations
+// may safely keep using the original pool.
+func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration) *Pool {
+	pl.mu.Lock()
+	entries := append([]*Proxy(nil), pl.entries...)
+	now := pl.Now
+	seq := pl.seq
+	pl.mu.Unlock()
+
+	kept := make(map[string]*Proxy, len(entries))
+	for _, entry := range entries {
+		kept[routeKey(entry.URL, entry.Kind)] = entry
+	}
+	next := make([]*Proxy, 0, len(routes))
+	for _, route := range routes {
+		key := routeKey(route.URL, route.Kind)
+		if prior, ok := kept[key]; ok {
+			next = append(next, prior)
+		} else {
+			next = append(next, &Proxy{URL: route.URL, Kind: route.Kind})
+		}
+	}
+	return &Pool{entries: next, base: base, max: max, seq: seq, Now: now}
 }
 
-// Pick returns the next proxy regardless of egress kind. It is the mixed
-// listener's selection path and remains available for existing callers.
-func (pl *Pool) Pick(exclude map[*Proxy]bool) *Proxy {
-	return pl.PickFor(exclude, nil)
+func routeKey(u *url.URL, kind config.EgressKind) string {
+	return config.CanonicalRouteID(u) + "|" + string(kind)
+}
+
+func (pl *Pool) nextSeq() uint64 {
+	return pl.seq.Add(1)
 }
 
 // PickFor returns the next allowed proxy, excluding entries already tried for
@@ -172,13 +187,11 @@ func (pl *Pool) PickFor(exclude map[*Proxy]bool, allow func(*Proxy) bool) *Proxy
 
 // ReportSuccess records a successful use and clears any endpoint dial cooldown.
 // It does not clear an authentication block: unchanged credentials cannot be
-// expected to recover without a pool reload that changes the route URL.
+// expected to recover without a reload that replaces the route.
 func (pl *Pool) ReportSuccess(p *Proxy) {
-	pl.mu.Lock()
-	defer pl.mu.Unlock()
+	seq := pl.nextSeq()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	seq := pl.nextSeq()
 	p.consecutiveFailures = 0
 	p.cooldownUntil = time.Time{}
 	p.lastDialError = ""
@@ -192,8 +205,9 @@ func (pl *Pool) ReportSuccess(p *Proxy) {
 func (pl *Pool) ReportFailure(p *Proxy, err error) time.Duration {
 	pl.mu.Lock()
 	base, max := pl.base, pl.max
+	nowFunc := pl.Now
 	pl.mu.Unlock()
-	now := pl.Now() // before p.mu: keep lock order pool -> proxy
+	now := nowFunc()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.consecutiveFailures++
@@ -208,7 +222,7 @@ func (pl *Pool) ReportFailure(p *Proxy, err error) time.Duration {
 
 // saturatingCooldown returns base doubled (failures-1) times, capped at max.
 // It never overflows and never returns a negative duration, even when base or
-// max bypass Config validation (e.g. a direct pool.New caller).
+// max bypasses runtime configuration validation.
 func saturatingCooldown(base, max time.Duration, failures int) time.Duration {
 	if base <= 0 || max <= 0 {
 		return 0
@@ -268,51 +282,6 @@ func sanitizeAuthError(err error) string {
 
 func containsToken(haystack, needle string) bool {
 	return len(haystack) >= len(needle) && strings.Contains(haystack, needle)
-}
-
-// Reload replaces unrestricted pool contents, preserving health state for URLs
-// that are present both before and after the change. It exists for compatibility
-// with callers that do not declare egress kind.
-func (pl *Pool) Reload(urls []*url.URL) {
-	routes := make([]config.RouteSpec, 0, len(urls))
-	for _, u := range urls {
-		routes = append(routes, config.RouteSpec{URL: u, Kind: config.EgressV4})
-	}
-	pl.ReloadRoutes(routes)
-}
-
-// ReloadRoutes replaces pool contents while preserving state only when both URL
-// (including credentials) and declared egress kind are unchanged.
-func (pl *Pool) ReloadRoutes(routes []config.RouteSpec) {
-	pl.mu.Lock()
-	defer pl.mu.Unlock()
-	kept := make(map[string]*Proxy, len(pl.entries))
-	for _, e := range pl.entries {
-		kept[routeKey(e.URL, e.Kind)] = e
-	}
-	next := make([]*Proxy, 0, len(routes))
-	for _, route := range routes {
-		key := routeKey(route.URL, route.Kind)
-		if old, ok := kept[key]; ok {
-			next = append(next, old)
-			delete(kept, key)
-		} else {
-			next = append(next, &Proxy{URL: route.URL, Kind: route.Kind})
-		}
-	}
-	pl.entries = next
-}
-
-func routeKey(u *url.URL, kind config.EgressKind) string {
-	return u.String() + "|" + string(kind)
-}
-
-// SetCooldowns applies validated cooldown tuning for future endpoint dial
-// failures. Existing cooldown deadlines are deliberately left untouched.
-func (pl *Pool) SetCooldowns(base, max time.Duration) {
-	pl.mu.Lock()
-	pl.base, pl.max = base, max
-	pl.mu.Unlock()
 }
 
 // Snapshot returns the health view of every entry.
