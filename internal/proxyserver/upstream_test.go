@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -18,6 +19,20 @@ import (
 type socksOptions struct {
 	user, pass string
 	connectRep byte
+	// greetingRaw, when non-nil, is written as the method-selection reply
+	// after consuming the client greeting. It enables malformed-version,
+	// unsupported-method, and truncated-reply cases without sleeps.
+	greetingRaw []byte
+	// greetingNoReply consumes the client greeting then closes without a
+	// reply, modeling a truncated greeting.
+	greetingNoReply bool
+	// connectRaw, when non-nil, is written as the CONNECT reply after
+	// consuming the client CONNECT request, then the connection closes.
+	// It covers malformed, truncated, and unsupported-bound-type replies.
+	connectRaw []byte
+	// connectPrefix is extra stream bytes written immediately after a
+	// success reply, modeling a peer that pipelines post-handshake data.
+	connectPrefix []byte
 }
 
 type fakeSocks struct {
@@ -64,6 +79,10 @@ func (s *fakeSocks) handle(conn net.Conn) {
 	if err != nil {
 		return
 	}
+	if s.opts.connectRaw != nil {
+		conn.Write(s.opts.connectRaw) //nolint:errcheck
+		return
+	}
 	if s.opts.connectRep != 0 {
 		writeSocksReply(conn, s.opts.connectRep)
 		return
@@ -75,6 +94,9 @@ func (s *fakeSocks) handle(conn net.Conn) {
 	}
 	defer up.Close()
 	writeSocksReply(conn, 0x00)
+	if len(s.opts.connectPrefix) > 0 {
+		conn.Write(s.opts.connectPrefix) //nolint:errcheck
+	}
 	conn.SetDeadline(time.Time{})
 	if n := br.Buffered(); n > 0 {
 		b := make([]byte, n)
@@ -96,6 +118,18 @@ func readSocksGreeting(br *bufio.Reader, conn net.Conn, opts socksOptions) error
 	methods := make([]byte, head[1])
 	if _, err := io.ReadFull(br, methods); err != nil {
 		return err
+	}
+	if opts.greetingRaw != nil {
+		if _, err := conn.Write(opts.greetingRaw); err != nil {
+			return err
+		}
+		if len(opts.greetingRaw) < 2 {
+			return fmt.Errorf("truncated greeting reply")
+		}
+		return nil
+	}
+	if opts.greetingNoReply {
+		return fmt.Errorf("no greeting reply")
 	}
 	if opts.user == "" && opts.pass == "" {
 		_, err := conn.Write([]byte{0x05, 0x00})
@@ -242,5 +276,173 @@ func TestDialViaConnectReplyIsProtocolError(t *testing.T) {
 	var protocolErr *SocksProtocolError
 	if !errors.As(err, &protocolErr) || isProxyDialError(err) || isProxyAuthError(err) {
 		t.Fatalf("connect reply error = %T %v", err, err)
+	}
+}
+
+func assertSocksProtocolError(t *testing.T, err error, op string) *SocksProtocolError {
+	t.Helper()
+	var protocolErr *SocksProtocolError
+	if !errors.As(err, &protocolErr) {
+		t.Fatalf("expected SocksProtocolError, got %T %v", err, err)
+	}
+	if protocolErr.Op != op {
+		t.Fatalf("op = %q, want %q (err %v)", protocolErr.Op, op, err)
+	}
+	if isProxyDialError(err) || isProxyAuthError(err) {
+		t.Fatalf("protocol error misclassified as dial/auth: %T %v", err, err)
+	}
+	return protocolErr
+}
+
+func TestDialViaGreetingFailuresAreProtocolErrors(t *testing.T) {
+	cases := map[string]socksOptions{
+		"wrong version":        {greetingRaw: []byte{0x04, 0x00}},
+		"unsupported method":   {greetingRaw: []byte{0x05, 0x07}},
+		"no acceptable method": {greetingRaw: []byte{0x05, 0xff}},
+		"truncated choice":     {greetingRaw: []byte{0x05}},
+		"truncated no reply":   {greetingNoReply: true},
+	}
+	for name, opts := range cases {
+		t.Run(name, func(t *testing.T) {
+			fs := startSocks5Proxy(t, opts)
+			_, err := dialVia(context.Background(), fs.URL, "example.com:80", time.Second)
+			switch name {
+			case "no acceptable method":
+				if !isProxyAuthError(err) || isProxyDialError(err) {
+					t.Fatalf("auth error classification = %T %v", err, err)
+				}
+				var protocolErr *SocksProtocolError
+				if errors.As(err, &protocolErr) {
+					t.Fatalf("auth error must not be SocksProtocolError: %v", err)
+				}
+			case "unsupported method":
+				assertSocksProtocolError(t, err, "negotiate authentication")
+			default:
+				assertSocksProtocolError(t, err, "read greeting")
+			}
+		})
+	}
+}
+
+func TestDialViaConnectFramingFailuresAreProtocolErrors(t *testing.T) {
+	v4ok := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80}
+	cases := map[string]socksOptions{
+		"wrong version":          {connectRaw: []byte{0x04, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}},
+		"nonzero reserved":       {connectRaw: []byte{0x05, 0x00, 0x01, 0x01, 0, 0, 0, 0, 0, 0}},
+		"truncated reply":        {connectRaw: []byte{0x05, 0x00}},
+		"truncated bound ipv4":   {connectRaw: []byte{0x05, 0x00, 0x00, 0x01, 127, 0}},
+		"unsupported bound type": {connectRaw: []byte{0x05, 0x00, 0x00, 0x07, 0, 0}},
+		"ipv6 bound ok":          {connectRaw: []byte{0x05, 0x00, 0x00, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 80}},
+		"domain bound ok":        {connectRaw: append([]byte{0x05, 0x00, 0x00, 0x03, 4}, append([]byte("test"), 0, 80)...)},
+		"ipv4 bound ok":          {connectRaw: v4ok},
+	}
+	for name, opts := range cases {
+		t.Run(name, func(t *testing.T) {
+			fs := startSocks5Proxy(t, opts)
+			conn, err := dialVia(context.Background(), fs.URL, "example.com:80", time.Second)
+			switch name {
+			case "ipv6 bound ok", "domain bound ok", "ipv4 bound ok":
+				if err != nil {
+					t.Fatalf("dialVia: %v", err)
+				}
+				conn.Close()
+			case "unsupported bound type", "truncated bound ipv4":
+				assertSocksProtocolError(t, err, "read bound address")
+			default:
+				assertSocksProtocolError(t, err, "read connect")
+			}
+		})
+	}
+}
+
+func TestSocksConnectRequestFraming(t *testing.T) {
+	cases := []struct {
+		name string
+		host string
+		want []byte
+	}{
+		{"ipv4", "127.0.0.1", []byte{0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80}},
+		{"ipv6", "::1", append([]byte{0x05, 0x01, 0x00, 0x04}, append(make([]byte, 15), 1, 0, 80)...)},
+		{"domain", "example.com", append([]byte{0x05, 0x01, 0x00, 0x03, byte(len("example.com"))}, append([]byte("example.com"), 0, 80)...)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := socksConnectRequest(tc.host, 80)
+			if err != nil {
+				t.Fatalf("socksConnectRequest: %v", err)
+			}
+			if string(got) != string(tc.want) {
+				t.Fatalf("request = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	t.Run("oversized hostname", func(t *testing.T) {
+		if _, err := socksConnectRequest(strings.Repeat("a", 256), 80); err == nil {
+			t.Fatal("expected error for 256-byte hostname")
+		}
+		if _, err := socksConnectRequest("", 80); err == nil {
+			t.Fatal("expected error for empty hostname")
+		}
+	})
+}
+
+func TestDialViaOversizedTargetHostnameIsProtocolError(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{})
+	long := strings.Repeat("a", 256) + ".example:80"
+	_, err := dialVia(context.Background(), fs.URL, long, time.Second)
+	assertSocksProtocolError(t, err, "encode target")
+	if got := len(fs.hits); got != 1 {
+		t.Fatalf("SOCKS attempts = %d, want 1", got)
+	}
+}
+
+func TestDialViaBufferedPrefixDelivered(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{connectPrefix: []byte("early-bytes")})
+	conn, err := dialVia(context.Background(), fs.URL, startEchoTarget(t), time.Second)
+	if err != nil {
+		t.Fatalf("dialVia: %v", err)
+	}
+	defer conn.Close()
+	buf := make([]byte, len("early-bytes"))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read prefix: %v", err)
+	}
+	if string(buf) != "early-bytes" {
+		t.Fatalf("prefix = %q", buf)
+	}
+}
+
+func TestPostDialFailuresReturnSingleSanitized502(t *testing.T) {
+	rawCases := []struct {
+		name string
+		raw  []byte
+	}{
+		{"truncated connect reply", []byte{0x05, 0x00}},
+		{"unsupported bound type", []byte{0x05, 0x00, 0x00, 0x07, 0, 0}},
+	}
+	for _, tc := range rawCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := startSocks5Proxy(t, socksOptions{connectRaw: tc.raw})
+			ts, pl := newForwarder(t, fs)
+			resp, err := proxiedClient(t, ts.URL).Get("http://example.com/")
+			if err != nil {
+				t.Fatalf("GET: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Fatalf("status=%d, want 502", resp.StatusCode)
+			}
+			if string(body) != "upstream SOCKS setup failed\n" {
+				t.Fatalf("502 body = %q, want generic sanitized message", body)
+			}
+			snap := pl.Snapshot()[0]
+			if snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 || !snap.Available {
+				t.Fatalf("protocol failure changed route health: %+v", snap)
+			}
+			if got := len(fs.hits); got != 1 {
+				t.Fatalf("SOCKS attempts = %d, want 1", got)
+			}
+		})
 	}
 }
