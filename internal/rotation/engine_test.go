@@ -62,6 +62,7 @@ type ipServer struct {
 	static  atomic.Value // string
 	unique  atomic.Bool
 	counter atomic.Int32
+	hang    atomic.Int64 // handler delay, exercising probe timeouts
 }
 
 func newIPServer(t *testing.T, initial string) *ipServer {
@@ -69,6 +70,9 @@ func newIPServer(t *testing.T, initial string) *ipServer {
 	s := &ipServer{}
 	s.static.Store(initial)
 	s.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if d := time.Duration(s.hang.Load()); d > 0 {
+			time.Sleep(d)
+		}
 		if s.unique.Load() {
 			n := int(s.counter.Add(1))
 			fmt.Fprintf(w, "loc=XX\nip=10.%d.%d.%d\n", (n>>16)&255, (n>>8)&255, n&255)
@@ -367,6 +371,29 @@ func TestProbeIPParsesTrace(t *testing.T) {
 	}
 	if ip != "203.0.113.7" {
 		t.Fatalf("probeIP = %q, want 203.0.113.7", ip)
+	}
+}
+
+func TestProbeIPTimeoutBoundsConn(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	ips.hang.Store(int64(2 * time.Second)) // the answer would arrive, but late
+	cfg := &config.RuntimeConfig{Rotation: fastSettings()}
+	pl := testPool(t, cfg)
+	store := pool.NewStore(cfg, pl)
+	e := testEngine(t, ips, store, nil)
+	spec := manualRoute(t, "m1.test", time.Minute, apiSpec(newAPIServer(t)))
+	gen := pool.NewGeneration(cfg, pl)
+
+	// The caller's context outlives the probe budget: the connection must
+	// still be bounded by the timeout parameter, not the context deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := e.probeIP(ctx, gen, spec, 300*time.Millisecond); err == nil {
+		t.Fatal("probeIP succeeded past its timeout")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("probeIP returned after %s, want bounded by the 300ms timeout", elapsed)
 	}
 }
 

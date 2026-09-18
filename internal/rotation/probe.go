@@ -48,11 +48,13 @@ func (e *Engine) probeIP(ctx context.Context, gen *pool.Generation, spec config.
 	}
 	defer conn.Close()
 
-	if dl, ok := ctx.Deadline(); ok {
-		conn.SetDeadline(dl)
-	} else {
-		conn.SetDeadline(time.Now().Add(timeout))
+	// The probe budget bounds the connection even when the caller's context
+	// carries a later deadline: the timeout parameter is the contract.
+	deadline := time.Now().Add(timeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
 	}
+	conn.SetDeadline(deadline)
 
 	tlsConn := tls.Client(conn, e.probeTLS(checkURL.Hostname()))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
