@@ -93,26 +93,6 @@ func TestInvalidValues(t *testing.T) {
 	}
 }
 
-func TestDotEnvDoesNotOverrideEnvironment(t *testing.T) {
-	dir := t.TempDir()
-	t.Chdir(dir)
-	t.Setenv("MAX_RETRIES", "7") // real env wins over .env
-	envFile := "LISTEN_ADDR=:4321\nMAX_RETRIES=9\n# comment\n\nBADLINE\n"
-	if err := os.WriteFile(".env", []byte(envFile), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.ListenAddr != ":4321" {
-		t.Errorf("ListenAddr = %q, want :4321 from .env", cfg.ListenAddr)
-	}
-	if cfg.MaxRetries != 7 {
-		t.Errorf("MaxRetries = %d, want 7 (environment beats .env)", cfg.MaxRetries)
-	}
-}
-
 func TestParseProxiesRejectsNonSOCKS(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "proxies.txt")
 	content := "# comment line\n" +

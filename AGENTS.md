@@ -18,8 +18,9 @@ rules for this repo: `math/rand/v2` (never `math/rand`), `for range n` loops.
 
 ## Run
 
-`configs/proxies.txt` (ignored by git) holds one SOCKS5 route per line; `#`
-comments are allowed. Supported forms are:
+`proxies.txt` at the project root (ignored by git) holds one SOCKS5 route per
+line; `#` comments are allowed. Copy `proxies.example.txt` to create it.
+Supported forms are:
 
 ```text
 socks5://host:port
@@ -35,18 +36,18 @@ logs or `/status`.
 ```bash
 LISTEN_ADDR=:8080 \
 ADMIN_ADDR=127.0.0.1:8081 \
-PROXIES_FILE=configs/proxies.txt \
+PROXIES_FILE=proxies.txt \
 ./bin/paf
 ```
 
-An optional `.env` in the working directory is read without overriding the real
-environment. See `.env.example` for every knob:
+Configuration is supplied through the process environment. For the Docker
+deployment, `compose.yaml` documents every supported variable beside its value.
 
 |Env|Default|Meaning|
 |---|---|---|
 |`LISTEN_ADDR`|`:8080`|inbound proxy listener (HTTP + CONNECT)|
 |`ADMIN_ADDR`|`127.0.0.1:8081`|admin listener (always on; must differ from `LISTEN_ADDR`)|
-|`PROXIES_FILE`|`configs/proxies.txt`|SOCKS5 pool file|
+|`PROXIES_FILE`|`proxies.txt`|SOCKS5 pool file|
 |`MAX_RETRIES`|`3`|attempts across **distinct** routes after endpoint TCP dial or SOCKS authentication failure|
 |`COOLDOWN_BASE`|`15s`|first SOCKS endpoint **TCP dial** failure cooldown; doubles per consecutive dial failure, capped|
 |`COOLDOWN_MAX`|`10m`|maximum SOCKS endpoint TCP dial cooldown|
@@ -83,7 +84,7 @@ ADMIN_ADDR=127.0.0.1:8081 ./bin/paf healthcheck # exit 0 = healthy (Docker HEALT
 ```bash
 docker build -t paf:dev --build-arg VERSION=0.1.0-dev .
 docker run --rm paf:dev version
-# or full stack (mounts configs/proxies.txt read-only):
+# or full stack (mounts root-level proxies.txt read-only):
 docker compose up -d --build && curl http://127.0.0.1:8081/status
 ```
 
@@ -97,7 +98,7 @@ subcommand of the entrypoint binary itself (no shell in the image).
 
 ## Layout
 
-- `internal/config` — env + `.env` loading, SOCKS pool file parser
+- `internal/config` — environment loading, SOCKS pool file parser
 - `internal/pool` — fixed LRU round-robin rotation, endpoint dial cooldowns, SOCKS auth state, live `Reload`
 - `internal/proxyserver` — SOCKS5 dialing and inbound HTTP/CONNECT forwarding
 - `cmd/proxy-auto-rotate-forwarder` — entrypoint, signals, admin endpoints

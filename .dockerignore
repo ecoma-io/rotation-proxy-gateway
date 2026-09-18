@@ -1,0 +1,7 @@
+# Deployment credentials are bind-mounted at runtime and must not enter builds.
+proxies.txt
+
+# Local development artifacts do not belong in the build context.
+.git
+.claude
+bin

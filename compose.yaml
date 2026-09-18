@@ -1,6 +1,7 @@
 # Homelab deployment for proxy-auto-rotate-forwarder.
-# The pool file is mounted read-only; override the path or values via
-# environment as needed. Secrets live only in configs/proxies.txt (git-ignored).
+# proxies.txt is a root-level, Git-ignored secret file mounted read-only. Copy
+# proxies.example.txt before starting the service; never bake credentials into
+# the image or commit them.
 services:
   proxy:
     build:
@@ -9,21 +10,35 @@ services:
         VERSION: dev
     container_name: proxy
     ports:
-      - "8080:8080"       # forward proxy (HTTP absolute-URI + CONNECT)
+      - "8080:8080" # forward proxy (HTTP absolute-URI + CONNECT)
       - "127.0.0.1:8081:8081" # admin (healthz, status) — localhost only
     environment:
+      # Address for inbound HTTP forward-proxy requests and CONNECT tunnels.
       LISTEN_ADDR: ":8080"
-      # Bind inside the container on all interfaces; the ports mapping below
-      # still makes the admin listener reachable from the host localhost only.
+      # Admin listener inside the container. Host publishing above confines it
+      # to localhost; it must differ from LISTEN_ADDR.
       ADMIN_ADDR: ":8081"
-      PROXIES_FILE: /app/configs/proxies.txt
+      # In-container SOCKS5 pool path, backed by the root-level read-only bind.
+      PROXIES_FILE: /app/proxies.txt
+      # Total distinct routes attempted after endpoint dial/auth failures.
       MAX_RETRIES: "3"
+      # Homelab override of the 15s app default: first endpoint TCP-dial
+      # cooldown. It doubles on consecutive dial failures.
       COOLDOWN_BASE: 1s
+      # Upper bound for exponential endpoint TCP-dial cooldowns.
       COOLDOWN_MAX: 10m
+      # Timeout covering SOCKS endpoint dialing and SOCKS setup.
       CONNECT_TIMEOUT: 10s
+      # Homelab override of the secure app default: skip HTTPS target
+      # certificate verification through SOCKS. Never use for untrusted targets.
+      TARGET_TLS_INSECURE: "true"
+      # Buffered request-body limit in bytes for safe dial/auth fallback replay.
+      # Larger bodies stream once and cannot be retried after consumption.
+      MAX_BODY_BUFFER: "67108864"
+      # Application log threshold: debug, info, warn, or error.
       LOG_LEVEL: info
     volumes:
-      - ./configs/proxies.txt:/app/configs/proxies.txt:ro
+      - ./proxies.txt:/app/proxies.txt:ro
     healthcheck:
       test: ["CMD", "/app/proxy-auto-rotate-forwarder", "healthcheck"]
       interval: 30s

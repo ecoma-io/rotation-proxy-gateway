@@ -5,7 +5,7 @@
 #   host:port:user:pass
 #   user:pass@host:port
 #
-# Copy to configs/proxies.txt (gitignored: it carries credentials), then reload
-# with SIGHUP. Runtime state is preserved only for unchanged route URLs.
+# Copy to proxies.txt (gitignored: it carries credentials), then reload with
+# SIGHUP. Runtime state is preserved only for unchanged route URLs.
 proxy1.example.com:1080:username:password
 user:pass@proxy2.example.com:1080

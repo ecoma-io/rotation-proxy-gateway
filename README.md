@@ -16,7 +16,7 @@ availability or correctness of destination servers.
 ## Quick start
 
 ```bash
-cp configs/proxies.example.txt configs/proxies.txt # edit: your SOCKS5 routes
+cp proxies.example.txt proxies.txt # edit: your SOCKS5 routes
 LISTEN_ADDR=:8080 ADMIN_ADDR=127.0.0.1:8081 \
   go run ./cmd/proxy-auto-rotate-forwarder
 
@@ -48,8 +48,9 @@ operational counters.
 
 ## Upstream SOCKS5 pool
 
-`PROXIES_FILE` defaults to `configs/proxies.txt`. It contains one SOCKS5 route
-per line; blank lines and lines beginning with `#` are ignored.
+`PROXIES_FILE` defaults to root-level `proxies.txt`. It contains one SOCKS5
+route per line; blank lines and lines beginning with `#` are ignored. Copy the
+tracked `proxies.example.txt` to create the Git-ignored live file.
 
 Supported formats are:
 
@@ -175,14 +176,14 @@ never exposed in responses or logs.
 
 ## Configuration
 
-An optional `.env` in the working directory is read without overriding real
-environment variables.
+Configuration is read from the process environment. Docker deployment values
+and their operational comments live directly in `compose.yaml`.
 
 | Variable | Default | Meaning |
 |---|---:|---|
 | `LISTEN_ADDR` | `:8080` | Inbound proxy listener for HTTP and `CONNECT` |
 | `ADMIN_ADDR` | `127.0.0.1:8081` | Always-on admin listener; must differ from `LISTEN_ADDR` |
-| `PROXIES_FILE` | `configs/proxies.txt` | SOCKS5 pool file |
+| `PROXIES_FILE` | `proxies.txt` | SOCKS5 pool file |
 | `MAX_RETRIES` | `3` | Maximum distinct routes attempted after endpoint dial or SOCKS authentication failure |
 | `COOLDOWN_BASE` | `15s` | First endpoint TCP-dial cooldown; doubles for consecutive dial failures |
 | `COOLDOWN_MAX` | `10m` | Maximum endpoint TCP-dial cooldown |
@@ -263,7 +264,7 @@ replay after a genuine endpoint dial failure, and `CONNECT` tunneling.
 
 ## Source layout
 
-- `internal/config` — environment and `.env` loading; SOCKS pool-file parsing.
+- `internal/config` — environment loading; SOCKS pool-file parsing.
 - `internal/pool` — LRU selection, endpoint dial cooldowns, SOCKS
   authentication state, snapshots, and live reload.
 - `internal/proxyserver` — SOCKS5 dialing plus inbound HTTP and `CONNECT`

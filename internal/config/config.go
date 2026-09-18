@@ -1,6 +1,6 @@
-// Package config loads runtime configuration from environment variables
-// (with an optional .env file for local runs) and parses the upstream proxy
-// pool file. Empty environment values are treated as unset.
+// Package config loads runtime configuration from environment variables and
+// parses the upstream proxy pool file. Empty environment values are treated as
+// unset.
 package config
 
 import (
@@ -18,7 +18,7 @@ import (
 const (
 	DefaultListenAddr     = ":8080"
 	DefaultAdminAddr      = "127.0.0.1:8081"
-	DefaultProxiesFile    = "configs/proxies.txt"
+	DefaultProxiesFile    = "proxies.txt"
 	DefaultMaxRetries     = 3
 	DefaultCooldownBase   = 15 * time.Second
 	DefaultCooldownMax    = 10 * time.Minute
@@ -40,11 +40,9 @@ type Config struct {
 	LogLevel          string
 }
 
-// Load applies defaults, reads the optional .env from the working directory,
-// then overrides from the environment. Malformed values produce errors.
+// Load applies defaults, then overrides them from the process environment.
+// Malformed values produce errors.
 func Load() (*Config, error) {
-	_ = loadDotEnv(".env")
-
 	cfg := &Config{
 		ListenAddr:        DefaultListenAddr,
 		AdminAddr:         DefaultAdminAddr,
@@ -159,40 +157,6 @@ func envBool(key string, dst *bool) error {
 	}
 	*dst = b
 	return nil
-}
-
-// loadDotEnv reads KEY=VALUE lines into the environment without overriding
-// variables that are already set. Missing file is not an error.
-func loadDotEnv(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	defer f.Close()
-
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		k, v, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		k = strings.TrimSpace(k)
-		v = strings.TrimSpace(v)
-		if k == "" {
-			continue
-		}
-		if _, exists := os.LookupEnv(k); !exists {
-			_ = os.Setenv(k, v)
-		}
-	}
-	return sc.Err()
 }
 
 var validSchemes = map[string]bool{"socks5": true}
