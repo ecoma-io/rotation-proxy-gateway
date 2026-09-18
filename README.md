@@ -1,58 +1,97 @@
 # proxy-auto-rotate-forwarder
 
-`proxy-auto-rotate-forwarder` is a zero-dependency Go HTTP forward proxy. It
-accepts one stable **inbound HTTP proxy** endpoint for clients and routes every
-outbound connection through a pool of **SOCKS5** proxies.
+`proxy-auto-rotate-forwarder` is a Go HTTP forward proxy that accepts stable
+inbound HTTP proxy endpoints and routes traffic through a health-aware pool of
+**SOCKS5-only** upstream routes. It supports ordinary absolute-form HTTP
+requests and inbound `CONNECT` tunnels.
 
-It supports ordinary absolute-form HTTP requests and inbound `CONNECT` tunnels
-on one listener. Its health model is deliberately narrow: it manages
-reachability and authentication of configured SOCKS endpoints, not the
-availability or correctness of destination servers.
+> **Status:** This document is the normative behavior contract. In particular,
+> never infer SOCKS route health from a destination HTTP response.
 
-> **Status:** This document is the normative behavior contract. The
-> implementation and tests must conform to it. In particular, never infer SOCKS
-> route health from a destination HTTP status.
+## Inbound endpoints
+
+The process starts one private admin listener and up to three proxy listeners:
+
+| Endpoint | Default | Purpose |
+|---|---:|---|
+| Admin | `127.0.0.1:30120` | `/healthz` and `/status`; keep private |
+| Mixed proxy | `:30121` | Selects both v4- and v6-egress routes |
+| IPv4 proxy | `:30122` | Selects only `kind: v4` routes |
+| IPv6 proxy | `:30123` | Selects only `kind: v6` routes |
+
+`kind` is the public egress IP family supplied by a proxy provider. It is not
+the SOCKS endpoint address family and it does not impose an IPv4/IPv6 policy on
+the client’s target destination.
+
+A single shared pool owns health state. Therefore, a dial cooldown or SOCKS
+authentication block observed through the v4 listener is also observed by the
+mixed listener when it considers that route. A listener never falls through to
+a route of another kind.
 
 ## Quick start
 
 ```bash
-cp proxies.example.txt proxies.txt # edit: your SOCKS5 routes
-LISTEN_ADDR=:8080 ADMIN_ADDR=127.0.0.1:8081 \
-  go run ./cmd/proxy-auto-rotate-forwarder
+cp config.example.yaml config.yaml # add real static SOCKS routes
+MIXED_LISTEN_ADDR=:30121 \
+V4_LISTEN_ADDR=:30122 \
+V6_LISTEN_ADDR=:30123 \
+ADMIN_ADDR=127.0.0.1:30120 \
+go run ./cmd/proxy-auto-rotate-forwarder
 
-curl -x http://127.0.0.1:8080 https://example.com/
-curl http://127.0.0.1:8081/status
+curl -x http://127.0.0.1:30121 https://example.com/
+curl http://127.0.0.1:30120/status
 ```
 
-## Architecture
+`config.yaml` normally contains upstream credentials and is ignored by Git and
+Docker build contexts. Do not commit it or bake it into an image.
 
-```text
-client
-  |
-  | absolute-form HTTP request or CONNECT target:port
-  v
-proxy-auto-rotate-forwarder
-  |                 \
-  |                  \-- admin listener: health and pool status
-  v
-selected SOCKS5 endpoint
-  |
-  | SOCKS5 CONNECT
-  v
-requested destination
+## Configuration
+
+### Bootstrap settings — environment, restart required
+
+These values create sockets or choose the watched file and are read only when
+the process starts. Empty proxy listener addresses disable their listener, but
+at least one proxy listener must remain enabled.
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `CONFIG_FILE` | `config.yaml` | Runtime YAML file path |
+| `ADMIN_ADDR` | `127.0.0.1:30120` | Always-on private admin listener |
+| `MIXED_LISTEN_ADDR` | `:30121` | Mixed v4/v6 egress listener |
+| `V4_LISTEN_ADDR` | `:30122` | v4-egress-only listener |
+| `V6_LISTEN_ADDR` | `:30123` | v6-egress-only listener |
+
+All enabled addresses must be valid, use a numeric port, and not overlap —
+including wildcard binds on the same port. Docker Healthcheck uses only
+`ADMIN_ADDR`; a bad runtime reload cannot make an otherwise-running service
+unhealthy.
+
+### Runtime YAML — validated and hot-reloaded
+
+See [`config.example.yaml`](config.example.yaml). The file is the complete
+source for runtime behavior and static routes:
+
+```yaml
+log-level: info
+max-retries: 3
+cooldown:
+  base: 15s
+  max: 10m
+dial-timeout: 10s
+global:
+  target-tls-insecure: false
+  max-body-buffer: 67108864
+proxies:
+  auto:
+    - proxy: socks5://username:password@provider.example:1080
+      kind: v4
+    - proxy: socks5://username:password@[2001:db8::1]:1080
+      kind: v6
+  manual: []
 ```
 
-The public listener defaults to `:8080`; the admin listener defaults to
-`127.0.0.1:8081`. Keep the admin listener private: it exposes route health and
-operational counters.
-
-## Upstream SOCKS5 pool
-
-`PROXIES_FILE` defaults to root-level `proxies.txt`. It contains one SOCKS5
-route per line; blank lines and lines beginning with `#` are ignored. Copy the
-tracked `proxies.example.txt` to create the Git-ignored live file.
-
-Supported formats are:
+`proxies.auto` is the phase-1 source of static routes. The accepted `proxy`
+forms are:
 
 ```text
 socks5://host:port
@@ -61,238 +100,141 @@ host:port:user:pass
 user:pass@host:port
 ```
 
-The two bare forms default to SOCKS5. Explicit `http://` and `https://` entries
-are rejected; outbound HTTP and HTTPS proxy protocols are not supported.
+Every route requires an explicit port. Bracket IPv6 literals. HTTP/HTTPS routes,
+URL paths, queries, fragments, unknown active YAML fields, duplicate route
+identities, and non-lowercase/missing `kind` are rejected. A duplicate remains
+a duplicate even if it claims another kind. Credentials never appear in errors,
+logs, or `/status`.
 
-URL userinfo is used only for SOCKS authentication. Credentials are never shown
-in logs or `/status`; route identities are reported as `host:port` only.
+`global.target-tls-insecure` and `global.max-body-buffer` are global settings;
+per-route overrides are rejected. `target-tls-insecure` defaults to `false` and
+should not be enabled for untrusted targets.
 
-The pool uses stable least-recently-used selection by pick sequence (true
-round-robin). A request never tries the same route twice. A route in dial
-cooldown is skipped when another usable route is available; if all usable routes
-are cooling down, the route recovering soonest is used rather than failing
-immediately. An authentication-blocked route is not usable.
+`proxies.manual` is deliberately accepted but **ignored** in phase 1. No API
+request is made, no manual route is selected, and its contents are never exposed
+by logs or status. API-driven rotation is a future phase.
 
-Sending `SIGHUP` reloads the pool file. A parsing error leaves the current pool
-untouched. An unchanged URL preserves its runtime state; changing a URL,
-including its userinfo, creates a new route with clean state.
+### Reload behavior
+
+Viper watches the runtime YAML file. The process also retains `SIGHUP` as a
+manual and bind-mount-safe reload trigger:
+
+```bash
+kill -HUP "$(pgrep -f proxy-auto-rotate-forwarder)"
+# Docker:
+docker kill -s HUP proxy
+```
+
+Each reload parses and validates a complete new configuration before changing
+any serving state. A syntax error, partial write, invalid route, or invalid
+runtime setting logs a sanitized warning and retains the last-known-good config
+and pool.
+
+The following settings apply to new client operations without restart:
+
+- `log-level`
+- `max-retries`
+- `cooldown.base` and `cooldown.max` (new dial failures only)
+- `dial-timeout`
+- `global.target-tls-insecure`
+- `global.max-body-buffer`
+- `proxies.auto`
+
+Unchanged URL+kind routes preserve their LRU, cooldown, authentication-block,
+and counter state. Changing userinfo or kind creates a fresh route state.
 
 ## Failure and route-health contract
 
 ### Definitions
 
-- **`proxy_connect_error`**: failure of DNS resolution or TCP dialing to the
-  configured SOCKS endpoint. This includes connection refused, dial timeout,
-  and host or network unreachable errors returned while dialing that endpoint.
+- **`proxy_connect_error`**: DNS resolution or TCP dialing of the configured
+  SOCKS endpoint fails.
 - **`auth_route_error`**: a connected SOCKS endpoint cannot authenticate the
-  configured route. This includes an endpoint requiring credentials when none
-  are configured, accepting none of the offered methods, or rejecting RFC 1929
-  username/password credentials.
-- **Post-dial setup/target outcome**: every other error after the TCP dial has
-  succeeded, including SOCKS framing errors, SOCKS target `CONNECT` replies,
-  target TLS failures, request write/read failures, malformed target responses,
-  client cancellation, and established-tunnel failures.
-
-Only `proxy_connect_error` changes dial health and creates exponential cooldown.
-`auth_route_error` is recorded separately and blocks that route without creating
-dial cooldown. Neither category asserts that a destination server is healthy or
-unhealthy.
-
-### Outcome matrix
+  configured route.
+- **Post-dial setup/target outcome**: every other error after the endpoint TCP
+  dial succeeds, including SOCKS framing/target replies, TLS, writes, reads,
+  malformed responses, cancellation, and established-tunnel failures.
 
 | Outcome | Pool handling | Request handling |
 |---|---|---|
-| SOCKS endpoint DNS/TCP dial fails | Record `proxy_connect_error`, increment dial-failure count, and apply exponential cooldown | Retry a distinct route; return synthetic `502` only when no usable route remains |
-| SOCKS endpoint cannot authenticate the route | Record `auth_route_error`, block the route, and do not change dial cooldown | Retry a distinct route; return synthetic `502` only when no usable route remains |
-| SOCKS protocol/setup error after endpoint TCP dial, including a non-success target `CONNECT` reply | No failure-health mutation and no retry | Sanitized synthetic `502` |
-| Target TLS, HTTP write/read, or malformed-response error after SOCKS setup succeeds | No failure-health mutation and no retry | Synthetic `502` unless the client has cancelled |
-| Valid target HTTP response, including `407`, `408`, `429`, and `5xx` | Record normal route success; no failure/cooldown mutation and no retry | Forward the response once |
-| Client cancels/disconnects | No route-health mutation and no retry | End the request/connection |
-| Tunnel breaks after `200 Connection Established` | No route-health mutation and no retry | Close the tunnel |
+| SOCKS endpoint DNS/TCP dial fails | Record `proxy_connect_error`, exponential cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
+| SOCKS endpoint cannot authenticate | Auth-block the route; no dial cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
+| SOCKS setup/target error after TCP dial | No health mutation and no retry | Sanitized `502` |
+| Target TLS, HTTP write/read, malformed response | No health mutation and no retry | `502` unless client cancelled |
+| Valid target HTTP response, including `407`, `408`, `429`, `5xx` | Record success; no rotation/cooldown | Forward once |
+| Client cancellation/disconnect | No health mutation and no retry | End operation |
+| Established tunnel breaks | No health mutation | Close tunnel |
 
-An authentication-blocked route stays blocked until a reload changes its exact
-pool entry. This is intentional: unchanged credentials are not expected to
-recover spontaneously. Changed credentials create a new route that can be tried
-again.
+The pool is least-recently-used by pick sequence (true round-robin). A request
+never tries the same route twice. Cooling routes are skipped when a usable
+eligible route exists; when all eligible non-auth-blocked routes cool down, the
+one recovering soonest is tried. Authentication blocks remain until the route
+identity changes on reload.
 
-### HTTP `407` is ordinary target data
-
-There is no outbound HTTP proxy exchange in this project, so there is no
-outbound HTTP-proxy `407` attribution problem. SOCKS authentication errors are
-identified from the SOCKS protocol before a target HTTP request exists.
-
-A `407 Proxy Authentication Required` received as a valid HTTP response from a
-target or intermediary is ordinary response data. It is forwarded once, has no
-SOCKS authentication meaning, does not rotate the pool, and does not create a
-cooldown.
+A target HTTP `407` is ordinary target response data. It is not SOCKS
+authentication data, does not rotate, and does not create cooldown.
 
 ## HTTP and CONNECT behavior
 
-### Ordinary HTTP requests
+Clients send absolute-form HTTP requests. The forwarder opens one SOCKS5
+`CONNECT` tunnel to the target for each ordinary request, writes an origin-form
+request, and performs target TLS inside that tunnel for HTTPS. It removes
+hop-by-hop headers, including `Connection`-listed headers and
+`Proxy-Authorization`, in both directions.
 
-Clients send absolute-form requests, for example:
+Bodies up to `global.max-body-buffer` are replayable after an endpoint dial or
+SOCKS authentication fallback. Known-larger bodies stream immediately;
+unknown-length bodies are probed up to the limit. Once streamed bytes have been
+consumed, the body cannot safely be retried. Declared request trailers retain
+chunked framing.
 
-```http
-GET http://example.com/path HTTP/1.1
-Host: example.com
-```
-
-The forwarder establishes a SOCKS5 `CONNECT` tunnel to the request target, then
-writes an origin-form HTTP request through that tunnel. For an `https://` target,
-it performs target TLS inside the SOCKS tunnel before writing the request.
-
-Every successful target response is forwarded once. A `407`, `408`, `429`, or
-`5xx` response does not cause rotation or dial cooldown.
-
-Known-length request bodies larger than `MAX_BODY_BUFFER` start streaming to
-the selected route immediately, without an initial body buffer. Bodies up to the
-limit are replayable for an endpoint dial or SOCKS authentication fallback. For
-unknown-length bodies, the forwarder probes up to the limit so small bodies keep
-that replay safety; a body found to exceed the limit then streams once. A streamed
-body cannot safely be retried after the forwarder has begun consuming it.
-
-Each ordinary request uses its own SOCKS tunnel rather than a reused HTTP
-transport connection. This makes the boundary between endpoint TCP-dial errors
-and all later errors explicit and reliable.
-
-### `CONNECT` tunnels
-
-For an inbound request such as:
-
-```http
-CONNECT api.example.com:443 HTTP/1.1
-Host: api.example.com:443
-```
-
-The forwarder sends a SOCKS5 `CONNECT` command to the selected route and returns
-`200 Connection Established` only after the SOCKS endpoint reports success.
-After that point, bytes flow verbatim in both directions. A target refusal
-reported by SOCKS becomes a sanitized `502`; it is not evidence that the SOCKS
-endpoint itself is unreachable. A post-establishment reset or destination
-failure never affects route health.
-
-## Headers and privacy
-
-Hop-by-hop headers are removed in both directions, including headers named by
-`Connection`. `Proxy-Authorization` is never sent onward to destinations and is
-never exposed in responses or logs.
-
-## Configuration
-
-Configuration is read from the process environment. Docker deployment values
-and their operational comments live directly in `compose.yaml`.
-
-| Variable | Default | Meaning |
-|---|---:|---|
-| `LISTEN_ADDR` | `:8080` | Inbound proxy listener for HTTP and `CONNECT` |
-| `ADMIN_ADDR` | `127.0.0.1:8081` | Always-on admin listener; must differ from `LISTEN_ADDR` |
-| `PROXIES_FILE` | `proxies.txt` | SOCKS5 pool file |
-| `MAX_RETRIES` | `3` | Maximum distinct routes attempted after endpoint dial or SOCKS authentication failure |
-| `COOLDOWN_BASE` | `15s` | First endpoint TCP-dial cooldown; doubles for consecutive dial failures |
-| `COOLDOWN_MAX` | `10m` | Maximum endpoint TCP-dial cooldown |
-| `CONNECT_TIMEOUT` | `10s` | Timeout for SOCKS endpoint dial and SOCKS setup |
-| `TARGET_TLS_INSECURE` | `false` | Skip certificate verification for HTTPS targets reached through SOCKS; avoid in production |
-| `MAX_BODY_BUFFER` | `64MiB` | Maximum request body buffered for dial/auth fallback replay; known-larger bodies stream immediately |
-| `LOG_LEVEL` | `info` | Application default; `debug` adds request-flow events, while `info`, `warn`, and `error` progressively filter them. The supplied Compose deployment overrides this to `warn`. |
+For CONNECT, the service returns `200 Connection Established` only after the
+SOCKS target CONNECT succeeds, then relays bytes bidirectionally. Failures after
+that point do not alter route health.
 
 ## Admin and observability
 
 ```bash
-curl http://127.0.0.1:8081/healthz # body: ok
-curl http://127.0.0.1:8081/status  # version, uptime, requests, rotations, pool state
-ADMIN_ADDR=127.0.0.1:8081 ./bin/paf healthcheck
+curl http://127.0.0.1:30120/healthz # body: ok
+curl http://127.0.0.1:30120/status
+ADMIN_ADDR=127.0.0.1:30120 ./bin/paf healthcheck
 ./bin/paf version
 ```
 
-`/status` reports redacted route identities and distinguishes TCP dial failures
-from SOCKS authentication-route failures. A dial failure records its cooldown
-and last safe error. An authentication-route failure is reported separately and
-never extends dial cooldown. The `rotations` counter counts route changes, not a
-proxy-health verdict by itself.
+`/status` keeps `version`, `uptime`, global `requests`, global `rotations`, and
+redacted `pool` state. It additionally reports safe per-listener counters and
+each route’s `kind`. Route identities are always `host:port`, never userinfo.
 
-### Structured request logs
-
-Every proxied HTTP request and CONNECT tunnel receives a process-local,
-monotonically increasing `request_id`. It is generated by the forwarder—not
-accepted from client headers—so every retry and terminal outcome for one client
-operation can be grouped safely. `request_id` restarts when the process restarts.
-
-| Level | Events | Purpose |
-|---|---|---|
-| `debug` | request/tunnel start, body replay mode, client cancellation | Full control-flow investigation |
-| `info` | successful HTTP response, established CONNECT tunnel, lifecycle events | One normal terminal event per successful operation |
-| `warn` | endpoint dial/auth fallback, terminal setup failure or no-route `502` | Operational degradation and client-visible failures |
-| `error` | failed hijack and process/internal failures | The server could not perform its own work |
-
-Route retries share a stable vocabulary: `target`, `upstream`, `attempt`,
-`attempts`, `error_kind`, `error`, `cooldown`, and `duration`. `upstream` and
-`target` contain host or host:port only; logs never contain route userinfo,
-request URLs/queries, headers, or bodies. `cooldown` is emitted only for
-`error_kind=proxy_connect`, which makes the sole route-health-mutating failure
-explicit. `error_kind=auth_route` is an authentication block; `setup` is a
-post-dial terminal error; `no_route` means all eligible routes were exhausted.
-
-The supplied `compose.yaml` uses `LOG_LEVEL=warn`, so healthy operations do not
-write a per-request line in the homelab deployment. It retains fallback and
-terminal-failure warnings; temporarily override it with `info` or `debug` when
-per-request tracing is needed. Compose uses the Docker `json-file` driver with
-three 10 MiB files, limiting this container's stored logs to 30 MiB.
-
-For example, `LOG_LEVEL=debug` makes a fallback easy to correlate:
-
-```text
-... level=DEBUG msg="request start" request_id=42 method=GET target=example.com
-... level=WARN  msg="upstream dial failed" request_id=42 upstream=198.51.100.7:1080 attempt=1 error_kind=proxy_connect cooldown=15s
-... level=INFO  msg=request request_id=42 upstream=198.51.100.8:1080 status=200 attempts=2 duration=31ms
-```
-
-The shared `request_id=42` proves the endpoint TCP-dial failure was retried on
-the next route and that the second route completed the same client operation.
-
-## Operations
-
-Graceful shutdown proceeds in this order:
-
-1. drain normal proxy requests for up to 10 seconds;
-2. drain the admin listener;
-3. close hijacked `CONNECT` tunnels, which Go's `http.Server.Shutdown` does not
-   track automatically.
+Each request has a process-local `request_id`. Logs additionally include
+`listener=mixed|v4|v6`, host-only `target` and `upstream`, retry attempts,
+error category, and cooldown only for endpoint dial errors. They never log full
+URLs, headers, bodies, userinfo, or the ignored manual API configuration.
 
 ## Docker
 
 ```bash
-docker build -t paf:dev --build-arg VERSION=0.1.0-dev .
-docker run --rm paf:dev version
-
-# Full stack. The pool file is mounted read-only.
+cp config.example.yaml config.yaml
+# edit config.yaml with real routes
 docker compose up -d --build
-curl http://127.0.0.1:8081/status
+curl http://127.0.0.1:30120/status
 ```
 
-The Docker image is a static binary in `scratch` plus the CA bundle needed to
-verify HTTPS targets. The container healthcheck invokes the binary's
-`healthcheck` subcommand directly; there is no shell in the runtime image.
-`compose.yaml` maps the proxy on host port `8080` and binds the admin port to
-`127.0.0.1:8081` only. It uses `LOG_LEVEL=warn` and bounded Docker `json-file`
-logging (three 10 MiB files); set `LOG_LEVEL=info` or `LOG_LEVEL=debug`
-temporarily when detailed successful-request logs are needed.
+Compose publishes ports `30121` (mixed), `30122` (v4), and `30123` (v6), while
+publishing admin `30120` to host loopback only. The image remains a static
+binary in `scratch` with CA certificates and no shell; its healthcheck invokes
+the binary subcommand directly. Compose retains at most three 10 MiB JSON log
+files.
 
-## Non-goals
+## Migration from `proxies.txt`
 
-This project does not:
-
-- support HTTP or HTTPS upstream proxy routes;
-- determine whether an origin service is healthy;
-- treat arbitrary HTTP `4xx`/`5xx` responses as proof that a SOCKS endpoint is
-  unhealthy;
-- retry destination or application failures across egress routes;
-- provide weighted routing, domain policy routing, geo routing, or a remote
-  control plane;
-- intercept or decrypt inbound `CONNECT` tunnel traffic.
+For each old line, create one `proxies.auto` item and choose `kind` from your
+provider’s documented public egress family. There is no safe automatic family
+detection from the SOCKS hostname/IP. `proxies.txt` is no longer loaded.
 
 ## Build and verification
 
-Go 1.25 or newer is required.
+Go 1.25 or newer is required. The project now uses Viper for YAML loading and
+file watching.
 
 ```bash
 gofmt -w .
@@ -301,17 +243,5 @@ go test -race ./...
 go build -ldflags "-X main.version=0.1.0-dev" -o bin/paf ./cmd/proxy-auto-rotate-forwarder
 ```
 
-The test suite covers endpoint dial retry/cooldown, SOCKS authentication state,
-target `407`/`408`/`429`/`5xx` pass-through without cooldown, SOCKS target
-failure without cooldown, post-dial setup failures without retry, request-body
-replay after a genuine endpoint dial failure, and `CONNECT` tunneling.
-
-## Source layout
-
-- `internal/config` — environment loading; SOCKS pool-file parsing.
-- `internal/pool` — LRU selection, endpoint dial cooldowns, SOCKS
-  authentication state, snapshots, and live reload.
-- `internal/proxyserver` — SOCKS5 dialing plus inbound HTTP and `CONNECT`
-  forwarding.
-- `cmd/proxy-auto-rotate-forwarder` — process entrypoint, signals, and admin
-  endpoints.
+Graceful shutdown drains proxy requests for up to ten seconds, drains admin,
+then closes hijacked CONNECT tunnels that `http.Server.Shutdown` does not track.

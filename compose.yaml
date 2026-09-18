@@ -1,7 +1,7 @@
 # Homelab deployment for proxy-auto-rotate-forwarder.
-# proxies.txt is a root-level, Git-ignored secret file mounted read-only. Copy
-# proxies.example.txt before starting the service; never bake credentials into
-# the image or commit them.
+# config.yaml is a root-level, Git-ignored credential-bearing runtime file.
+# Copy config.example.yaml first; it is mounted read-only and never baked into
+# the image or committed.
 services:
   proxy:
     build:
@@ -10,41 +10,24 @@ services:
         VERSION: dev
     container_name: proxy
     ports:
-      - "8080:8080" # forward proxy (HTTP absolute-URI + CONNECT)
-      - "127.0.0.1:8081:8081" # admin (healthz, status) — localhost only
+      - "30121:30121" # mixed IPv4/IPv6 egress forward proxy
+      - "30122:30122" # IPv4-egress forward proxy
+      - "30123:30123" # IPv6-egress forward proxy
+      - "127.0.0.1:30120:30120" # admin: healthz and status, localhost only
     environment:
-      # Address for inbound HTTP forward-proxy requests and CONNECT tunnels.
-      LISTEN_ADDR: ":8080"
-      # Admin listener inside the container. Host publishing above confines it
-      # to localhost; it must differ from LISTEN_ADDR.
-      ADMIN_ADDR: ":8081"
-      # In-container SOCKS5 pool path, backed by the root-level read-only bind.
-      PROXIES_FILE: /app/proxies.txt
-      # Total distinct routes attempted after endpoint dial/auth failures.
-      MAX_RETRIES: "3"
-      # Homelab override of the 15s app default: first endpoint TCP-dial
-      # cooldown. It doubles on consecutive dial failures.
-      COOLDOWN_BASE: 1s
-      # Upper bound for exponential endpoint TCP-dial cooldowns.
-      COOLDOWN_MAX: 10m
-      # Timeout covering SOCKS endpoint dialing and SOCKS setup.
-      CONNECT_TIMEOUT: 10s
-      # Homelab override of the secure app default: skip HTTPS target
-      # certificate verification through SOCKS. Never use for untrusted targets.
-      TARGET_TLS_INSECURE: "true"
-      # Buffered request-body limit in bytes for safe dial/auth fallback replay.
-      # Larger bodies stream once and cannot be retried after consumption.
-      MAX_BODY_BUFFER: "67108864"
-      # Homelab default: suppress healthy per-request logs while retaining
-      # fallback and terminal-failure warnings. Override with info/debug to investigate.
-      LOG_LEVEL: warn
+      # Bootstrap-only settings: changes require a container restart.
+      CONFIG_FILE: /app/config.yaml
+      ADMIN_ADDR: ":30120"
+      MIXED_LISTEN_ADDR: ":30121"
+      V4_LISTEN_ADDR: ":30122"
+      V6_LISTEN_ADDR: ":30123"
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
     volumes:
-      - ./proxies.txt:/app/proxies.txt:ro
+      - ./config.yaml:/app/config.yaml:ro
     healthcheck:
       test: ["CMD", "/app/proxy-auto-rotate-forwarder", "healthcheck"]
       interval: 30s

@@ -16,6 +16,8 @@ func TestHealthcheckURL(t *testing.T) {
 		want string
 	}{
 		{name: "empty host defaults to loopback", addr: ":8081", want: "http://127.0.0.1:8081/healthz"},
+		{name: "IPv4 wildcard defaults to loopback", addr: "0.0.0.0:8081", want: "http://127.0.0.1:8081/healthz"},
+		{name: "IPv6 wildcard defaults to loopback", addr: "[::]:8081", want: "http://[::1]:8081/healthz"},
 		{name: "loopback host", addr: "127.0.0.1:8081", want: "http://127.0.0.1:8081/healthz"},
 		{name: "ipv6 loopback", addr: "[::1]:8081", want: "http://[::1]:8081/healthz"},
 		{name: "named host with port passes through", addr: "localhost:8081", want: "http://localhost:8081/healthz"},

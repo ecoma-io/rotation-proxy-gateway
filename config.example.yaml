@@ -1,0 +1,46 @@
+# Runtime configuration for proxy-auto-rotate-forwarder.
+# The process watches this file and also accepts SIGHUP for a validated reload.
+# Copy it to config.yaml, replace the example routes, then start the service.
+# config.yaml is intentionally ignored because it normally contains credentials.
+#
+# `kind` is the public egress IP family guaranteed by the proxy provider. It
+# does not describe the SOCKS endpoint address family or restrict targets.
+
+# Application log threshold: debug, info, warn, or error.
+log-level: info
+
+# Total distinct eligible routes attempted after endpoint TCP-dial or SOCKS
+# authentication failures.
+max-retries: 3
+
+cooldown:
+  # First SOCKS endpoint TCP-dial failure cooldown; it doubles per consecutive
+  # dial failure, capped by max.
+  base: 15s
+  # Upper bound for exponential endpoint TCP-dial cooldowns.
+  max: 10m
+
+# Timeout covering SOCKS endpoint TCP dialing and SOCKS setup.
+dial-timeout: 10s
+
+global:
+  # Skip HTTPS target certificate verification through SOCKS. The secure default
+  # is false; never enable this for untrusted targets.
+  target-tls-insecure: false
+  # Request bodies at or below this size are replayable after a dial/auth
+  # fallback. Larger bodies stream once.
+  max-body-buffer: 67108864
+
+proxies:
+  # Static SOCKS5 routes selected by the local health-aware pool. Accepted proxy
+  # forms are socks5://host:port, socks5://user:pass@host:port,
+  # host:port:user:pass, and user:pass@host:port. Bracket IPv6 literals.
+  auto:
+    - proxy: socks5://username:password@v4-provider.example:1080
+      kind: v4
+    - proxy: socks5://username:password@[2001:db8::1]:1080
+      kind: v6
+
+  # Reserved for phase 2 API-driven rotation. It is accepted but ignored in
+  # phase 1: no route is added and no API request is performed.
+  manual: []

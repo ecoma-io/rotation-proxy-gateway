@@ -492,6 +492,123 @@ func TestRequestBodyBufferBoundaries(t *testing.T) {
 	}
 }
 
+func TestBufferedRequestFraming(t *testing.T) {
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch} {
+		t.Run(method+" empty", func(t *testing.T) {
+			r := httptest.NewRequest(method, "http://example.test/", nil)
+			out := buildOutbound(r, []byte{})
+			var wire bytes.Buffer
+			if err := out.Write(&wire); err != nil {
+				t.Fatalf("write outbound request: %v", err)
+			}
+			got := wire.String()
+			if !strings.Contains(got, "Content-Length: 0\r\n") {
+				t.Fatalf("missing zero content length:\n%s", got)
+			}
+			if strings.Contains(got, "Transfer-Encoding: chunked") {
+				t.Fatalf("empty request was chunked:\n%s", got)
+			}
+		})
+	}
+	t.Run("GET no body", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
+		out := buildOutbound(r, nil)
+		var wire bytes.Buffer
+		if err := out.Write(&wire); err != nil {
+			t.Fatalf("write outbound request: %v", err)
+		}
+		got := wire.String()
+		for _, unexpected := range []string{"Content-Length:", "Transfer-Encoding:"} {
+			if strings.Contains(got, unexpected) {
+				t.Fatalf("bodyless GET contained %q:\n%s", unexpected, got)
+			}
+		}
+	})
+	t.Run("chunked body without trailers", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodPost, "http://example.test/", nil)
+		r.TransferEncoding = []string{"chunked"}
+		out := buildOutbound(r, []byte("abc"))
+		var wire bytes.Buffer
+		if err := out.Write(&wire); err != nil {
+			t.Fatalf("write outbound request: %v", err)
+		}
+		got := wire.String()
+		if !strings.Contains(got, "Content-Length: 3\r\n") || strings.Contains(got, "Transfer-Encoding:") {
+			t.Fatalf("chunked buffered request was not normalized:\n%s", got)
+		}
+	})
+	t.Run("empty body with trailer", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodPost, "http://example.test/", nil)
+		r.TransferEncoding = []string{"chunked"}
+		r.Trailer = http.Header{"X-Checksum": {"done"}}
+		out := buildOutbound(r, []byte{})
+		var wire bytes.Buffer
+		if err := out.Write(&wire); err != nil {
+			t.Fatalf("write outbound request: %v", err)
+		}
+		got := wire.String()
+		for _, want := range []string{"Transfer-Encoding: chunked\r\n", "Trailer: X-Checksum\r\n", "0\r\nX-Checksum: done\r\n\r\n"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("trailer request missing %q:\n%s", want, got)
+			}
+		}
+	})
+}
+
+type trailerReadCloser struct {
+	body    []byte
+	trailer http.Header
+	done    bool
+}
+
+func (b *trailerReadCloser) Read(p []byte) (int, error) {
+	if len(b.body) > 0 {
+		n := copy(p, b.body)
+		b.body = b.body[n:]
+		return n, nil
+	}
+	if !b.done {
+		b.done = true
+		b.trailer.Set("X-Checksum", "streamed")
+	}
+	return 0, io.EOF
+}
+
+func (b *trailerReadCloser) Close() error { return nil }
+
+func TestStreamedChunkedBodyForwardsTrailers(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		fmt.Fprintf(w, "%s:%s", body, r.Trailer.Get("X-Checksum"))
+	}))
+	defer target.Close()
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.New([]*url.URL{fs.URL}, time.Second, time.Minute)
+	cfg := defaultCfg()
+	cfg.MaxBodyBuffer = 3
+	s := New(pl, cfg, testLogger(), "test")
+
+	trailer := http.Header{"X-Checksum": nil}
+	body := &trailerReadCloser{body: []byte("abcd"), trailer: trailer}
+	req := httptest.NewRequest(http.MethodPost, target.URL+"/", body)
+	req.ContentLength = -1
+	req.TransferEncoding = []string{"chunked"}
+	req.Trailer = trailer
+	rec := httptest.NewRecorder()
+
+	s.ServeHTTP(rec, req)
+	resp := rec.Result()
+	defer resp.Body.Close()
+	got, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(got) != "abcd:streamed" {
+		t.Fatalf("status=%d body=%q", resp.StatusCode, got)
+	}
+}
+
 func TestStreamedPOSTReplaysAfterDialFallback(t *testing.T) {
 	closed, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

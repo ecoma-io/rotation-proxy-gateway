@@ -1,10 +1,15 @@
 # proxy-auto-rotate-forwarder
 
-Zero-dependency Go HTTP forward proxy that routes plain absolute-URI requests
-and inbound `CONNECT` tunnels through a pool of **SOCKS5-only** routes. It has
-an always-on admin listener (health + status) and SIGHUP pool reload. The
-authoritative behavior contract is [`README.md`](README.md). Built for the
-private homelab deployment layer described in the workspace `CLAUDE.md`.
+Go HTTP forward proxy that routes plain absolute-URI requests and inbound
+`CONNECT` tunnels through a health-aware pool of **SOCKS5-only** routes. It
+runs three inbound proxy listener views over one shared route-health pool:
+
+- mixed egress (`30121` by default): v4 and v6 routes
+- v4 egress (`30122` by default): `kind: v4` routes only
+- v6 egress (`30123` by default): `kind: v6` routes only
+
+The always-on admin listener defaults to `127.0.0.1:30120`. The authoritative
+behavior contract is [`README.md`](README.md).
 
 ## Build and test
 
@@ -13,70 +18,84 @@ gofmt -w . && go vet ./... && go test -race ./...
 go build -ldflags "-X main.version=0.1.0-dev" -o bin/paf ./cmd/proxy-auto-rotate-forwarder
 ```
 
-The toolchain pins Go ≥ 1.25 (`go.mod`); development used Go 1.26.4. Style
-rules for this repo: `math/rand/v2` (never `math/rand`), `for range n` loops.
+The toolchain pins Go ≥ 1.25; development used Go 1.26.4. Viper is used for
+runtime YAML loading and fsnotify-backed watching. Style rules: use
+`math/rand/v2` (never `math/rand`) and `for range n` loops.
 
-## Run
+## Configure and run
 
-`proxies.txt` at the project root (ignored by git) holds one SOCKS5 route per
-line; `#` comments are allowed. Copy `proxies.example.txt` to create it.
-Supported forms are:
-
-```text
-socks5://host:port
-socks5://user:pass@host:port
-host:port:user:pass
-user:pass@host:port
-```
-
-Bare forms default to SOCKS5. Explicit `http://` and `https://` upstream routes
-are rejected. Userinfo is used for SOCKS authentication and is never echoed in
-logs or `/status`.
+Copy [`config.example.yaml`](config.example.yaml) to Git-ignored `config.yaml`,
+then replace the placeholder `proxies.auto` SOCKS routes. The file may contain
+credentials; never log, commit, or bake it into an image.
 
 ```bash
-LISTEN_ADDR=:8080 \
-ADMIN_ADDR=127.0.0.1:8081 \
-PROXIES_FILE=proxies.txt \
+CONFIG_FILE=config.yaml \
+ADMIN_ADDR=127.0.0.1:30120 \
+MIXED_LISTEN_ADDR=:30121 \
+V4_LISTEN_ADDR=:30122 \
+V6_LISTEN_ADDR=:30123 \
 ./bin/paf
 ```
 
-Configuration is supplied through the process environment. For the Docker
-deployment, `compose.yaml` documents every supported variable beside its value.
+Environment variables are bootstrap-only and require restart:
 
-|Env|Default|Meaning|
-|---|---|---|
-|`LISTEN_ADDR`|`:8080`|inbound proxy listener (HTTP + CONNECT)|
-|`ADMIN_ADDR`|`127.0.0.1:8081`|admin listener (always on; must differ from `LISTEN_ADDR`)|
-|`PROXIES_FILE`|`proxies.txt`|SOCKS5 pool file|
-|`MAX_RETRIES`|`3`|attempts across **distinct** routes after endpoint TCP dial or SOCKS authentication failure|
-|`COOLDOWN_BASE`|`15s`|first SOCKS endpoint **TCP dial** failure cooldown; doubles per consecutive dial failure, capped|
-|`COOLDOWN_MAX`|`10m`|maximum SOCKS endpoint TCP dial cooldown|
-|`CONNECT_TIMEOUT`|`10s`|timeout for SOCKS endpoint dial and setup|
-|`TARGET_TLS_INSECURE`|`false`|skip HTTPS **target** certificate verification through SOCKS; never use casually|
-|`MAX_BODY_BUFFER`|64MiB|request bodies replayed only for a dial/auth fallback; known-larger bodies stream immediately|
-|`LOG_LEVEL`|`info`|application default; `debug` adds request-flow events, while `info`/`warn`/`error` filter progressively. Compose overrides this to `warn`.|
+| Env | Default | Meaning |
+|---|---:|---|
+| `CONFIG_FILE` | `config.yaml` | Runtime YAML path |
+| `ADMIN_ADDR` | `127.0.0.1:30120` | Private admin listener |
+| `MIXED_LISTEN_ADDR` | `:30121` | Mixed v4/v6 egress listener |
+| `V4_LISTEN_ADDR` | `:30122` | IPv4-egress-only listener |
+| `V6_LISTEN_ADDR` | `:30123` | IPv6-egress-only listener |
+
+Empty proxy listener addresses disable their listener, but at least one proxy
+listener must remain enabled. All enabled addresses must be valid host:port
+addresses and must not overlap (including wildcard binds on the same port).
+
+Runtime settings and active static routes live only in `config.yaml`:
+`log-level`, `max-retries`, `cooldown`, `dial-timeout`, global TLS/body
+settings, and `proxies.auto`. Viper watches that file; `SIGHUP` is a manual
+fallback. A failed parse/validation leaves the last-known-good pool and runtime
+settings serving. `proxies.manual` is accepted but opaque and ignored until the
+future API-rotation phase. Per-route `target-tls-insecure` and
+`max-body-buffer` are not allowed: both are global settings.
+
+`kind: v4|v6` means the provider-backed **public egress IP family**. It does
+not classify the SOCKS endpoint transport address and does not restrict target
+address families. Do not infer kind by resolving a hostname.
 
 ## Behavior notes
 
-Read [`README.md`](README.md) before changing failure classification: it is the
-normative behavior contract and outcome matrix.
+Read [`README.md`](README.md) before changing failure classification.
 
-- The pool always selects the usable route least recently used by pick sequence (true round-robin); it has no rotation-mode setting.
-- Only SOCKS endpoint DNS/TCP dial failure is a `proxy_connect_error`: it causes a dial cooldown and retry through a distinct route.
-- SOCKS authentication negotiation/rejection is a separate authentication-route failure. It blocks the route and may fall back to another route, but never causes TCP dial cooldown.
-- A valid target HTTP response—including `407`, `408`, `429`, and `5xx`—is forwarded once without rotation. A target `407` is ordinary response data, not a SOCKS authentication signal.
-- Errors after endpoint TCP dial succeeds—including SOCKS target-connect/protocol errors, target TLS, write/read, malformed response, client cancellation, and broken established tunnels—do not mutate route health and are not retried. SOCKS target-connect failure becomes a sanitized `502`.
-- Hop-by-hop headers (including Connection-listed tokens and `Proxy-Authorization`) are stripped in both directions. Upstream URL credentials must never appear in logs, `/status`, or responses.
-- Request logs carry a process-local `request_id` so a fallback sequence can be correlated. Log `target` and `upstream` values are host-only; never add full URLs, userinfo, headers, or bodies. `LOG_LEVEL=debug` shows request flow, while `info` records terminal successes and `warn` records fallback/terminal failures.
-- `SIGHUP` re-reads the pool file; on parse error the old pool keeps serving. Unchanged URLs preserve runtime state; changing URL/userinfo creates a new route.
-- Shutdown order: graceful proxy drain (10s) → admin drain → close hijacked tunnels (Go's `Shutdown` does not track those).
+- The pool selects the usable **eligible** route least recently used by pick
+  sequence. It is a single shared pool: cooldown/auth state is visible through
+  both dedicated and mixed listeners.
+- Endpoint DNS/TCP failure is `proxy_connect_error`: cooldown then a distinct
+  eligible fallback. SOCKS auth failure blocks the route and may fall back, but
+  never creates dial cooldown.
+- Errors after endpoint TCP dial succeeds—including SOCKS target-connect,
+  target TLS, write/read, malformed response, cancellation, and broken tunnel—
+  do not alter health and are not retried.
+- Valid target responses, including `407`, `408`, `429`, and `5xx`, are
+  forwarded once. A target `407` is ordinary data, not SOCKS authentication.
+- The kind filter applies to ordinary LRU selection and all-cooling fallback;
+  v4/v6 listeners must never leak into the other kind.
+- Hop-by-hop headers and `Proxy-Authorization` are removed in both directions.
+  Declared request trailers retain chunked framing. Userinfo must never appear
+  in logs, `/status`, errors, or responses.
+- Logs contain process-local `request_id` and `listener`; `target` and
+  `upstream` are host-only. `debug` shows flow, `info` terminal successes, and
+  `warn` fallback/terminal failures.
+- Reload preserves runtime pool state only for unchanged URL+kind. Changed URL
+  userinfo or kind creates a new route state.
+- Shutdown order: drain all proxy listeners (10s) → admin → hijacked tunnels.
 
 ## Admin
 
 ```bash
-curl http://127.0.0.1:8081/healthz   # body "ok"
-curl http://127.0.0.1:8081/status   # JSON: version, uptime, requests, rotations, pool (per-proxy state)
-ADMIN_ADDR=127.0.0.1:8081 ./bin/paf healthcheck # exit 0 = healthy (Docker HEALTHCHECK uses it)
+curl http://127.0.0.1:30120/healthz # body "ok"
+curl http://127.0.0.1:30120/status  # global + per-listener counters, safe pool state
+ADMIN_ADDR=127.0.0.1:30120 ./bin/paf healthcheck
 ./bin/paf version
 ```
 
@@ -85,24 +104,19 @@ ADMIN_ADDR=127.0.0.1:8081 ./bin/paf healthcheck # exit 0 = healthy (Docker HEALT
 ```bash
 docker build -t paf:dev --build-arg VERSION=0.1.0-dev .
 docker run --rm paf:dev version
-# or full stack (mounts root-level proxies.txt read-only):
-docker compose up -d --build && curl http://127.0.0.1:8081/status
+# Copy config.example.yaml to config.yaml and add routes first.
+docker compose up -d --build
+curl http://127.0.0.1:30120/status
 ```
 
-`compose.yaml` maps host 8080 → proxy and 127.0.0.1:8081 → admin
-(localhost-only); the pool file is mounted `:ro`, application logging defaults
-to `warn` in Compose, and Docker retains at most three 10 MiB `json-file` logs.
-Set `LOG_LEVEL=info` or `debug` temporarily for detailed request tracing. The
-container healthcheck calls the binary's own `healthcheck` subcommand (no shell
+`compose.yaml` maps host 30121/30122/30123 to mixed/v4/v6 proxy listeners and
+maps `127.0.0.1:30120` to admin. It mounts `config.yaml` read-only, defaults to
+bounded `json-file` logs, and uses the binary `healthcheck` subcommand (no shell
 in the scratch image).
-
-`Dockerfile` builds a static binary into a `scratch` image plus the CA bundle
-for HTTPS target verification; `HEALTHCHECK` works because `healthcheck` is a
-subcommand of the entrypoint binary itself (no shell in the image).
 
 ## Layout
 
-- `internal/config` — environment loading, SOCKS pool file parser
-- `internal/pool` — fixed LRU round-robin rotation, endpoint dial cooldowns, SOCKS auth state, live `Reload`
-- `internal/proxyserver` — SOCKS5 dialing and inbound HTTP/CONNECT forwarding
-- `cmd/proxy-auto-rotate-forwarder` — entrypoint, signals, admin endpoints
+- `internal/config` — bootstrap environment, Viper YAML validation, route parsing
+- `internal/pool` — LRU filtering, cooldown/auth state, live route reload
+- `internal/proxyserver` — SOCKS5 dialing plus inbound HTTP/CONNECT forwarding
+- `cmd/proxy-auto-rotate-forwarder` — lifecycle, signals, watcher, admin endpoints

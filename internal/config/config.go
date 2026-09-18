@@ -115,6 +115,14 @@ func envStr(key string, dst *string) {
 	}
 }
 
+// envAddr permits an explicit empty value so a bootstrap proxy listener can be
+// disabled, unlike the legacy envStr convention where empty means unset.
+func envAddr(key string, dst *string) {
+	if v, ok := os.LookupEnv(key); ok {
+		*dst = v
+	}
+}
+
 func envInt(key string, dst *int) error {
 	v, ok := os.LookupEnv(key)
 	if !ok || v == "" {

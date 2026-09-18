@@ -53,11 +53,14 @@ func stripHopByHop(h http.Header) {
 
 // Server is the inbound HTTP forward-proxy handler.
 type Server struct {
-	pool    *pool.Pool
-	cfg     *config.Config
-	log     *slog.Logger
-	version string
-	dial    func(context.Context, *url.URL, string, time.Duration) (net.Conn, error)
+	pool     *pool.Pool
+	cfg      *config.Config // legacy static configuration; superseded by runtime when set
+	runtime  *config.Store
+	log      *slog.Logger
+	version  string
+	listener string
+	allow    func(*pool.Proxy) bool
+	dial     func(context.Context, *url.URL, string, time.Duration) (net.Conn, error)
 
 	cmu   sync.Mutex
 	conns map[net.Conn]struct{}
@@ -67,17 +70,159 @@ type Server struct {
 	rotations atomic.Uint64
 }
 
-// New builds a proxy Server.
+// ListenerStatus is the safe operational view for one inbound proxy listener.
+type ListenerStatus struct {
+	Requests  uint64 `json:"requests"`
+	Rotations uint64 `json:"rotations"`
+}
+
+func (s *Server) ListenerStatus() ListenerStatus {
+	return ListenerStatus{
+		Requests:  s.requests.Load(),
+		Rotations: s.rotations.Load(),
+	}
+}
+
+// New builds a mixed proxy Server using the original static configuration API.
+// It is retained for existing embedders and tests.
 func New(pl *pool.Pool, cfg *config.Config, log *slog.Logger, version string) *Server {
+	return newServer(pl, cfg, nil, log, version, "mixed", nil)
+}
+
+// NewRuntime builds a listener-specific proxy Server whose new requests use
+// atomic runtime configuration snapshots.
+func NewRuntime(pl *pool.Pool, runtime *config.Store, log *slog.Logger, version, listener string, allowed ...config.EgressKind) *Server {
+	allow := func(p *pool.Proxy) bool {
+		for _, kind := range allowed {
+			if p.Kind == kind {
+				return true
+			}
+		}
+		return len(allowed) == 0
+	}
+	return newServer(pl, nil, runtime, log, version, listener, allow)
+}
+
+func newServer(pl *pool.Pool, cfg *config.Config, runtime *config.Store, log *slog.Logger, version, listener string, allow func(*pool.Proxy) bool) *Server {
 	return &Server{
 		pool:      pl,
 		cfg:       cfg,
-		log:       log,
+		runtime:   runtime,
+		log:       log.With("listener", listener),
 		version:   version,
+		listener:  listener,
+		allow:     allow,
 		dial:      dialVia,
 		conns:     map[net.Conn]struct{}{},
 		startTime: time.Now(),
 	}
+}
+
+func (s *Server) runtimeConfig() *config.RuntimeConfig {
+	if s.runtime != nil {
+		return s.runtime.Load()
+	}
+	return nil
+}
+
+func (s *Server) maxRetries() int {
+	if cfg := s.runtimeConfig(); cfg != nil {
+		return cfg.MaxRetries
+	}
+	return s.cfg.MaxRetries
+}
+
+func (s *Server) maxBodyBuffer() int64 {
+	if cfg := s.runtimeConfig(); cfg != nil {
+		return cfg.MaxBodyBuffer
+	}
+	return s.cfg.MaxBodyBuffer
+}
+
+func (s *Server) dialTimeout() time.Duration {
+	if cfg := s.runtimeConfig(); cfg != nil {
+		return cfg.DialTimeout
+	}
+	return s.cfg.ConnectTimeout
+}
+
+func (s *Server) targetTLSInsecure() bool {
+	if cfg := s.runtimeConfig(); cfg != nil {
+		return cfg.TargetTLSInsecure
+	}
+	return s.cfg.TargetTLSInsecure
+}
+
+func (s *Server) pick(exclude map[*pool.Proxy]bool) *pool.Proxy {
+	return s.pool.PickFor(exclude, s.allow)
+}
+
+type requestSettings struct {
+	maxRetries        int
+	maxBodyBuffer     int64
+	dialTimeout       time.Duration
+	targetTLSInsecure bool
+}
+
+// settings snapshots all mutable runtime values once per operation so a reload
+// cannot change retry, body, timeout, or TLS policy part-way through it.
+func (s *Server) settings() requestSettings {
+	if cfg := s.runtimeConfig(); cfg != nil {
+		return requestSettings{
+			maxRetries:        cfg.MaxRetries,
+			maxBodyBuffer:     cfg.MaxBodyBuffer,
+			dialTimeout:       cfg.DialTimeout,
+			targetTLSInsecure: cfg.TargetTLSInsecure,
+		}
+	}
+	return requestSettings{
+		maxRetries:        s.cfg.MaxRetries,
+		maxBodyBuffer:     s.cfg.MaxBodyBuffer,
+		dialTimeout:       s.cfg.ConnectTimeout,
+		targetTLSInsecure: s.cfg.TargetTLSInsecure,
+	}
+}
+
+func (s *Server) roundTripWithSettings(ctx context.Context, p *pool.Proxy, out *http.Request, settings requestSettings) (*http.Response, error) {
+	return s.roundTripViaSOCKSWithOptions(ctx, p, out, settings.dialTimeout, settings.targetTLSInsecure)
+}
+
+func (s *Server) roundTripViaSOCKSWithOptions(ctx context.Context, p *pool.Proxy, out *http.Request, dialTimeout time.Duration, targetTLSInsecure bool) (*http.Response, error) {
+	target, err := targetAddress(out.URL)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := s.dial(ctx, p.URL, target, dialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (*http.Response, error) {
+		conn.Close()
+		return nil, err
+	}
+	if out.URL.Scheme == "https" {
+		host := out.URL.Hostname()
+		tlsConn := tls.Client(conn, &tls.Config{
+			ServerName:         host,
+			InsecureSkipVerify: targetTLSInsecure,
+		})
+		hsCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+		err := tlsConn.HandshakeContext(hsCtx)
+		cancel()
+		if err != nil {
+			return fail(fmt.Errorf("target TLS handshake: %w", err))
+		}
+		conn = tlsConn
+	}
+	if err := out.Write(conn); err != nil {
+		return fail(fmt.Errorf("write target request: %w", err))
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), out)
+	if err != nil {
+		return fail(fmt.Errorf("read target response: %w", err))
+	}
+	resp.Body = &connReadCloser{ReadCloser: resp.Body, conn: conn}
+	return resp, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -92,6 +237,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleHTTP forwards a plain absolute-form request through a SOCKS5 route.
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Logger) {
+	settings := s.settings()
 	start := time.Now()
 	target := httpTargetLogValue(r.URL)
 	if !r.URL.IsAbs() || r.Host == "" {
@@ -111,10 +257,10 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 	// dial or SOCKS authentication fallback. A buffered prefix of a larger
 	// unknown-length body is replayable only until SOCKS setup succeeds.
 	var body []byte
-	streamMode := r.ContentLength > s.cfg.MaxBodyBuffer
+	streamMode := r.ContentLength > settings.maxBodyBuffer
 	directStream := streamMode
 	if !streamMode {
-		b, err := io.ReadAll(io.LimitReader(r.Body, s.cfg.MaxBodyBuffer+1))
+		b, err := io.ReadAll(io.LimitReader(r.Body, settings.maxBodyBuffer+1))
 		if err != nil {
 			r.Body.Close()
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
@@ -122,7 +268,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 			return
 		}
 		body = b
-		if int64(len(body)) > s.cfg.MaxBodyBuffer {
+		if int64(len(body)) > settings.maxBodyBuffer {
 			streamMode = true
 		} else {
 			r.Body.Close()
@@ -133,7 +279,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 
 	exclude := map[*pool.Proxy]bool{}
 	attempts := 0
-	for attempt := 0; attempt < s.cfg.MaxRetries; attempt++ {
+	for attempt := 0; attempt < settings.maxRetries; attempt++ {
 		attemptNumber := attempt + 1
 		if r.Context().Err() != nil {
 			if streamMode {
@@ -142,7 +288,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 			log.Debug("request canceled", "target", target, "attempts", attempt)
 			return
 		}
-		p := s.pool.Pick(exclude)
+		p := s.pick(exclude)
 		if p == nil {
 			break
 		}
@@ -155,8 +301,13 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 				out.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
 			}
 			out.ContentLength = r.ContentLength
+			out.TransferEncoding = append([]string(nil), r.TransferEncoding...)
+			// r.Body populates r.Trailer at EOF. Retain the same map rather
+			// than the clone made by Request.Clone so Request.Write sees the
+			// final trailer values after streaming the body.
+			out.Trailer = r.Trailer
 		}
-		resp, err := s.roundTripViaSOCKS(r.Context(), p, out)
+		resp, err := s.roundTripWithSettings(r.Context(), p, out, settings)
 		if streamMode && !isProxyDialError(err) && !isProxyAuthError(err) {
 			r.Body.Close()
 		}
@@ -221,19 +372,30 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 		"error_kind", errorKindNoRoute, "duration", logDuration(time.Since(start)))
 }
 
-// buildOutbound clones the client request for a route attempt; body is replayed
-// from memory when non-nil.
+// buildOutbound clones the client request for a route attempt. Buffered bodies
+// are replayed from memory; empty bodies without trailers use nil rather than an
+// empty reader so net/http keeps no-body request framing.
 func buildOutbound(r *http.Request, body []byte) *http.Request {
 	out := r.Clone(r.Context())
 	out.RequestURI = "" // http.Request.Write derives origin-form from URL.
 	out.Close = true    // each SOCKS tunnel is scoped to this request.
-	if body != nil {
+	if len(r.Trailer) > 0 {
+		// A trailer requires chunked framing. The body probe has reached EOF, so
+		// these values are complete and safe to clone for each retry.
+		out.Body = io.NopCloser(bytes.NewReader(body))
+		out.ContentLength = -1
+		out.TransferEncoding = []string{"chunked"}
+		return out
+	}
+	out.Trailer = nil
+	out.TransferEncoding = nil
+	if len(body) > 0 {
 		out.Body = io.NopCloser(bytes.NewReader(body))
 		out.ContentLength = int64(len(body))
-	} else {
-		out.Body = nil
-		out.ContentLength = 0
+		return out
 	}
+	out.Body = nil
+	out.ContentLength = 0
 	return out
 }
 
@@ -244,7 +406,7 @@ func (s *Server) roundTripViaSOCKS(ctx context.Context, p *pool.Proxy, out *http
 	if err != nil {
 		return nil, err
 	}
-	conn, err := s.dial(ctx, p.URL, target, s.cfg.ConnectTimeout)
+	conn, err := s.dial(ctx, p.URL, target, s.dialTimeout())
 	if err != nil {
 		return nil, err
 	}
@@ -256,9 +418,9 @@ func (s *Server) roundTripViaSOCKS(ctx context.Context, p *pool.Proxy, out *http
 		host := out.URL.Hostname()
 		tlsConn := tls.Client(conn, &tls.Config{
 			ServerName:         host,
-			InsecureSkipVerify: s.cfg.TargetTLSInsecure,
+			InsecureSkipVerify: s.targetTLSInsecure(),
 		})
-		hsCtx, cancel := context.WithTimeout(ctx, s.cfg.ConnectTimeout)
+		hsCtx, cancel := context.WithTimeout(ctx, s.dialTimeout())
 		err := tlsConn.HandshakeContext(hsCtx)
 		cancel()
 		if err != nil {
@@ -324,6 +486,7 @@ func (s *Server) writeResponse(w http.ResponseWriter, resp *http.Response) {
 // handleTunnel relays an inbound CONNECT tunnel through the SOCKS5 pool.
 // Retries occur only before the SOCKS target connection succeeds.
 func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.Logger) {
+	settings := s.settings()
 	start := time.Now()
 	target := r.URL.Host
 	if _, _, err := net.SplitHostPort(target); err != nil {
@@ -358,18 +521,18 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 	var upstream net.Conn
 	var chosen *pool.Proxy
 	var attempts int
-	for attempt := 0; attempt < s.cfg.MaxRetries; attempt++ {
+	for attempt := 0; attempt < settings.maxRetries; attempt++ {
 		attempts = attempt + 1
 		if r.Context().Err() != nil {
 			log.Debug("tunnel canceled", "target", logTarget, "attempts", attempt)
 			clientConn.Close()
 			return
 		}
-		p := s.pool.Pick(exclude)
+		p := s.pick(exclude)
 		if p == nil {
 			break
 		}
-		up, err := s.dial(r.Context(), p.URL, target, s.cfg.ConnectTimeout)
+		up, err := s.dial(r.Context(), p.URL, target, settings.dialTimeout)
 		if err != nil {
 			if r.Context().Err() != nil {
 				log.Debug("tunnel canceled", "target", logTarget, "attempts", attempts)
@@ -458,6 +621,13 @@ func (s *Server) CloseTunnels() {
 
 // AdminMux serves the health and status endpoints for the admin listener.
 func (s *Server) AdminMux() *http.ServeMux {
+	return AdminMux(s.version, s.startTime, s.pool, map[string]*Server{s.listener: s})
+}
+
+// AdminMux serves aggregate health/status for all proxy listener views sharing
+// a pool. Existing status fields remain global totals; listeners adds safe
+// per-listener counters.
+func AdminMux(version string, started time.Time, pl *pool.Pool, listeners map[string]*Server) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -465,12 +635,21 @@ func (s *Server) AdminMux() *http.ServeMux {
 	})
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		perListener := make(map[string]ListenerStatus, len(listeners))
+		var requests, rotations uint64
+		for name, listener := range listeners {
+			status := listener.ListenerStatus()
+			perListener[name] = status
+			requests += status.Requests
+			rotations += status.Rotations
+		}
 		json.NewEncoder(w).Encode(map[string]any{
-			"version":   s.version,
-			"uptime":    time.Since(s.startTime).Truncate(time.Second).String(),
-			"requests":  s.requests.Load(),
-			"rotations": s.rotations.Load(),
-			"pool":      s.pool.Snapshot(),
+			"version":   version,
+			"uptime":    time.Since(started).Truncate(time.Second).String(),
+			"requests":  requests,
+			"rotations": rotations,
+			"listeners": perListener,
+			"pool":      pl.Snapshot(),
 		})
 	})
 	return mux

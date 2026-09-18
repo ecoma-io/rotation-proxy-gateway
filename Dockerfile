@@ -14,6 +14,6 @@ FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/proxy-auto-rotate-forwarder /app/proxy-auto-rotate-forwarder
 USER 65532:65532
-EXPOSE 8080
+EXPOSE 30120 30121 30122 30123
 ENTRYPOINT ["/app/proxy-auto-rotate-forwarder"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 CMD ["/app/proxy-auto-rotate-forwarder", "healthcheck"]
