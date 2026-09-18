@@ -185,6 +185,38 @@ func TestParseProxiesBareBadLines(t *testing.T) {
 	}
 }
 
+func TestParseProxiesDoesNotEchoCredentialsInErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxies.txt")
+	const secret = "credential-that-must-not-be-logged"
+	content := "user:" + secret + "@host:not-a-port\nuser:" + secret + "@%zz:1080\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ParseProxies(path)
+	if err == nil {
+		t.Fatal("ParseProxies() succeeded, want invalid proxy error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("ParseProxies() error leaked credentials: %q", err)
+	}
+}
+
+func TestParseProxiesDoesNotEchoCredentialsForUnsupportedScheme(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxies.txt")
+	const secret = "credential-that-must-not-be-logged"
+	content := "http://user:" + secret + "@host:8080\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ParseProxies(path)
+	if err == nil {
+		t.Fatal("ParseProxies() succeeded, want unsupported scheme error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("ParseProxies() error leaked credentials: %q", err)
+	}
+}
+
 func TestParseProxiesEmpty(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "proxies.txt")
 	if err := os.WriteFile(path, []byte("# nothing here\n\n"), 0o600); err != nil {

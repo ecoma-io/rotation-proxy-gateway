@@ -192,6 +192,12 @@ func ParseProxies(path string) ([]*url.URL, error) {
 			errs = append(errs, fmt.Errorf("%s line %d: unsupported scheme %q (want socks5://..., host:port:user:pass, or user:pass@host:port)", path, lineNo, u.Scheme))
 		case u.Hostname() == "":
 			errs = append(errs, fmt.Errorf("%s line %d: missing host", path, lineNo))
+		case u.Port() != "":
+			if err := checkPort(u.Port()); err != nil {
+				errs = append(errs, fmt.Errorf("%s line %d: %w", path, lineNo, err))
+				continue
+			}
+			fallthrough
 		default:
 			entries = append(entries, u)
 		}
@@ -212,18 +218,22 @@ func ParseProxies(path string) ([]*url.URL, error) {
 // "host:port:user:pass" or "user:pass@host:port".
 func parseProxyLine(line string) (*url.URL, error) {
 	if strings.Contains(line, "://") {
-		return url.Parse(line)
+		u, err := url.Parse(line)
+		if err != nil {
+			return nil, errors.New("invalid proxy URL")
+		}
+		return u, nil
 	}
 	if strings.Contains(line, "@") {
 		// Bare "user:pass@host:port" defaults to SOCKS5.
 		u, err := url.Parse("socks5://" + line)
 		if err != nil {
-			return nil, fmt.Errorf("bad proxy %q: %w", line, err)
+			return nil, errors.New("invalid proxy URL")
 		}
 		if u.Hostname() == "" {
-			return nil, fmt.Errorf("bad proxy %q: missing host", line)
+			return nil, errors.New("proxy host is required")
 		}
-		if err := checkPort(u.Port(), line); err != nil {
+		if err := checkPort(u.Port()); err != nil {
 			return nil, err
 		}
 		return u, nil
@@ -231,17 +241,17 @@ func parseProxyLine(line string) (*url.URL, error) {
 	// Bare "host:port:user:pass" defaults to SOCKS5.
 	host, rest, ok := strings.Cut(line, ":")
 	if !ok || host == "" {
-		return nil, fmt.Errorf("bad proxy %q (want socks5://..., host:port:user:pass, or user:pass@host:port)", line)
+		return nil, errors.New("invalid proxy format (want socks5://..., host:port:user:pass, or user:pass@host:port)")
 	}
 	port, creds, ok := strings.Cut(rest, ":")
 	if !ok || port == "" || creds == "" {
-		return nil, fmt.Errorf("bad proxy %q (want socks5://..., host:port:user:pass, or user:pass@host:port)", line)
+		return nil, errors.New("invalid proxy format (want socks5://..., host:port:user:pass, or user:pass@host:port)")
 	}
 	user, pass, ok := strings.Cut(creds, ":")
 	if !ok || user == "" || pass == "" || strings.Contains(pass, ":") {
-		return nil, fmt.Errorf("bad proxy %q (want socks5://..., host:port:user:pass, or user:pass@host:port)", line)
+		return nil, errors.New("invalid proxy format (want socks5://..., host:port:user:pass, or user:pass@host:port)")
 	}
-	if err := checkPort(port, line); err != nil {
+	if err := checkPort(port); err != nil {
 		return nil, err
 	}
 	return &url.URL{
@@ -251,11 +261,12 @@ func parseProxyLine(line string) (*url.URL, error) {
 	}, nil
 }
 
-// checkPort validates a proxy port is numeric and in range.
-func checkPort(port, line string) error {
+// checkPort validates a proxy port is numeric and in range without including a
+// potentially credential-bearing pool entry in the error.
+func checkPort(port string) error {
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 1 || n > 65535 {
-		return fmt.Errorf("bad proxy %q: invalid port %q", line, port)
+		return fmt.Errorf("invalid proxy port %q", port)
 	}
 	return nil
 }

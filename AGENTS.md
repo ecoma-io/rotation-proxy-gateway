@@ -54,7 +54,7 @@ deployment, `compose.yaml` documents every supported variable beside its value.
 |`CONNECT_TIMEOUT`|`10s`|timeout for SOCKS endpoint dial and setup|
 |`TARGET_TLS_INSECURE`|`false`|skip HTTPS **target** certificate verification through SOCKS; never use casually|
 |`MAX_BODY_BUFFER`|64MiB|request bodies replayed only for a dial/auth fallback; larger bodies stream once|
-|`LOG_LEVEL`|`info`|`debug`/`info`/`warn`/`error`|
+|`LOG_LEVEL`|`info`|`debug` adds request-flow events; `info`/`warn`/`error` filter progressively|
 
 ## Behavior notes
 
@@ -67,6 +67,7 @@ normative behavior contract and outcome matrix.
 - A valid target HTTP response—including `407`, `408`, `429`, and `5xx`—is forwarded once without rotation. A target `407` is ordinary response data, not a SOCKS authentication signal.
 - Errors after endpoint TCP dial succeeds—including SOCKS target-connect/protocol errors, target TLS, write/read, malformed response, client cancellation, and broken established tunnels—do not mutate route health and are not retried. SOCKS target-connect failure becomes a sanitized `502`.
 - Hop-by-hop headers (including Connection-listed tokens and `Proxy-Authorization`) are stripped in both directions. Upstream URL credentials must never appear in logs, `/status`, or responses.
+- Request logs carry a process-local `request_id` so a fallback sequence can be correlated. Log `target` and `upstream` values are host-only; never add full URLs, userinfo, headers, or bodies. `LOG_LEVEL=debug` shows request flow, while `info` records terminal successes and `warn` records fallback/terminal failures.
 - `SIGHUP` re-reads the pool file; on parse error the old pool keeps serving. Unchanged URLs preserve runtime state; changing URL/userinfo creates a new route.
 - Shutdown order: graceful proxy drain (10s) → admin drain → close hijacked tunnels (Go's `Shutdown` does not track those).
 

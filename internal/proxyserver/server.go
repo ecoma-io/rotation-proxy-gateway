@@ -79,25 +79,30 @@ func New(pl *pool.Pool, cfg *config.Config, log *slog.Logger, version string) *S
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.requests.Add(1)
+	requestID := s.requests.Add(1)
+	log := s.log.With("request_id", requestID)
 	if r.Method == http.MethodConnect {
-		s.handleTunnel(w, r)
+		s.handleTunnel(w, r, log)
 		return
 	}
-	s.handleHTTP(w, r)
+	s.handleHTTP(w, r, log)
 }
 
 // handleHTTP forwards a plain absolute-form request through a SOCKS5 route.
-func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Logger) {
 	start := time.Now()
+	target := httpTargetLogValue(r.URL)
 	if !r.URL.IsAbs() || r.Host == "" {
 		http.Error(w, "proxy request requires an absolute URI", http.StatusBadRequest)
+		log.Warn("request rejected", "target", target, "error_kind", "bad_request")
 		return
 	}
 	if r.URL.Scheme != "http" && r.URL.Scheme != "https" {
 		http.Error(w, "proxy request requires an http or https URI", http.StatusBadRequest)
+		log.Warn("request rejected", "target", target, "error_kind", "bad_request")
 		return
 	}
+	log.Debug("request start", "method", r.Method, "target", target)
 
 	// Buffer the body up to the cap. When it is larger, its buffered prefix is
 	// replayable only until a route succeeds in establishing SOCKS setup.
@@ -115,17 +120,22 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		body = b
 		r.Body.Close()
 	}
+	log.Debug("request body mode", "target", target, "body_mode", bodyLogMode(streamMode))
 	stripHopByHop(r.Header)
 
 	exclude := map[*pool.Proxy]bool{}
+	attempts := 0
 	for attempt := 0; attempt < s.cfg.MaxRetries; attempt++ {
+		attemptNumber := attempt + 1
 		if r.Context().Err() != nil {
+			log.Debug("request canceled", "target", target, "attempts", attempt)
 			return
 		}
 		p := s.pool.Pick(exclude)
 		if p == nil {
 			break
 		}
+		attempts = attemptNumber
 		out := buildOutbound(r, body)
 		if streamMode {
 			out.Body = io.NopCloser(io.MultiReader(bytes.NewReader(b), r.Body))
@@ -138,23 +148,30 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			switch {
 			case isProxyDialError(err):
-				s.pool.ReportFailure(p, err)
+				cooldown := s.pool.ReportFailure(p, err)
 				exclude[p] = true
 				s.rotations.Add(1)
-				s.log.Warn("SOCKS endpoint dial failed", "proxy", p.URL.Host, "target", r.URL.Host, "err", err.Error())
+				log.Warn("upstream dial failed", "target", target, "upstream", upstreamLogValue(p),
+					"attempt", attemptNumber, "error_kind", errorKindProxyConnect,
+					"error", logErrorValue(err), "cooldown", cooldown.String())
 				continue
 			case isProxyAuthError(err):
 				s.pool.ReportAuthBlocked(p, err)
 				exclude[p] = true
 				s.rotations.Add(1)
-				s.log.Warn("SOCKS route authentication failed", "proxy", p.URL.Host, "target", r.URL.Host, "err", err.Error())
+				log.Warn("upstream auth failed", "target", target, "upstream", upstreamLogValue(p),
+					"attempt", attemptNumber, "error_kind", errorKindAuthRoute,
+					"error", logErrorValue(err))
 				continue
 			default:
 				if r.Context().Err() != nil {
+					log.Debug("request canceled", "target", target, "attempts", attemptNumber)
 					return
 				}
 				http.Error(w, "upstream SOCKS setup failed", http.StatusBadGateway)
-				s.log.Warn("request failed after SOCKS endpoint dial", "proxy", p.URL.Host, "target", r.URL.Host, "err", err.Error())
+				log.Warn("upstream setup failed", "target", target, "upstream", upstreamLogValue(p),
+					"attempt", attemptNumber, "error_kind", logErrorKind(err), "error", logErrorValue(err),
+					"duration", logDuration(time.Since(start)))
 				return
 			}
 		}
@@ -164,8 +181,8 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.pool.ReportSuccess(p)
 		s.writeResponse(w, resp)
-		s.log.Info("request", "method", r.Method, "target", r.URL.Host, "via", p.URL.Host,
-			"status", resp.StatusCode, "attempts", attempt+1, "dur", time.Since(start).Truncate(time.Millisecond).String())
+		log.Info("request", "method", r.Method, "target", target, "upstream", upstreamLogValue(p),
+			"status", resp.StatusCode, "attempts", attemptNumber, "duration", logDuration(time.Since(start)))
 		return
 	}
 
@@ -173,7 +190,8 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body.Close()
 	}
 	http.Error(w, "no usable upstream SOCKS routes", http.StatusBadGateway)
-	s.log.Warn("request failed", "target", r.URL.Host, "dur", time.Since(start).Truncate(time.Millisecond).String())
+	log.Warn("request failed", "target", target, "attempts", attempts,
+		"error_kind", errorKindNoRoute, "duration", logDuration(time.Since(start)))
 }
 
 // buildOutbound clones the client request for a route attempt; body is replayed
@@ -278,20 +296,23 @@ func (s *Server) writeResponse(w http.ResponseWriter, resp *http.Response) {
 
 // handleTunnel relays an inbound CONNECT tunnel through the SOCKS5 pool.
 // Retries occur only before the SOCKS target connection succeeds.
-func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.Logger) {
 	start := time.Now()
 	target := r.URL.Host
 	if _, _, err := net.SplitHostPort(target); err != nil {
 		target = net.JoinHostPort(r.URL.Host, "443")
 	}
+	logTarget := tunnelTargetLogValue(target)
+	log.Debug("tunnel start", "target", logTarget)
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "tunneling unsupported", http.StatusInternalServerError)
+		log.Error("tunnel unsupported", "target", logTarget, "error_kind", "server")
 		return
 	}
 	clientConn, brw, err := hj.Hijack()
 	if err != nil {
-		s.log.Error("hijack failed", "err", err.Error())
+		log.Error("hijack failed", "target", logTarget, "error", logErrorValue(err))
 		return
 	}
 	s.trackConn(clientConn)
@@ -313,6 +334,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	for attempt := 0; attempt < s.cfg.MaxRetries; attempt++ {
 		attempts = attempt + 1
 		if r.Context().Err() != nil {
+			log.Debug("tunnel canceled", "target", logTarget, "attempts", attempt)
 			clientConn.Close()
 			return
 		}
@@ -324,21 +346,27 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			switch {
 			case isProxyDialError(err):
-				s.pool.ReportFailure(p, err)
+				cooldown := s.pool.ReportFailure(p, err)
 				exclude[p] = true
 				s.rotations.Add(1)
-				s.log.Warn("SOCKS endpoint dial failed", "proxy", p.URL.Host, "target", target, "err", err.Error())
+				log.Warn("upstream dial failed", "target", logTarget, "upstream", upstreamLogValue(p),
+					"attempt", attempts, "error_kind", errorKindProxyConnect,
+					"error", logErrorValue(err), "cooldown", cooldown.String())
 				continue
 			case isProxyAuthError(err):
 				s.pool.ReportAuthBlocked(p, err)
 				exclude[p] = true
 				s.rotations.Add(1)
-				s.log.Warn("SOCKS route authentication failed", "proxy", p.URL.Host, "target", target, "err", err.Error())
+				log.Warn("upstream auth failed", "target", logTarget, "upstream", upstreamLogValue(p),
+					"attempt", attempts, "error_kind", errorKindAuthRoute,
+					"error", logErrorValue(err))
 				continue
 			default:
 				clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 				clientConn.Close()
-				s.log.Warn("tunnel failed after SOCKS endpoint dial", "proxy", p.URL.Host, "target", target, "err", err.Error())
+				log.Warn("upstream setup failed", "target", logTarget, "upstream", upstreamLogValue(p),
+					"attempt", attempts, "error_kind", logErrorKind(err), "error", logErrorValue(err),
+					"duration", logDuration(time.Since(start)))
 				return
 			}
 		}
@@ -349,7 +377,8 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	if upstream == nil {
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
 		clientConn.Close()
-		s.log.Warn("tunnel failed", "target", target, "attempts", attempts, "dur", time.Since(start).Truncate(time.Millisecond).String())
+		log.Warn("tunnel failed", "target", logTarget, "attempts", len(exclude),
+			"error_kind", errorKindNoRoute, "duration", logDuration(time.Since(start)))
 		return
 	}
 	if len(prefix) > 0 {
@@ -357,7 +386,8 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 	brw.Writer.WriteString("HTTP/1.1 200 Connection established\r\n\r\n") //nolint:errcheck
 	brw.Writer.Flush()                                                    //nolint:errcheck
-	s.log.Info("tunnel", "target", target, "via", chosen.URL.Host, "attempts", attempts)
+	log.Info("tunnel", "target", logTarget, "upstream", upstreamLogValue(chosen),
+		"attempts", attempts, "duration", logDuration(time.Since(start)))
 
 	go func() {
 		io.Copy(clientConn, upstream) //nolint:errcheck // tunnel close is expected

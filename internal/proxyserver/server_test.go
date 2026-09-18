@@ -2,6 +2,7 @@ package proxyserver
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -24,6 +25,10 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+func captureLogger(buf *bytes.Buffer, level slog.Level) *slog.Logger {
+	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: level}))
+}
+
 func defaultCfg() *config.Config {
 	return &config.Config{
 		MaxRetries:        3,
@@ -36,9 +41,12 @@ func defaultCfg() *config.Config {
 }
 
 func newForwarderCfg(t *testing.T, pl *pool.Pool, cfg *config.Config) *httptest.Server {
+	return newForwarderCfgLogger(t, pl, cfg, testLogger())
+}
+
+func newForwarderCfgLogger(t *testing.T, pl *pool.Pool, cfg *config.Config, log *slog.Logger) *httptest.Server {
 	t.Helper()
-	s := New(pl, cfg, testLogger(), "test")
-	ts := httptest.NewServer(s)
+	ts := httptest.NewServer(New(pl, cfg, log, "test"))
 	t.Cleanup(ts.Close)
 	return ts
 }
@@ -218,6 +226,48 @@ func TestRotatesOnlyOnEndpointDialFailure(t *testing.T) {
 	snap := pl.Snapshot()
 	if snap[0].Failures != 1 || snap[0].Available || snap[1].Successes != 1 {
 		t.Fatalf("snapshot = %+v", snap)
+	}
+}
+
+func TestLogsCorrelateDialFallbackAndRedactCredentials(t *testing.T) {
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadURL := &url.URL{Scheme: "socks5", User: url.UserPassword("route-user", "route-password"), Host: closed.Addr().String()}
+	closed.Close()
+	good := startSocks5Proxy(t, socksOptions{})
+	target := startEchoTarget(t)
+	pl := pool.New([]*url.URL{deadURL, good.URL}, 30*time.Second, time.Minute)
+	var logs bytes.Buffer
+	ts := newForwarderCfgLogger(t, pl, defaultCfg(), captureLogger(&logs, slog.LevelDebug))
+
+	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+
+	output := logs.String()
+	for _, want := range []string{
+		"request_id=1",
+		"msg=\"upstream dial failed\"",
+		"error_kind=proxy_connect",
+		"cooldown=30s",
+		"msg=request",
+		"attempts=2",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("logs missing %q:\n%s", want, output)
+		}
+	}
+	for _, secret := range []string{"route-user", "route-password"} {
+		if strings.Contains(output, secret) {
+			t.Errorf("logs leaked %q:\n%s", secret, output)
+		}
 	}
 }
 
