@@ -236,6 +236,12 @@ For CONNECT, the service returns `200 Connection Established` only after the
 SOCKS target CONNECT succeeds, then relays bytes bidirectionally. Failures after
 that point do not alter route health.
 
+Relayed bytes are never inspected or buffered: streamed responses such as
+server-sent events are flushed per chunk, and established tunnels have no
+timeouts. An upstream that breaks the tunnel mid-stream resets the client
+connection, so a truncated stream stays visibly truncated instead of reading as
+a clean end.
+
 ## Admin and observability
 
 ```bash
@@ -256,6 +262,12 @@ Each request has a process-local `request_id`. Logs additionally include
 error category, and cooldown for endpoint dial and SOCKS handshake failures.
 They never log full URLs, headers, bodies, userinfo, or the ignored manual API
 configuration.
+
+Every established tunnel also logs a close record with its lifetime,
+per-direction byte counts, and which side ended the stream first
+(`close_reason`). Close records log at `debug`; a tunnel broken by an
+upstream-side error logs at `warn`, making mid-stream provider drops
+attributable.
 
 ## Docker
 

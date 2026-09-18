@@ -149,9 +149,11 @@ func TestE2E_TunnelBreakDoesNotMutateHealth(t *testing.T) {
 	}
 	socks := NewSocksSim(t, SocksOK, "", "")
 	target := NewEchoTarget(t)
-	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
+	cfg := defaultGatewayConfig([]RouteConfig{
 		{Proxy: socks.RouteValue(), Kind: "v4"},
-	}))
+	})
+	cfg.LogLevel = "debug" // tunnel close records are flow detail
+	g := NewGateway(t, cfg)
 
 	conn, err := net.DialTimeout("tcp", g.MixedAddr, 5*time.Second)
 	if err != nil {
@@ -184,6 +186,21 @@ func TestE2E_TunnelBreakDoesNotMutateHealth(t *testing.T) {
 	}
 	if st.Pool[0].Successes != 1 || st.Pool[0].Failures != 0 || !st.Pool[0].Available {
 		t.Fatalf("tunnel break mutated health: %+v", st.Pool[0])
+	}
+
+	// The relay writes a close record naming the lifetime and both directions'
+	// byte counts, so mid-stream drops are attributable in production logs.
+	out := waitForLog(t, g, "close_reason=", 10*time.Second)
+	for _, want := range []string{
+		"target=" + target.Host,
+		"upstream=" + socks.Addr,
+		"client_to_upstream_bytes=",
+		"upstream_to_client_bytes=",
+		"duration=",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("close record missing %q:\n%s", want, out)
+		}
 	}
 
 	// The same listener keeps serving fresh requests afterwards.

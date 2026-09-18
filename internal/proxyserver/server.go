@@ -329,7 +329,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 			return
 		}
 		gen.Pool.ReportSuccess(p)
-		s.writeResponse(w, resp)
+		s.writeResponse(log, w, resp)
 		log.Info("request", "method", r.Method, "target", target, "upstream", upstreamLogValue(p),
 			"status", resp.StatusCode, "attempts", attemptNumber, "duration", logDuration(time.Since(start)))
 		return
@@ -402,7 +402,22 @@ func (c *connReadCloser) Close() error {
 	return err
 }
 
-func (s *Server) writeResponse(w http.ResponseWriter, resp *http.Response) {
+// flushWriter flushes after every write so streamed bodies — server-sent
+// events in particular — reach the client as they arrive instead of waiting
+// for the net/http output buffer to fill.
+type flushWriter struct {
+	w http.ResponseWriter
+}
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if flusher, ok := fw.w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return n, err
+}
+
+func (s *Server) writeResponse(log *slog.Logger, w http.ResponseWriter, resp *http.Response) {
 	stripHopByHop(resp.Header)
 	for k, vv := range resp.Header {
 		for _, v := range vv {
@@ -410,7 +425,11 @@ func (s *Server) writeResponse(w http.ResponseWriter, resp *http.Response) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	if _, err := io.Copy(flushWriter{w: w}, resp.Body); err != nil {
+		// The client sees a truncated body: nothing to retry and no health to
+		// mutate, but the log attributes the mid-body drop to this request.
+		log.Warn("response relay failed", "error_kind", logErrorKind(err), "error", logErrorValue(err))
+	}
 	resp.Body.Close()
 }
 
@@ -526,13 +545,79 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 	log.Info("tunnel", "target", logTarget, "upstream", upstreamLogValue(chosen),
 		"attempts", attempts, "duration", logDuration(time.Since(start)))
 
+	// Relay until either side ends the stream. Established tunnels carry no
+	// health or retry semantics; the close record is the only trace of which
+	// side ended the stream first and why.
+	closes := make(chan relayResult, 2)
 	go func() {
-		io.Copy(clientConn, upstream) //nolint:errcheck // tunnel close is expected
-		clientConn.Close()
+		n, err := io.Copy(clientConn, upstream)
+		// Send before teardown: whichever result lands first is the cause;
+		// the one our own closes unblock is the artifact.
+		closes <- relayResult{direction: relayToClient, bytes: n, err: err}
+		if err != nil {
+			// A broken upstream must not masquerade as a clean end of stream:
+			// reset the client side so a truncated stream stays truncated.
+			if tc, ok := clientConn.(*net.TCPConn); ok {
+				tc.SetLinger(0)
+			}
+		}
+		clientConn.Close() // unblocks the client-to-upstream direction
 	}()
-	io.Copy(upstream, clientConn) //nolint:errcheck // tunnel close is expected
+	n, err := io.Copy(upstream, clientConn)
+	closes <- relayResult{direction: relayToUpstream, bytes: n, err: err}
 	upstream.Close()
 	clientConn.Close() // unblocks the other direction
+	first := <-closes
+	second := <-closes // the forced close of the remaining side is an artifact
+	recordTunnelClose(log, logTarget, chosen, start, first, second)
+}
+
+// relayResult is the outcome of one direction of an established tunnel relay.
+type relayResult struct {
+	direction string
+	bytes     int64
+	err       error
+}
+
+const (
+	relayToClient   = "upstream_to_client"
+	relayToUpstream = "client_to_upstream"
+)
+
+// recordTunnelClose logs which side ended an established tunnel first and how
+// much each direction carried. An upstream-side error is a broken tunnel — the
+// client's stream died mid-flight — and logs at warn; every other close is
+// routine flow detail at debug. Tunnel closes never mutate route health.
+func recordTunnelClose(log *slog.Logger, target string, p *pool.Proxy, start time.Time, first, second relayResult) {
+	toClient, toUpstream := second, first
+	if first.direction == relayToClient {
+		toClient, toUpstream = first, second
+	}
+	msg, reason := "tunnel closed", "client_closed"
+	switch {
+	case first.direction == relayToClient && first.err != nil:
+		msg, reason = "tunnel broken", "upstream_broken"
+	case first.direction == relayToClient:
+		reason = "upstream_closed"
+	case first.err != nil:
+		reason = "client_aborted"
+	}
+	args := []any{
+		"target", target,
+		"upstream", upstreamLogValue(p),
+		"duration", logDuration(time.Since(start)),
+		"client_to_upstream_bytes", toUpstream.bytes,
+		"upstream_to_client_bytes", toClient.bytes,
+		"close_reason", reason,
+	}
+	if first.err != nil {
+		args = append(args, "error", logErrorValue(first.err))
+	}
+	if msg == "tunnel broken" {
+		log.Warn(msg, args...)
+		return
+	}
+	log.Debug(msg, args...)
 }
 
 func (s *Server) trackConn(c net.Conn) {

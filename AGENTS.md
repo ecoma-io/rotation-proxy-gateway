@@ -102,7 +102,10 @@ Read [`README.md`](README.md) before changing failure classification.
   in logs, `/status`, errors, or responses.
 - Logs contain process-local `request_id` and `listener`; `target` and
   `upstream` are host-only. `debug` shows flow, `info` terminal successes, and
-  `warn` fallback/terminal failures.
+  `warn` fallback/terminal failures. Established tunnels log a close record
+  (lifetime, per-direction byte counts, which side ended first) at `debug`; a
+  tunnel broken by an upstream error logs at `warn` and resets the client
+  connection. Streamed plain-HTTP responses flush per chunk.
 - Reload preserves runtime pool state only for unchanged URL+kind. Changed URL
   userinfo or kind creates a new route state. Validated configuration and its
   reconfigured pool snapshot publish as one atomic generation; in-flight

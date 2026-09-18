@@ -114,7 +114,14 @@ func (s *fakeSocks) handle(conn net.Conn) {
 		io.Copy(up, conn) //nolint:errcheck
 		up.Close()
 	}()
-	io.Copy(conn, up) //nolint:errcheck
+	if _, err := io.Copy(conn, up); err != nil {
+		// The target ended the stream abnormally. Reset the SOCKS peer too so
+		// it sees a broken tunnel rather than a clean close, modeling
+		// providers that drop live streams mid-flight.
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetLinger(0)
+		}
+	}
 }
 
 func readSocksGreeting(br *bufio.Reader, conn net.Conn, opts socksOptions) error {

@@ -195,7 +195,7 @@ func TestPlainHTTPForwardThroughSOCKS(t *testing.T) {
 func TestInvalidInboundRequestsAreRejectedBeforeDialing(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
-	var logs bytes.Buffer
+	var logs safeLogBuffer
 	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
 	for _, tc := range []struct{ name, target string }{
@@ -317,7 +317,7 @@ func TestLogsCorrelateDialFallbackAndRedactCredentials(t *testing.T) {
 	good := startSocks5Proxy(t, socksOptions{})
 	target := startEchoTarget(t)
 	pl := pool.NewRoutes(mixedRoutes(deadURL, good.URL), 30*time.Second, time.Minute)
-	var logs bytes.Buffer
+	var logs safeLogBuffer
 	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
 	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
@@ -738,7 +738,7 @@ func (b *errorReadCloser) Close() error {
 func TestBodyReadErrorIsLoggedAndDoesNotChangePool(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
-	var logs bytes.Buffer
+	var logs safeLogBuffer
 	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 	body := &errorReadCloser{err: errors.New("TEST body read failure")}
 	req := httptest.NewRequest(http.MethodPost, "http://TEST-target.invalid/", body)
@@ -1219,5 +1219,73 @@ func TestAdminEndpoints(t *testing.T) {
 	}
 	if got["version"] != "9.9.9-test" {
 		t.Fatalf("status=%v", got)
+	}
+}
+
+// startAbortTarget answers each request with a partial body under an
+// oversized Content-Length, then resets the connection — modeling a target or
+// provider that drops a live stream mid-flight.
+func startAbortTarget(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go abortTargetConn(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func abortTargetConn(conn net.Conn) {
+	defer conn.Close()
+	// No request is read: over CONNECT the client only opens the tunnel and
+	// reads, so the partial response goes out unprompted.
+	fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\npartial") //nolint:errcheck
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetLinger(0) // reset instead of a clean close
+	}
+}
+
+// An upstream that ends the tunnel abnormally produces a broken-tunnel close
+// record at warn without touching route health.
+func TestTunnelUpstreamResetLogsBrokenClose(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
+	var logs safeLogBuffer
+	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+
+	conn, _, resp := connectThrough(t, ts.URL, startAbortTarget(t))
+	defer conn.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.Copy(io.Discard, conn); err == nil {
+		t.Fatal("tunnel stayed open after the target aborted the stream")
+	}
+
+	output := waitForLog(t, &logs, `msg="tunnel broken"`)
+	for _, want := range []string{
+		"close_reason=upstream_broken",
+		"client_to_upstream_bytes=",
+		"upstream_to_client_bytes=",
+		"duration=",
+		"error=",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("close record missing %q:\n%s", want, output)
+		}
+	}
+	snap := pl.Snapshot()[0]
+	if snap.Successes != 1 || snap.Failures != 0 || snap.AuthFailures != 0 {
+		t.Fatalf("broken tunnel mutated route health: %+v", snap)
 	}
 }
