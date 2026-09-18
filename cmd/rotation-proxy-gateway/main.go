@@ -87,7 +87,7 @@ type runningListener struct {
 
 func warnUnavailableKindListeners(log *slog.Logger, cfg *config.RuntimeConfig, bootstrap *config.BootstrapConfig) {
 	var v4, v6 int
-	for _, route := range cfg.Routes {
+	for _, route := range cfg.AllRoutes() {
 		switch route.Kind {
 		case config.EgressV4:
 			v4++
@@ -117,8 +117,9 @@ func run() error {
 	warnUnavailableKindListeners(log, runtimeCfg, bootstrap)
 	// The store publishes one immutable generation (validated config + pool
 	// snapshot). Handlers load it once per operation; reload builds the next
-	// pool snapshot and swaps the whole generation atomically.
-	store := pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.Routes, runtimeCfg.CooldownBase, runtimeCfg.CooldownMax))
+	// pool snapshot and swaps the whole generation atomically. The pool serves
+	// both origins; manual routes additionally carry rotation state.
+	store := pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.AllRoutes(), runtimeCfg.CooldownBase, runtimeCfg.CooldownMax))
 
 	listeners := make([]runningListener, 0, 3)
 	listenerViews := make(map[string]*proxyserver.Server, 3)
@@ -193,7 +194,7 @@ func run() error {
 		store.Publish(next)
 		level.Set(parseSlogLevel(next.LogLevel))
 		warnUnavailableKindListeners(log, next, bootstrap)
-		log.Info("configuration reloaded", "source", source, "upstreams", len(next.Routes))
+		log.Info("configuration reloaded", "source", source, "upstreams", len(next.AllRoutes()))
 	}
 
 	for {

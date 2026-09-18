@@ -14,10 +14,25 @@ import (
 	"rotation-proxy-gateway/internal/sanitize"
 )
 
+// RotationState is the manual-route rotation lifecycle phase shown by /status.
+// Auto routes have none. draining/rotating/verifying mean the route is
+// temporarily ineligible for new picks; stale means it is serving again after a
+// rotation that did not change its egress IP.
+type RotationState string
+
+const (
+	RotationIdle      RotationState = "idle"
+	RotationDraining  RotationState = "draining"
+	RotationRotating  RotationState = "rotating"
+	RotationVerifying RotationState = "verifying"
+	RotationStale     RotationState = "stale"
+)
+
 // Proxy is one upstream SOCKS route plus its health state.
 type Proxy struct {
-	URL  *url.URL
-	Kind config.EgressKind
+	URL    *url.URL
+	Kind   config.EgressKind
+	Origin config.RouteOrigin
 
 	mu                  sync.Mutex
 	consecutiveFailures int
@@ -29,12 +44,40 @@ type Proxy struct {
 	usedSeq             uint64
 	successes           uint64
 	failures            uint64
+
+	// Rotation bookkeeping (manual routes only). rotating excludes the route
+	// from new picks while a rotation procedure holds it.
+	rotating          bool
+	rotationState     RotationState
+	inFlight          int
+	lastIP            string
+	lastRotationAt    time.Time
+	nextRetryIn       time.Duration
+	consecutiveSameIP int
+}
+
+func newProxy(route config.RouteSpec) *Proxy {
+	origin := effectiveOrigin(route.Origin)
+	p := &Proxy{URL: route.URL, Kind: route.Kind, Origin: origin}
+	if origin == config.RouteOriginManual {
+		p.rotationState = RotationIdle
+	}
+	return p
+}
+
+// effectiveOrigin treats an unset origin as auto: hand-built RouteSpecs may
+// carry the zero value and identity keys must agree with constructed entries.
+func effectiveOrigin(origin config.RouteOrigin) config.RouteOrigin {
+	if origin == "" {
+		return config.RouteOriginAuto
+	}
+	return origin
 }
 
 func (p *Proxy) available(now time.Time) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return !p.authBlocked && !now.Before(p.cooldownUntil)
+	return !p.authBlocked && !p.rotating && !now.Before(p.cooldownUntil)
 }
 
 func (p *Proxy) cooldownUntilTime() time.Time {
@@ -55,10 +98,20 @@ func (p *Proxy) lastUsedSequence() uint64 {
 	return p.usedSeq
 }
 
-func (p *Proxy) markUsed(seq uint64) {
+// markPicked records the pick sequence and one in-flight holder in a single
+// lock hold so a concurrent drain observer can never see a picked route with
+// no in-flight count.
+func (p *Proxy) markPicked(seq uint64) {
 	p.mu.Lock()
 	p.usedSeq = seq
+	p.inFlight++
 	p.mu.Unlock()
+}
+
+func (p *Proxy) rotatingNow() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.rotating
 }
 
 // Status is the exported health view of one proxy. Proxy is the redacted
@@ -66,7 +119,9 @@ func (p *Proxy) markUsed(seq uint64) {
 type Status struct {
 	Proxy               string            `json:"proxy"`
 	Kind                config.EgressKind `json:"kind"`
+	Origin              string            `json:"origin"`
 	Available           bool              `json:"available"`
+	InFlight            int               `json:"inFlight"`
 	ConsecutiveFailures int               `json:"consecutiveFailures"`
 	CooldownFor         string            `json:"cooldownFor"`
 	Successes           uint64            `json:"successes"`
@@ -75,6 +130,18 @@ type Status struct {
 	AuthFailures        uint64            `json:"authFailures"`
 	AuthBlocked         bool              `json:"authBlocked"`
 	LastAuthError       string            `json:"lastAuthError,omitempty"`
+	Rotation            *RotationStatus   `json:"rotation,omitempty"`
+}
+
+// RotationStatus is the public rotation view of one manual route. LastIP is
+// the route's own public egress IP — an operational fact operators need to
+// verify rotations, not a credential.
+type RotationStatus struct {
+	State             string `json:"state"`
+	LastIP            string `json:"lastIP,omitempty"`
+	LastRotationAt    string `json:"lastRotationAt,omitempty"`
+	NextRetryIn       string `json:"nextRetryIn,omitempty"`
+	ConsecutiveSameIP int    `json:"consecutiveSameIP"`
 }
 
 // Pool is a set of upstream SOCKS routes with least-recently-used round-robin
@@ -91,11 +158,11 @@ type Pool struct {
 	Now func() time.Time
 }
 
-// NewRoutes builds a pool from validated, kinded static routes.
+// NewRoutes builds a pool from validated, kinded routes of both origins.
 func NewRoutes(routes []config.RouteSpec, base, max time.Duration) *Pool {
 	entries := make([]*Proxy, 0, len(routes))
 	for _, route := range routes {
-		entries = append(entries, &Proxy{URL: route.URL, Kind: route.Kind})
+		entries = append(entries, newProxy(route))
 	}
 	return &Pool{
 		entries: entries,
@@ -106,9 +173,10 @@ func NewRoutes(routes []config.RouteSpec, base, max time.Duration) *Pool {
 	}
 }
 
-// Reconfigure returns a new immutable route-list snapshot. Route health is
-// retained only for canonical URL+kind matches; existing in-flight operations
-// may safely keep using the original pool.
+// Reconfigure returns a new immutable route-list snapshot. Route state is
+// retained only for canonical URL+kind+origin matches; moving a route between
+// proxies.auto and proxies.manual rebuilds it because its role changed.
+// Existing in-flight operations may safely keep using the original pool.
 func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration) *Pool {
 	pl.mu.Lock()
 	entries := append([]*Proxy(nil), pl.entries...)
@@ -118,22 +186,21 @@ func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration) 
 
 	kept := make(map[string]*Proxy, len(entries))
 	for _, entry := range entries {
-		kept[routeKey(entry.URL, entry.Kind)] = entry
+		kept[routeKey(entry.URL, entry.Kind, entry.Origin)] = entry
 	}
 	next := make([]*Proxy, 0, len(routes))
 	for _, route := range routes {
-		key := routeKey(route.URL, route.Kind)
-		if prior, ok := kept[key]; ok {
+		if prior, ok := kept[routeKey(route.URL, route.Kind, route.Origin)]; ok {
 			next = append(next, prior)
 		} else {
-			next = append(next, &Proxy{URL: route.URL, Kind: route.Kind})
+			next = append(next, newProxy(route))
 		}
 	}
 	return &Pool{entries: next, base: base, max: max, seq: seq, Now: now}
 }
 
-func routeKey(u *url.URL, kind config.EgressKind) string {
-	return config.CanonicalRouteID(u) + "|" + string(kind)
+func routeKey(u *url.URL, kind config.EgressKind, origin config.RouteOrigin) string {
+	return config.CanonicalRouteID(u) + "|" + string(kind) + "|" + string(effectiveOrigin(origin))
 }
 
 func (pl *Pool) nextSeq() uint64 {
@@ -143,9 +210,13 @@ func (pl *Pool) nextSeq() uint64 {
 // PickFor returns the next allowed proxy, excluding entries already tried for
 // the current request. It picks the least recently used available entry (stable
 // order on ties). When every allowed, non-excluded, non-auth-blocked entry is
-// cooling down it returns the allowed route that recovers soonest. It returns
-// nil when no allowed entry remains. The filter is applied equally to both
-// paths so a dedicated v4/v6 listener never crosses into another egress kind.
+// cooling down it returns the allowed route that recovers soonest. Routes held
+// by an in-progress rotation are skipped on both paths. It returns nil when no
+// allowed entry remains. The filter is applied equally to both paths so a
+// dedicated v4/v6 listener never crosses into another egress kind.
+//
+// Every successful pick holds one in-flight count on the returned route; the
+// caller releases it via Release when the request or tunnel finishes.
 func (pl *Pool) PickFor(exclude map[*Proxy]bool, allow func(*Proxy) bool) *Proxy {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
@@ -161,7 +232,7 @@ func (pl *Pool) PickFor(exclude map[*Proxy]bool, allow func(*Proxy) bool) *Proxy
 	if len(avail) == 0 {
 		var best *Proxy
 		for _, e := range pl.entries {
-			if !allowed(e) || exclude[e] || e.authBlockedNow() {
+			if !allowed(e) || exclude[e] || e.authBlockedNow() || e.rotatingNow() {
 				continue
 			}
 			if best == nil || e.cooldownUntilTime().Before(best.cooldownUntilTime()) {
@@ -169,7 +240,7 @@ func (pl *Pool) PickFor(exclude map[*Proxy]bool, allow func(*Proxy) bool) *Proxy
 			}
 		}
 		if best != nil {
-			best.markUsed(pl.nextSeq())
+			best.markPicked(pl.nextSeq())
 		}
 		return best
 	}
@@ -181,8 +252,27 @@ func (pl *Pool) PickFor(exclude map[*Proxy]bool, allow func(*Proxy) bool) *Proxy
 			chosen, chosenSeq = e, s
 		}
 	}
-	chosen.markUsed(pl.nextSeq())
+	chosen.markPicked(pl.nextSeq())
 	return chosen
+}
+
+// Release drops one in-flight hold taken by PickFor. Each successful pick is
+// released exactly once when its request or tunnel finishes; releasing a route
+// that holds nothing is harmless.
+func (p *Proxy) Release() {
+	p.mu.Lock()
+	if p.inFlight > 0 {
+		p.inFlight--
+	}
+	p.mu.Unlock()
+}
+
+// InFlight reports how many picked requests or tunnels currently hold the
+// route. The rotation engine drains to zero before rotating.
+func (p *Proxy) InFlight() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.inFlight
 }
 
 // ReportSuccess records a successful use and clears any endpoint dial cooldown.
@@ -300,7 +390,9 @@ func (pl *Pool) Snapshot() []Status {
 		out = append(out, Status{
 			Proxy:               e.URL.Host,
 			Kind:                e.Kind,
-			Available:           !e.authBlocked && !cooling,
+			Origin:              string(e.Origin),
+			Available:           !e.authBlocked && !e.rotating && !cooling,
+			InFlight:            e.inFlight,
 			ConsecutiveFailures: e.consecutiveFailures,
 			CooldownFor:         cooldown,
 			Successes:           e.successes,
@@ -309,8 +401,29 @@ func (pl *Pool) Snapshot() []Status {
 			AuthFailures:        e.authFailures,
 			AuthBlocked:         e.authBlocked,
 			LastAuthError:       e.lastAuthError,
+			Rotation:            e.rotationStatus(),
 		})
 		e.mu.Unlock()
 	}
 	return out
+}
+
+// rotationStatus builds the rotation view of a manual route. It must be called
+// with p.mu held.
+func (p *Proxy) rotationStatus() *RotationStatus {
+	if p.Origin != config.RouteOriginManual {
+		return nil
+	}
+	rs := &RotationStatus{
+		State:             string(p.rotationState),
+		ConsecutiveSameIP: p.consecutiveSameIP,
+	}
+	rs.LastIP = p.lastIP
+	if !p.lastRotationAt.IsZero() {
+		rs.LastRotationAt = p.lastRotationAt.UTC().Format(time.RFC3339)
+	}
+	if p.nextRetryIn > 0 {
+		rs.NextRetryIn = p.nextRetryIn.Truncate(time.Millisecond).String()
+	}
+	return rs
 }

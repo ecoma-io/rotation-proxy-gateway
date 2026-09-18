@@ -255,6 +255,10 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 		if p == nil {
 			break
 		}
+		// Hold the route until this handler returns: the pick counts as
+		// in-flight work for rotation draining, and earlier excluded attempts
+		// release when the handler ends rather than leaking.
+		defer p.Release()
 		attempts = attemptNumber
 		out := buildOutbound(r, body)
 		if streamMode {
@@ -485,6 +489,9 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 		if p == nil {
 			break
 		}
+		// The winning pick holds the route for the tunnel's whole lifetime;
+		// earlier excluded attempts release when the handler ends.
+		defer p.Release()
 		up, err := s.dial(r.Context(), p.URL, target, settings.dialTimeout)
 		if err != nil {
 			if r.Context().Err() != nil {
