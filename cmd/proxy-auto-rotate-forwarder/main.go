@@ -120,7 +120,7 @@ func run() error {
 			if sig == syscall.SIGHUP {
 				// Reload the pool file; keep serving with the old pool on
 				// error.
-				if err := reload(pl, srv, cfg, log); err != nil {
+				if err := reload(pl, cfg, log); err != nil {
 					log.Warn("reload failed; keeping previous pool", "err", err.Error())
 				}
 				continue
@@ -140,13 +140,12 @@ func shutdownAll(proxySrv, adminSrv *http.Server, srv *proxyserver.Server) {
 	srv.CloseTunnels()      // Shutdown ignores hijacked CONNECT conns
 }
 
-func reload(pl *pool.Pool, srv *proxyserver.Server, cfg *config.Config, log *slog.Logger) error {
+func reload(pl *pool.Pool, cfg *config.Config, log *slog.Logger) error {
 	urls, err := config.ParseProxies(cfg.ProxiesFile)
 	if err != nil {
 		return err
 	}
 	pl.Reload(urls)
-	srv.ResetTransports()
 	log.Info("pool reloaded", "upstreams", len(urls))
 	return nil
 }

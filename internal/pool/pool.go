@@ -1,5 +1,5 @@
-// Package pool holds the upstream proxy pool: rotation, per-proxy health
-// tracking, and failure cooldowns.
+// Package pool holds the upstream proxy pool: rotation, route health tracking,
+// and endpoint dial cooldowns.
 package pool
 
 import (
@@ -8,14 +8,17 @@ import (
 	"time"
 )
 
-// Proxy is one upstream proxy plus its health state.
+// Proxy is one upstream SOCKS route plus its health state.
 type Proxy struct {
 	URL *url.URL
 
 	mu                  sync.Mutex
 	consecutiveFailures int
 	cooldownUntil       time.Time
-	lastError           string
+	lastDialError       string
+	authFailures        uint64
+	authBlocked         bool
+	lastAuthError       string
 	usedSeq             uint64
 	successes           uint64
 	failures            uint64
@@ -24,13 +27,19 @@ type Proxy struct {
 func (p *Proxy) available(now time.Time) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return !now.Before(p.cooldownUntil)
+	return !p.authBlocked && !now.Before(p.cooldownUntil)
 }
 
 func (p *Proxy) cooldownUntilTime() time.Time {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.cooldownUntil
+}
+
+func (p *Proxy) authBlockedNow() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.authBlocked
 }
 
 func (p *Proxy) lastUsedSequence() uint64 {
@@ -54,11 +63,15 @@ type Status struct {
 	CooldownFor         string `json:"cooldownFor"`
 	Successes           uint64 `json:"successes"`
 	Failures            uint64 `json:"failures"`
-	LastError           string `json:"lastError,omitempty"`
+	LastDialError       string `json:"lastDialError,omitempty"`
+	AuthFailures        uint64 `json:"authFailures"`
+	AuthBlocked         bool   `json:"authBlocked"`
+	LastAuthError       string `json:"lastAuthError,omitempty"`
 }
 
-// Pool is a set of upstream proxies with least-recently-used round-robin
-// rotation and cooldown handling. All methods are safe for concurrent use.
+// Pool is a set of upstream SOCKS routes with least-recently-used round-robin
+// rotation, endpoint dial cooldowns, and authentication blocks. All methods
+// are safe for concurrent use.
 type Pool struct {
 	mu      sync.Mutex
 	entries []*Proxy
@@ -89,11 +102,11 @@ func (pl *Pool) nextSeq() uint64 {
 	return pl.seq
 }
 
-// Pick returns the next proxy to try, excluding entries already tried for
-// the current request. It picks the least recently used available entry
-// (stable order on ties). When every non-excluded entry is cooling down it
-// returns the one that recovers soonest (degraded beats down). It returns nil
-// only when exclude covers the whole pool.
+// Pick returns the next proxy to try, excluding entries already tried for the
+// current request. It picks the least recently used available entry (stable
+// order on ties). When every non-excluded, non-auth-blocked entry is cooling
+// down it returns the one that recovers soonest. It returns nil when exclude
+// covers all entries or all remaining entries are auth-blocked.
 func (pl *Pool) Pick(exclude map[*Proxy]bool) *Proxy {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
@@ -108,7 +121,7 @@ func (pl *Pool) Pick(exclude map[*Proxy]bool) *Proxy {
 	if len(avail) == 0 {
 		var best *Proxy
 		for _, e := range pl.entries {
-			if exclude[e] {
+			if exclude[e] || e.authBlockedNow() {
 				continue
 			}
 			if best == nil || e.cooldownUntilTime().Before(best.cooldownUntilTime()) {
@@ -129,21 +142,23 @@ func (pl *Pool) Pick(exclude map[*Proxy]bool) *Proxy {
 	return chosen
 }
 
-// ReportSuccess records a successful use and clears any cooldown.
+// ReportSuccess records a successful use and clears any endpoint dial cooldown.
+// It does not clear an authentication block: unchanged credentials cannot be
+// expected to recover without a pool reload that changes the route URL.
 func (pl *Pool) ReportSuccess(p *Proxy) {
 	seq := pl.nextSeq() // before p.mu: keep lock order pool -> proxy
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.consecutiveFailures = 0
 	p.cooldownUntil = time.Time{}
-	p.lastError = ""
+	p.lastDialError = ""
 	p.successes++
 	p.usedSeq = seq
 }
 
-// ReportFailure records a failure and puts the proxy into an exponentially
-// growing cooldown: base doubled per consecutive failure, capped at max.
-// It returns the applied cooldown.
+// ReportFailure records an upstream endpoint TCP dial failure and puts the
+// proxy into an exponentially growing cooldown: base doubled per consecutive
+// dial failure, capped at max. It returns the applied cooldown.
 func (pl *Pool) ReportFailure(p *Proxy, err error) time.Duration {
 	now := pl.Now() // before p.mu: keep lock order pool -> proxy
 	p.mu.Lock()
@@ -160,9 +175,21 @@ func (pl *Pool) ReportFailure(p *Proxy, err error) time.Duration {
 	}
 	p.cooldownUntil = now.Add(cd)
 	if err != nil {
-		p.lastError = err.Error()
+		p.lastDialError = err.Error()
 	}
 	return cd
+}
+
+// ReportAuthBlocked records that a SOCKS route could not authenticate. It is
+// separate from endpoint dial health and never changes cooldown.
+func (pl *Pool) ReportAuthBlocked(p *Proxy, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.authFailures++
+	p.authBlocked = true
+	if err != nil {
+		p.lastAuthError = err.Error()
+	}
 }
 
 // Reload replaces the pool contents, preserving health state for URLs that
@@ -194,19 +221,22 @@ func (pl *Pool) Snapshot() []Status {
 	out := make([]Status, 0, len(pl.entries))
 	for _, e := range pl.entries {
 		e.mu.Lock()
-		avail := !now.Before(e.cooldownUntil)
+		cooling := now.Before(e.cooldownUntil)
 		cooldown := "0s"
-		if !avail {
+		if cooling {
 			cooldown = e.cooldownUntil.Sub(now).Truncate(time.Millisecond).String()
 		}
 		out = append(out, Status{
 			Proxy:               e.URL.Host,
-			Available:           avail,
+			Available:           !e.authBlocked && !cooling,
 			ConsecutiveFailures: e.consecutiveFailures,
 			CooldownFor:         cooldown,
 			Successes:           e.successes,
 			Failures:            e.failures,
-			LastError:           e.lastError,
+			LastDialError:       e.lastDialError,
+			AuthFailures:        e.authFailures,
+			AuthBlocked:         e.authBlocked,
+			LastAuthError:       e.lastAuthError,
 		})
 		e.mu.Unlock()
 	}

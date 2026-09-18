@@ -1,5 +1,5 @@
 # Multi-stage build. Runtime stage is `scratch`: exactly one static binary
-# plus the CA bundle (provider API, upstream and healthchecks are HTTPS).
+# plus the CA bundle used to verify HTTPS targets reached through SOCKS5.
 # No shell — the Docker HEALTHCHECK works because `proxy-auto-rotate-forwarder
 # healthcheck` is a binary subcommand of the entrypoint itself.
 FROM golang:1.27-alpine AS build

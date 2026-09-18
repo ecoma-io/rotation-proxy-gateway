@@ -36,7 +36,7 @@ func newTestPool(t *testing.T, c *clock, urls ...string) *Pool {
 
 func TestRoundRobinCyclesAll(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, "http://a:1", "http://b:2", "http://c:3")
+	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2", "socks5://c:3")
 	var got []string
 	for range 6 {
 		got = append(got, pl.Pick(nil).URL.Host)
@@ -49,13 +49,13 @@ func TestRoundRobinCyclesAll(t *testing.T) {
 
 func TestFailureCooldownSkipAndRevive(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, "http://a:1", "http://b:2")
+	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2")
 
 	first := pl.Pick(nil)
 	if first.URL.Host != "a:1" {
 		t.Fatalf("first pick = %s, want a:1", first.URL.Host)
 	}
-	pl.ReportFailure(first, errors.New("boom"))
+	pl.ReportFailure(first, errors.New("dial refused"))
 
 	if got := pl.Pick(nil).URL.Host; got != "b:2" {
 		t.Fatalf("pick after failure = %s, want b:2 (a cooling)", got)
@@ -68,7 +68,7 @@ func TestFailureCooldownSkipAndRevive(t *testing.T) {
 
 func TestCooldownExponentialCap(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, "http://a:1")
+	pl := newTestPool(t, c, "socks5://a:1")
 	p := pl.Pick(nil)
 
 	if cd := pl.ReportFailure(p, nil); cd != 30*time.Second {
@@ -86,7 +86,7 @@ func TestCooldownExponentialCap(t *testing.T) {
 
 func TestExhaustedReturnsNil(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, "http://a:1")
+	pl := newTestPool(t, c, "socks5://a:1")
 	p := pl.Pick(nil)
 	if got := pl.Pick(map[*Proxy]bool{p: true}); got != nil {
 		t.Fatalf("Pick(all excluded) = %v, want nil", got)
@@ -95,7 +95,7 @@ func TestExhaustedReturnsNil(t *testing.T) {
 
 func TestAllCoolingPicksSoonestRecovery(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, "http://a:1", "http://b:2")
+	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2")
 
 	pl.ReportFailure(pl.entries[0], nil) // a: cooldown until +30s
 	pl.ReportFailure(pl.entries[1], nil)
@@ -107,40 +107,68 @@ func TestAllCoolingPicksSoonestRecovery(t *testing.T) {
 	}
 }
 
-func TestReloadCarriesCooldown(t *testing.T) {
+func TestAuthBlockedDoesNotCreateCooldown(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, "http://a:1", "http://b:2")
-	pl.ReportFailure(pl.entries[0], nil) // a cooling
+	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2")
+	pl.ReportAuthBlocked(pl.entries[0], errors.New("socks5: auth rejected"))
 
-	pl.Reload([]*url.URL{mustURL(t, "http://a:1"), mustURL(t, "http://b:2")})
-
-	if got := pl.Pick(nil).URL.Host; got != "b:2" {
-		t.Fatalf("pick after reload = %s, want b:2 (a still cooling)", got)
+	snap := pl.Snapshot()
+	if snap[0].Available || !snap[0].AuthBlocked || snap[0].AuthFailures != 1 ||
+		snap[0].Failures != 0 || snap[0].ConsecutiveFailures != 0 || snap[0].CooldownFor != "0s" {
+		t.Fatalf("blocked route snapshot = %+v", snap[0])
 	}
-	c.advance(31 * time.Second)
-	if got := pl.Pick(nil).URL.Host; got != "a:1" {
-		t.Fatalf("pick after reload+cooldown = %s, want a:1 revived", got)
+	if got := pl.Pick(nil); got.URL.Host != "b:2" {
+		t.Fatalf("Pick() = %s, want unblocked b:2", got.URL.Host)
+	}
+}
+
+func TestAllAuthBlockedReturnsNil(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := newTestPool(t, c, "socks5://a:1")
+	pl.ReportAuthBlocked(pl.entries[0], errors.New("auth rejected"))
+	if got := pl.Pick(nil); got != nil {
+		t.Fatalf("Pick() = %v, want nil when all routes auth-blocked", got)
+	}
+}
+
+func TestReloadPreservesUnchangedStateAndResetsChangedCredentials(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := newTestPool(t, c, "socks5://u:old@a:1", "socks5://b:2")
+	pl.ReportAuthBlocked(pl.entries[0], errors.New("auth rejected"))
+	pl.ReportFailure(pl.entries[1], errors.New("dial refused"))
+
+	pl.Reload([]*url.URL{
+		mustURL(t, "socks5://u:old@a:1"),
+		mustURL(t, "socks5://u:new@b:2"),
+	})
+
+	snap := pl.Snapshot()
+	if !snap[0].AuthBlocked || snap[0].AuthFailures != 1 {
+		t.Fatalf("unchanged route state = %+v, want auth state preserved", snap[0])
+	}
+	if snap[1].AuthBlocked || snap[1].Failures != 0 || snap[1].CooldownFor != "0s" {
+		t.Fatalf("changed route state = %+v, want fresh state", snap[1])
 	}
 }
 
 func TestSnapshotFields(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
-	pl := newTestPool(t, c, "http://a:1", "http://b:2")
-	pl.ReportFailure(pl.entries[0], errors.New("boom"))
+	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2")
+	pl.ReportFailure(pl.entries[0], errors.New("dial refused"))
 
 	snap := pl.Snapshot()
 	if len(snap) != 2 {
 		t.Fatalf("snapshot len = %d, want 2", len(snap))
 	}
 	a := snap[0]
-	if a.Proxy != "a:1" || a.Available || a.ConsecutiveFailures != 1 || a.Failures != 1 || a.LastError != "boom" {
+	if a.Proxy != "a:1" || a.Available || a.ConsecutiveFailures != 1 || a.Failures != 1 || a.LastDialError != "dial refused" {
 		t.Fatalf("status a = %+v", a)
 	}
 	if a.CooldownFor == "" || a.CooldownFor == "0s" {
 		t.Fatalf("status a cooldown = %q, want positive", a.CooldownFor)
 	}
 	b := snap[1]
-	if b.Proxy != "b:2" || !b.Available || b.CooldownFor != "0s" {
+	if b.Proxy != "b:2" || !b.Available || b.CooldownFor != "0s" || b.LastDialError != "" {
 		t.Fatalf("status b = %+v", b)
 	}
 }

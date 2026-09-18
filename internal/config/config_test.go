@@ -10,7 +10,7 @@ import (
 
 func TestDefaults(t *testing.T) {
 	for _, k := range []string{"LISTEN_ADDR", "ADMIN_ADDR", "PROXIES_FILE", "LOG_LEVEL",
-		"MAX_RETRIES", "COOLDOWN_BASE", "COOLDOWN_MAX", "CONNECT_TIMEOUT", "MAX_BODY_BUFFER", "UPSTREAM_TLS_INSECURE"} {
+		"MAX_RETRIES", "COOLDOWN_BASE", "COOLDOWN_MAX", "CONNECT_TIMEOUT", "MAX_BODY_BUFFER", "TARGET_TLS_INSECURE"} {
 		t.Setenv(k, "") // treated as unset
 	}
 	cfg, err := Load()
@@ -38,8 +38,8 @@ func TestDefaults(t *testing.T) {
 	if cfg.MaxBodyBuffer != DefaultMaxBodyBuffer {
 		t.Errorf("MaxBodyBuffer = %d, want %d", cfg.MaxBodyBuffer, DefaultMaxBodyBuffer)
 	}
-	if cfg.UpstreamTLSInsecure {
-		t.Error("UpstreamTLSInsecure = true, want false")
+	if cfg.TargetTLSInsecure {
+		t.Error("TargetTLSInsecure = true, want false")
 	}
 }
 
@@ -50,7 +50,7 @@ func TestEnvOverrides(t *testing.T) {
 	t.Setenv("COOLDOWN_MAX", "2m")
 	t.Setenv("CONNECT_TIMEOUT", "3s")
 	t.Setenv("MAX_BODY_BUFFER", "1024")
-	t.Setenv("UPSTREAM_TLS_INSECURE", "true")
+	t.Setenv("TARGET_TLS_INSECURE", "true")
 	t.Setenv("LOG_LEVEL", "debug")
 
 	cfg, err := Load()
@@ -60,7 +60,7 @@ func TestEnvOverrides(t *testing.T) {
 	if cfg.ListenAddr != ":9999" || cfg.AdminAddr != DefaultAdminAddr ||
 		cfg.MaxRetries != 5 || cfg.CooldownBase != time.Second || cfg.CooldownMax != 2*time.Minute ||
 		cfg.ConnectTimeout != 3*time.Second || cfg.MaxBodyBuffer != 1024 ||
-		!cfg.UpstreamTLSInsecure || cfg.LogLevel != "debug" {
+		!cfg.TargetTLSInsecure || cfg.LogLevel != "debug" {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 }
@@ -72,7 +72,7 @@ func TestInvalidValues(t *testing.T) {
 		{"zero retries", "MAX_RETRIES", "0", "MAX_RETRIES"},
 		{"bad retries", "MAX_RETRIES", "many", "MAX_RETRIES"},
 		{"bad duration", "COOLDOWN_BASE", "soon", "COOLDOWN_BASE"},
-		{"bad bool", "UPSTREAM_TLS_INSECURE", "maybe", "UPSTREAM_TLS_INSECURE"},
+		{"bad bool", "TARGET_TLS_INSECURE", "maybe", "TARGET_TLS_INSECURE"},
 		{"admin equals listen", "ADMIN_ADDR", ":7777", "LISTEN_ADDR"},
 	}
 	for _, tc := range cases {
@@ -113,12 +113,10 @@ func TestDotEnvDoesNotOverrideEnvironment(t *testing.T) {
 	}
 }
 
-func TestParseProxies(t *testing.T) {
+func TestParseProxiesRejectsNonSOCKS(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "proxies.txt")
 	content := "# comment line\n" +
 		"http://a.example:8080\n" +
-		"\n" +
-		"   \n" +
 		"socks5://user:pass@b.example:1080\n" +
 		"https://c.example:8443\n" +
 		"ftp://bad.example:21\n" +
@@ -128,9 +126,9 @@ func TestParseProxies(t *testing.T) {
 	}
 	entries, err := ParseProxies(path)
 	if err == nil {
-		t.Fatal("ParseProxies() succeeded, want error for invalid lines")
+		t.Fatal("ParseProxies() succeeded, want error for non-SOCKS lines")
 	}
-	for _, want := range []string{"line 7", "line 8"} {
+	for _, want := range []string{"line 2", "line 4", "line 5", "line 6"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q missing %q", err, want)
 		}
@@ -142,7 +140,7 @@ func TestParseProxies(t *testing.T) {
 
 func TestParseProxiesValid(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "proxies.txt")
-	content := "# only comments\n\nhttp://a.example:8080\nsocks5://u:p@b.example:1080\n"
+	content := "# only comments\n\nsocks5://a.example:1080\nsocks5://u:p@b.example:1080\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -158,9 +156,9 @@ func TestParseProxiesValid(t *testing.T) {
 	}
 }
 
-func TestParseProxiesLegacyFormat(t *testing.T) {
+func TestParseProxiesBareSOCKSFormat(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "proxies.txt")
-	content := "# legacy bare forms\n203.0.113.7:8080:alice:s3cret\ncarol:s4cret@203.0.113.9:3128\n"
+	content := "# bare SOCKS5 forms\n203.0.113.7:1080:alice:s3cret\ncarol:s4cret@203.0.113.9:1080\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -172,11 +170,11 @@ func TestParseProxiesLegacyFormat(t *testing.T) {
 		t.Fatalf("got %d entries, want 2", len(entries))
 	}
 	for i, want := range []struct{ host, user, pass string }{
-		{"203.0.113.7:8080", "alice", "s3cret"},
-		{"203.0.113.9:3128", "carol", "s4cret"},
+		{"203.0.113.7:1080", "alice", "s3cret"},
+		{"203.0.113.9:1080", "carol", "s4cret"},
 	} {
-		if entries[i].Scheme != "http" {
-			t.Errorf("entry[%d] scheme = %q, want http", i, entries[i].Scheme)
+		if entries[i].Scheme != "socks5" {
+			t.Errorf("entry[%d] scheme = %q, want socks5", i, entries[i].Scheme)
 		}
 		if entries[i].Host != want.host {
 			t.Errorf("entry[%d] host = %q, want %q", i, entries[i].Host, want.host)
@@ -190,17 +188,19 @@ func TestParseProxiesLegacyFormat(t *testing.T) {
 	}
 }
 
-func TestParseProxiesLegacyBadLines(t *testing.T) {
+func TestParseProxiesBareBadLines(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "proxies.txt")
-	content := "203.0.113.7:8080:onlythree\n203.0.113.7:notaport:u:p\nhttp://good.example:8080\n"
+	content := "203.0.113.7:1080:onlythree\n203.0.113.7:notaport:u:p\nhttp://bad.example:8080\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ParseProxies(path); err == nil {
-		t.Fatal("ParseProxies() succeeded, want error for malformed legacy lines")
+		t.Fatal("ParseProxies() succeeded, want error for malformed/non-SOCKS lines")
 	} else {
-		if !strings.Contains(err.Error(), "line 1") || !strings.Contains(err.Error(), "line 2") {
-			t.Errorf("error %q missing line 1/2 markers", err)
+		for _, want := range []string{"line 1", "line 2", "line 3"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q missing %s marker", err, want)
+			}
 		}
 	}
 }

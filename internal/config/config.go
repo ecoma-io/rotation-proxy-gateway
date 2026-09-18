@@ -28,16 +28,16 @@ const (
 
 // Config is the full runtime configuration.
 type Config struct {
-	ListenAddr          string
-	AdminAddr           string // admin listener (health, status); always on
-	ProxiesFile         string
-	MaxRetries          int
-	CooldownBase        time.Duration
-	CooldownMax         time.Duration
-	ConnectTimeout      time.Duration
-	UpstreamTLSInsecure bool
-	MaxBodyBuffer       int64
-	LogLevel            string
+	ListenAddr        string
+	AdminAddr         string // admin listener (health, status); always on
+	ProxiesFile       string
+	MaxRetries        int
+	CooldownBase      time.Duration
+	CooldownMax       time.Duration
+	ConnectTimeout    time.Duration
+	TargetTLSInsecure bool
+	MaxBodyBuffer     int64
+	LogLevel          string
 }
 
 // Load applies defaults, reads the optional .env from the working directory,
@@ -46,16 +46,16 @@ func Load() (*Config, error) {
 	_ = loadDotEnv(".env")
 
 	cfg := &Config{
-		ListenAddr:          DefaultListenAddr,
-		AdminAddr:           DefaultAdminAddr,
-		ProxiesFile:         DefaultProxiesFile,
-		MaxRetries:          DefaultMaxRetries,
-		CooldownBase:        DefaultCooldownBase,
-		CooldownMax:         DefaultCooldownMax,
-		ConnectTimeout:      DefaultConnectTimeout,
-		UpstreamTLSInsecure: false,
-		MaxBodyBuffer:       DefaultMaxBodyBuffer,
-		LogLevel:            "info",
+		ListenAddr:        DefaultListenAddr,
+		AdminAddr:         DefaultAdminAddr,
+		ProxiesFile:       DefaultProxiesFile,
+		MaxRetries:        DefaultMaxRetries,
+		CooldownBase:      DefaultCooldownBase,
+		CooldownMax:       DefaultCooldownMax,
+		ConnectTimeout:    DefaultConnectTimeout,
+		TargetTLSInsecure: false,
+		MaxBodyBuffer:     DefaultMaxBodyBuffer,
+		LogLevel:          "info",
 	}
 
 	var errs []error
@@ -69,7 +69,7 @@ func Load() (*Config, error) {
 		envDuration("COOLDOWN_MAX", &cfg.CooldownMax),
 		envDuration("CONNECT_TIMEOUT", &cfg.ConnectTimeout),
 		envInt64("MAX_BODY_BUFFER", &cfg.MaxBodyBuffer),
-		envBool("UPSTREAM_TLS_INSECURE", &cfg.UpstreamTLSInsecure),
+		envBool("TARGET_TLS_INSECURE", &cfg.TargetTLSInsecure),
 	)
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
@@ -195,13 +195,12 @@ func loadDotEnv(path string) error {
 	return sc.Err()
 }
 
-var validSchemes = map[string]bool{"http": true, "https": true, "socks5": true}
+var validSchemes = map[string]bool{"socks5": true}
 
-// ParseProxies reads the pool file: one upstream proxy per line, blank lines
-// and #-comments ignored. Each line is either a full proxy URL
-// ("http://user:pass@host:port", "socks5://host:port") or the legacy bare
-// form "host:port:user:pass" (treated as HTTP). It returns an error if any
-// line is invalid or if the file yields no proxies.
+// ParseProxies reads the SOCKS5 pool file: one upstream per line, blank lines
+// and #-comments ignored. Each line is a socks5:// URL or either bare form
+// "host:port:user:pass" / "user:pass@host:port", both interpreted as SOCKS5.
+// It returns an error if any line is invalid or if the file yields no proxies.
 func ParseProxies(path string) ([]*url.URL, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -226,7 +225,7 @@ func ParseProxies(path string) ([]*url.URL, error) {
 		case err != nil:
 			errs = append(errs, fmt.Errorf("%s line %d: %w", path, lineNo, err))
 		case !validSchemes[u.Scheme]:
-			errs = append(errs, fmt.Errorf("%s line %d: unsupported scheme %q (want http, https or socks5)", path, lineNo, u.Scheme))
+			errs = append(errs, fmt.Errorf("%s line %d: unsupported scheme %q (want socks5://..., host:port:user:pass, or user:pass@host:port)", path, lineNo, u.Scheme))
 		case u.Hostname() == "":
 			errs = append(errs, fmt.Errorf("%s line %d: missing host", path, lineNo))
 		default:
@@ -245,16 +244,15 @@ func ParseProxies(path string) ([]*url.URL, error) {
 	return entries, nil
 }
 
-// parseProxyLine accepts a full proxy URL ("http://user:pass@host:port") or
-// either legacy bare form: "host:port:user:pass" or "user:pass@host:port"
-// (both treated as HTTP with Basic auth).
+// parseProxyLine accepts a socks5:// URL or either bare SOCKS5 form:
+// "host:port:user:pass" or "user:pass@host:port".
 func parseProxyLine(line string) (*url.URL, error) {
 	if strings.Contains(line, "://") {
 		return url.Parse(line)
 	}
 	if strings.Contains(line, "@") {
-		// Legacy "user:pass@host:port" (no scheme) — treat as HTTP.
-		u, err := url.Parse("http://" + line)
+		// Bare "user:pass@host:port" defaults to SOCKS5.
+		u, err := url.Parse("socks5://" + line)
 		if err != nil {
 			return nil, fmt.Errorf("bad proxy %q: %w", line, err)
 		}
@@ -266,24 +264,24 @@ func parseProxyLine(line string) (*url.URL, error) {
 		}
 		return u, nil
 	}
-	// Legacy "host:port:user:pass" (no scheme) — treat as HTTP.
+	// Bare "host:port:user:pass" defaults to SOCKS5.
 	host, rest, ok := strings.Cut(line, ":")
 	if !ok || host == "" {
-		return nil, fmt.Errorf("bad proxy %q (want scheme://..., host:port:user:pass or user:pass@host:port)", line)
+		return nil, fmt.Errorf("bad proxy %q (want socks5://..., host:port:user:pass, or user:pass@host:port)", line)
 	}
 	port, creds, ok := strings.Cut(rest, ":")
 	if !ok || port == "" || creds == "" {
-		return nil, fmt.Errorf("bad proxy %q (want scheme://..., host:port:user:pass or user:pass@host:port)", line)
+		return nil, fmt.Errorf("bad proxy %q (want socks5://..., host:port:user:pass, or user:pass@host:port)", line)
 	}
 	user, pass, ok := strings.Cut(creds, ":")
 	if !ok || user == "" || pass == "" || strings.Contains(pass, ":") {
-		return nil, fmt.Errorf("bad proxy %q (want scheme://..., host:port:user:pass or user:pass@host:port)", line)
+		return nil, fmt.Errorf("bad proxy %q (want socks5://..., host:port:user:pass, or user:pass@host:port)", line)
 	}
 	if err := checkPort(port, line); err != nil {
 		return nil, err
 	}
 	return &url.URL{
-		Scheme: "http",
+		Scheme: "socks5",
 		User:   url.UserPassword(user, pass),
 		Host:   net.JoinHostPort(host, port),
 	}, nil
