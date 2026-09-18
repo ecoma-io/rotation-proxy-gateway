@@ -54,9 +54,10 @@ Empty proxy listener addresses disable their listener, but at least one proxy
 listener must remain enabled. All enabled addresses must be valid host:port
 addresses and must not overlap (including wildcard binds on the same port).
 
-Runtime settings and active static routes live only in `config.yaml`:
+Runtime settings and active routes live only in `config.yaml`:
 `log-level`, `max-retries`, `cooldown`, `dial-timeout`, global TLS/body
-settings, and `proxies.auto`. The process polls the file each second and
+settings, `proxies.auto`, `proxies.manual`, and the `rotation` block. The
+process polls the file each second and
 reloads when its content hash changes, so in-place edits and atomic
 replacements both reload under any mount style. A failed parse/validation
 leaves the last-known-good pool and runtime settings serving. Do not add a
@@ -64,8 +65,7 @@ manual reload fallback (for example SIGHUP), and do not reintroduce
 event-based watching: neither can fix the one blind spot, a rename-over a
 single-file bind mount (the mount pins the old inode) — see README
 "Reload behavior".
-`proxies.manual` is accepted but opaque and ignored until the
-future API-rotation phase. Per-route `target-tls-insecure` and
+Per-route `target-tls-insecure` and
 `max-body-buffer` are not allowed: both are global settings.
 
 `kind: v4|v6` means the provider-backed **public egress IP family**. It does
@@ -107,23 +107,37 @@ Read [`README.md`](README.md) before changing failure classification.
   tunnel broken by an upstream error logs at `warn` and resets the client
   connection. Streamed plain-HTTP responses flush per chunk.
 - Reload preserves runtime pool state only for unchanged URL+kind. Changed URL
-  userinfo or kind creates a new route state. Validated configuration and its
+  userinfo or kind — or moving a route between `proxies.auto` and
+  `proxies.manual` — creates a new route state. Validated configuration and its
   reconfigured pool snapshot publish as one atomic generation; in-flight
   operations finish on their original generation.
-- Shutdown drains all proxy listeners and admin against one shared
-  `SHUTDOWN_GRACE` budget (default 55s; one deadline for the whole process,
-  not a window per listener), then force-closes hijacked tunnels. Keep the
-  surrounding orchestrator's kill timer above the budget (`stop_grace_period:
-  60s` in compose).
+- Manual routes (`proxies.manual`) rotate their public egress IP through a
+  provider HTTP API on a per-route schedule, driven by `internal/rotation`:
+  drain → baseline probe → rotate call → verify (success requires a changed IP
+  that collides with no other manual route). An unchanged IP never takes the
+  route out of service: it serves in the `stale` state and retries forever with
+  doubling, capped, jittered backoff. Probe and rotate traffic bypasses pool
+  health entirely; rotate-API headers, bodies, and URLs must never reach logs,
+  errors, or `/status`. `rotation.drain-timeout` (one route's pre-rotation
+  quiesce) is unrelated to `SHUTDOWN_GRACE` (whole-process listener drain).
+- Shutdown cancels the rotation engine first — procedures abort at their next
+  checkpoint and never extend the budget — then drains all proxy listeners and
+  admin against one shared `SHUTDOWN_GRACE` budget (default 55s; one deadline
+  for the whole process, not a window per listener), then force-closes hijacked
+  tunnels. Keep the surrounding orchestrator's kill timer above the budget
+  (`stop_grace_period: 60s` in compose).
 
 ## Admin
 
 ```bash
 curl http://127.0.0.1:30120/healthz # body "ok\n"
-curl http://127.0.0.1:30120/status  # global + per-listener counters, safe pool state
+curl http://127.0.0.1:30120/status  # requests/failovers per listener, global rotations, safe pool state
 ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 ./bin/rpgw version
 ```
+
+`failovers` counts in-band route fallbacks (a listener metric); `rotations`
+counts completed manual-route rotations that observed a changed egress IP.
 
 ## Docker
 
@@ -144,10 +158,12 @@ binary `healthcheck` subcommand (no shell in the scratch image).
 
 ## Layout
 
-- `internal/config` — bootstrap environment, Viper YAML validation, route parsing, content-hash change poller
-- `internal/pool` — LRU filtering, cooldown/auth state, immutable generation snapshots
-- `internal/proxyserver` — SOCKS5 dialing plus inbound HTTP/CONNECT forwarding
-- `cmd/rotation-proxy-gateway` — lifecycle, signals, admin endpoints
+- `internal/config` — bootstrap environment, Viper YAML validation, route parsing (auto + manual), rotation settings, content-hash change poller
+- `internal/pool` — LRU filtering, cooldown/auth state, in-flight work, rotation state, immutable generation snapshots
+- `internal/proxyserver` — inbound HTTP/CONNECT forwarding plus the admin mux
+- `internal/socksdial` — the shared SOCKS5 dialer used by the forwarder and the rotation probes
+- `internal/rotation` — manual-route rotation engine: scheduling under the concurrency cap, drain, probes, rotate calls, verification, backoff
+- `cmd/rotation-proxy-gateway` — lifecycle, signals, watcher, admin endpoints
 - `e2e` — black-box tests and benchmarks driving the real binary as a
-  subprocess with SOCKS5/HTTP simulators; `go test ./e2e/` (skip with
-  `-short`), baselines in `e2e/BENCH.md`
+  subprocess with SOCKS5/HTTP/trace/rotate-API simulators; `go test ./e2e/`
+  (skip with `-short`), baselines in `e2e/BENCH.md`

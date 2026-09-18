@@ -93,7 +93,9 @@ proxies:
   manual: []
 ```
 
-`proxies.auto` is the phase-1 source of static routes. The accepted `proxy`
+`proxies.auto` is the source of static routes; `proxies.manual` routes
+additionally carry a rotate schedule and provider API (see
+["Manual rotation routes"](#manual-rotation-routes)). The accepted `proxy`
 forms are:
 
 ```text
@@ -113,9 +115,151 @@ logs, or `/status`.
 per-route overrides are rejected. `target-tls-insecure` defaults to `false` and
 should not be enabled for untrusted targets.
 
-`proxies.manual` is deliberately accepted but **ignored** in phase 1. No API
-request is made, no manual route is selected, and its contents are never exposed
-by logs or status. API-driven rotation is a future phase.
+`proxies.auto` routes and `proxies.manual` routes share one pool and one
+identity space; a duplicate across the two lists is rejected like any other.
+
+## Manual rotation routes
+
+`proxies.manual` routes are static SOCKS routes whose **public egress IP is
+changed through a provider HTTP API** on a per-route schedule. The gateway
+drives that schedule itself: it probes the route's current egress IP, calls the
+provider's rotate endpoint, verifies the egress IP actually changed, and records
+the outcome. Manual routes serve ordinary traffic like any other route between
+rotations.
+
+### Route configuration
+
+```yaml
+proxies:
+  manual:
+    - proxy: socks5://username:password@provider.example:1080
+      kind: v6
+      rotate-interval: 90s
+      api:
+        url: https://provider.example/api/rotate-ip
+        method: POST
+        headers:
+          Content-Type: application/json
+        body: '{"subnet": 3}'
+        timeout: 10s
+```
+
+- `rotate-interval` (required, positive duration): minimum time between
+  rotation attempts of this route. After a verified rotation the next attempt is
+  scheduled one interval out; after an unchanged-IP outcome it is scheduled by
+  the retry backoff instead.
+- `api` (required): the provider call that requests a new egress IP.
+  `url` is required (http or https). `method` defaults to `POST`. `timeout`
+  defaults to `10s` and bounds one call. `headers` and `body` are sent verbatim.
+  **Headers and body may carry provider credentials: they are never logged,
+  never echoed in errors, and never exposed by `/status`.** The call is made
+  directly from the gateway process and never through the route pool, so a
+  failing provider API cannot affect route health.
+- `kind` keeps its phase-1 meaning: the provider-backed public egress IP family.
+  It does not restrict target address families, and no family is inferred from
+  the SOCKS endpoint address.
+
+### Rotation settings
+
+```yaml
+rotation:
+  max-concurrent: 1
+  drain-timeout: 55s
+  rotate-on-start: false
+  ip-check-url: https://www.cloudflare.com/cdn-cgi/trace
+  ip-check-timeout: 20s
+  ip-check-interval: 2s
+  retry-backoff-max: 15m
+```
+
+| Setting | Default | Meaning |
+|---|---:|---|
+| `max-concurrent` | `1` | Rotation procedures running at once: a fixed count, or `"NN%"` of the manual routes (rounded up, at least 1, never more than the route count). Resolved fresh every scheduling cycle. |
+| `drain-timeout` | `55s` | How long a procedure waits for the route's in-flight requests to finish before force-rotating. Expiry does not wait longer; requests already in flight may continue on the old egress IP. |
+| `rotate-on-start` | `false` | Rotate every manual route at process start, under the same cap and staggering, instead of waiting one interval. |
+| `ip-check-url` | Cloudflare trace | HTTPS URL whose response body contains an `ip=` line. **Must be `https`.** The probe always verifies TLS regardless of `target-tls-insecure`. |
+| `ip-check-timeout` | `20s` | Total window for one verification: how long a procedure watches for a changed IP before giving up on that attempt. |
+| `ip-check-interval` | `2s` | Pause between verification probes inside that window. |
+| `retry-backoff-max` | `15m` | Ceiling of the same-IP retry backoff. |
+
+`rotation.drain-timeout` and `SHUTDOWN_GRACE` are unrelated budgets. The drain
+timeout bounds one route's pre-rotation quiesce; the shutdown grace bounds the
+whole process's listener drain. They never interact: a rotation procedure never
+extends shutdown, and shutdown never waits on a rotation.
+
+### Procedure contract
+
+Each attempt runs: **drain → baseline probe → rotate call → verify**.
+
+1. **Drain.** The route stops receiving new picks immediately and stays
+   ineligible for the whole procedure. The procedure waits for the route's
+   in-flight requests to finish, bounded by `drain-timeout`; expiry proceeds
+   anyway. Draining a route that serves no other purpose can make requests fail
+   with the ordinary `no_route` `502` until the window ends.
+2. **Baseline probe.** The gateway dials through the route (SOCKS, then TLS)
+   to `ip-check-url` and reads the `ip=` line. Three attempts; if all fail the
+   procedure continues with no known baseline (**unverified mode**), and later
+   verification only requires an IP that does not collide with another manual
+   route.
+3. **Rotate call.** One call to the route's `api`. Transport errors, non-2xx
+   statuses, and timeouts end the call; the procedure still probes once, because
+   the provider may have rotated despite reporting failure. A `429` response
+   with `Retry-After: N` raises the next attempt's wait to at least `N` seconds.
+4. **Verify.** The gateway re-probes until `ip-check-timeout` elapses. The
+   attempt **succeeds only if the reported IP differs from the baseline and is
+   not the current IP of any other manual route** (a cross-route collision does
+   not count). Success records the new IP as the route's baseline, clears dial
+   cooldowns learned against the old IP, and never clears an authentication
+   block — credentials did not rotate with the IP.
+
+**An unchanged IP is not a failure of the route.** The route returns to serving
+immediately in the `stale` state, and the gateway retries forever — the next
+attempt waits one `rotate-interval`, doubling per consecutive unchanged result
+(`interval`, `2×`, `4×`, …) with ±10% jitter, capped at `retry-backoff-max`, and
+floored by any `Retry-After`. Stale routes are pushed to the back of the
+least-recently-used order so fresher routes absorb traffic first, but they keep
+serving normally.
+
+A route whose provider hands out non-sticky addresses cannot be rotated
+reliably. At boot the gateway probes each manual route twice and logs a warning
+when the two probes differ.
+
+### States
+
+`/status` reports each manual route's rotation view:
+
+| State | Meaning |
+|---|---|
+| `idle` | Serving; last verified rotation observed a changed IP (or none has run yet). |
+| `draining` | Mid-procedure: ineligible for picks, waiting for in-flight work. |
+| `rotating` | Mid-procedure: baseline learned, rotate API call in progress. |
+| `verifying` | Mid-procedure: watching for a changed egress IP. |
+| `stale` | Serving; the last attempt(s) did not change the IP; next retry is scheduled. |
+
+Each view additionally shows `lastIP` (the last verified egress IP — this is
+operational data, not a credential), `lastRotationAt` (RFC 3339), `nextRetryIn`
+(stale routes only), and `consecutiveSameIP`.
+
+### Reload and shutdown interplay
+
+Manual routes reload like everything else: new or changed entries are picked up
+on the next one-second scheduling cycle, and unchanged identities keep their
+rotation state. A route removed (or whose URL, kind, or origin changes) while
+its procedure runs has that procedure abandoned at the next checkpoint; the
+provider API is not called again for it and no outcome is recorded.
+
+Shutdown cancels the rotation engine first, so every mid-flight procedure stops
+immediately and leaves the route in its last serving state; rotations never
+extend `SHUTDOWN_GRACE` and tunnels are never broken by shutdown sequencing
+beyond the ordinary listener drain.
+
+### Request-path interaction
+
+Rotation procedures run outside the request path: probe traffic bypasses pool
+health entirely and never creates cooldowns or failures. Requests picked before
+a rotation began keep running (unless the drain timeout expired and the operator
+accepts the old egress); requests arriving during a procedure select other
+routes, or `502` with `no_route` when none exist.
 
 ### Reload behavior
 
@@ -174,10 +318,14 @@ The following settings apply to new client operations without restart:
 - `dial-timeout`
 - `global.target-tls-insecure`
 - `global.max-body-buffer`
-- `proxies.auto`
+- `proxies.auto` and `proxies.manual`
+- every `rotation.*` setting (the scheduler reads them per cycle; a procedure
+  already running keeps its own `drain-timeout` and probe settings)
 
 Unchanged URL+kind routes preserve their LRU, cooldown, authentication-block,
-and counter state. Changing userinfo or kind creates a fresh route state.
+rotation state (last verified IP, stale history), and counters. Changing
+userinfo, kind, or moving a route between `proxies.auto` and `proxies.manual`
+creates a fresh route state.
 
 ## Failure and route-health contract
 
@@ -251,16 +399,20 @@ ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 ./bin/rpgw version
 ```
 
-`/status` keeps `version`, `uptime`, global `requests`, global `rotations`, and
-redacted `pool` state. It additionally reports safe per-listener counters and
-each route's `kind`. Route identities are always `host:port`, never userinfo.
-Each route's `failures` and `lastDialError` cover endpoint dial and SOCKS
-handshake failures.
+`/status` keeps `version`, `uptime`, global `requests`, global `rotations`
+(completed manual-route rotations that observed a changed egress IP), and
+redacted `pool` state. It additionally reports safe per-listener counters —
+`requests` and `failovers` (in-band route fallbacks, distinct from rotations) —
+each route's `kind` and `origin`, and each manual route's rotation view (see
+"Manual rotation routes"). Route identities are always `host:port`, never
+userinfo; rotate-API headers, bodies, and URLs never appear anywhere in the
+output. Each route's `failures` and `lastDialError` cover endpoint dial and
+SOCKS handshake failures.
 
 Each request has a process-local `request_id`. Logs additionally include
 `listener=mixed|v4|v6`, host-only `target` and `upstream`, retry attempts,
 error category, and cooldown for endpoint dial and SOCKS handshake failures.
-They never log full URLs, headers, bodies, userinfo, or the ignored manual API
+They never log full URLs, headers, bodies, userinfo, or the rotate-API
 configuration.
 
 Every established tunnel also logs a close record with its lifetime,
@@ -305,12 +457,13 @@ go test -race ./...
 go build -ldflags "-X main.version=0.1.0-dev" -o bin/rpgw ./cmd/rotation-proxy-gateway
 ```
 
-Graceful shutdown stops accepting, then drains every enabled proxy listener
-and the admin listener against one shared budget, `SHUTDOWN_GRACE` (default
-55s). It is one deadline for the whole process, not a window per listener, so
-even a fully busy worst case exits near the budget; an idle process exits
-immediately. When the budget expires, the remaining listeners are still closed,
-and hijacked CONNECT tunnels that `http.Server.Shutdown` does not track are
-force-closed. Size the surrounding orchestrator above the budget -- for
-example `stop_grace_period: 60s` in compose -- so its kill timer never cuts
+Graceful shutdown stops the rotation engine (mid-flight procedures abort at
+their next checkpoint; no outcome is recorded), then drains every enabled proxy
+listener and the admin listener against one shared budget, `SHUTDOWN_GRACE`
+(default 55s). It is one deadline for the whole process, not a window per
+listener, so even a fully busy worst case exits near the budget; an idle
+process exits immediately. When the budget expires, the remaining listeners are
+still closed, and hijacked CONNECT tunnels that `http.Server.Shutdown` does not
+track are force-closed. Size the surrounding orchestrator above the budget --
+for example `stop_grace_period: 60s` in compose -- so its kill timer never cuts
 the drain short.
