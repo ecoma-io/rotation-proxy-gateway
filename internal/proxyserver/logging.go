@@ -16,6 +16,7 @@ const maxLogErrorLength = 512
 const (
 	errorKindProxyConnect = "proxy_connect"
 	errorKindAuthRoute    = "auth_route"
+	errorKindSocksConnect = "socks_connect"
 	errorKindSetup        = "setup"
 	errorKindNoRoute      = "no_route"
 )
@@ -74,6 +75,8 @@ func logErrorKind(err error) string {
 		return errorKindProxyConnect
 	case isProxyAuthError(err):
 		return errorKindAuthRoute
+	case isSocksHandshakeError(err):
+		return errorKindSocksConnect
 	default:
 		return errorKindSetup
 	}

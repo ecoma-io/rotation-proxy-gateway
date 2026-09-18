@@ -81,11 +81,16 @@ Read [`README.md`](README.md) before changing failure classification.
   both dedicated and mixed listeners.
 - Endpoint DNS/TCP failure is `proxy_connect`: cooldown then a distinct
   eligible fallback. SOCKS auth failure is `auth_route`, blocks the route, and
-  may fall back, but never creates dial cooldown. Post-dial errors are `setup`;
-  exhausting eligible routes is `no_route`.
-- Errors after endpoint TCP dial succeeds—including SOCKS target-connect,
-  target TLS, write/read, malformed response, cancellation, and broken tunnel—
-  do not alter health and are not retried.
+  may fall back, but never creates dial cooldown. A SOCKS handshake failure
+  before the tunnel exists—greeting, method/auth framing, CONNECT framing or
+  reply, bound-address reads—is `socks_connect`: the same cooldown-and-fallback
+  treatment as `proxy_connect`, because no client bytes have crossed the tunnel
+  yet. Local request errors and post-tunnel errors are `setup`; exhausting
+  eligible routes is `no_route`.
+- Errors after the SOCKS tunnel is established—including target TLS, write/
+  read, malformed response, cancellation, and broken tunnel—and local request
+  errors (bad scheme, oversized configured credentials, invalid target) do not
+  alter health and are not retried.
 - Valid target responses, including `407`, `408`, `429`, and `5xx`, are
   forwarded once. A target `407` is ordinary data, not SOCKS authentication.
 - The kind filter applies to ordinary LRU selection and all-cooling fallback;

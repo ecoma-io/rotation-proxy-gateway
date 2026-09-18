@@ -25,8 +25,10 @@ type ProxyAuthError struct{ Reason string }
 
 func (e *ProxyAuthError) Error() string { return "SOCKS authentication failed: " + e.Reason }
 
-// SocksProtocolError covers every SOCKS or target setup failure after endpoint
-// TCP dialing succeeded. It must not change route health or trigger a retry.
+// SocksProtocolError covers local request-scoped failures that behave the
+// same on every route: an unsupported upstream scheme, oversized configured
+// credentials, and invalid target parsing or encoding. It must not change
+// route health or trigger a retry.
 type SocksProtocolError struct {
 	Op  string
 	Err error
@@ -40,6 +42,25 @@ func (e *SocksProtocolError) Error() string {
 }
 func (e *SocksProtocolError) Unwrap() error { return e.Err }
 
+// SocksHandshakeError means the network exchange with a connected SOCKS
+// endpoint failed before the target tunnel was established: greeting, method
+// or authentication framing, CONNECT framing or reply, and bound-address
+// reads. No client bytes have crossed the tunnel, so like ProxyDialError it
+// records dial health and permits a distinct-route retry; it logs under its
+// own error kind.
+type SocksHandshakeError struct {
+	Op  string
+	Err error
+}
+
+func (e *SocksHandshakeError) Error() string {
+	if e.Err == nil {
+		return "SOCKS handshake failed during " + e.Op
+	}
+	return fmt.Sprintf("SOCKS handshake failed during %s: %v", e.Op, e.Err)
+}
+func (e *SocksHandshakeError) Unwrap() error { return e.Err }
+
 func isProxyDialError(err error) bool {
 	var dialErr *ProxyDialError
 	return errorAs(err, &dialErr)
@@ -48,6 +69,11 @@ func isProxyDialError(err error) bool {
 func isProxyAuthError(err error) bool {
 	var authErr *ProxyAuthError
 	return errorAs(err, &authErr)
+}
+
+func isSocksHandshakeError(err error) bool {
+	var handshakeErr *SocksHandshakeError
+	return errorAs(err, &handshakeErr)
 }
 
 // errorAs is a narrow seam that keeps the public classifiers above together.
@@ -93,9 +119,13 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 	if err != nil {
 		return nil, err
 	}
-	failProtocol := func(op string, err error) (net.Conn, error) {
+	failSetup := func(op string, err error) (net.Conn, error) {
 		conn.Close()
 		return nil, &SocksProtocolError{Op: op, Err: err}
+	}
+	failHandshake := func(op string, err error) (net.Conn, error) {
+		conn.Close()
+		return nil, &SocksHandshakeError{Op: op, Err: err}
 	}
 
 	user, pass := "", ""
@@ -113,14 +143,14 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 		methods = []byte{0x00, 0x02}
 	}
 	if _, err := conn.Write(append([]byte{0x05, byte(len(methods))}, methods...)); err != nil {
-		return failProtocol("send greeting", err)
+		return failHandshake("send greeting", err)
 	}
 	choice := make([]byte, 2)
 	if _, err := io.ReadFull(br, choice); err != nil {
-		return failProtocol("read greeting", err)
+		return failHandshake("read greeting", err)
 	}
 	if choice[0] != 0x05 {
-		return failProtocol("read greeting", fmt.Errorf("unexpected SOCKS version 0x%02x", choice[0]))
+		return failHandshake("read greeting", fmt.Errorf("unexpected SOCKS version 0x%02x", choice[0]))
 	}
 	switch choice[1] {
 	case 0x00: // no auth needed
@@ -130,20 +160,20 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 			return nil, &ProxyAuthError{Reason: "endpoint requires credentials but none are configured"}
 		}
 		if len(user) > 255 || len(pass) > 255 {
-			return failProtocol("encode credentials", fmt.Errorf("username or password exceeds SOCKS5 length limit"))
+			return failSetup("encode credentials", fmt.Errorf("username or password exceeds SOCKS5 length limit"))
 		}
 		b := append([]byte{0x01, byte(len(user))}, user...)
 		b = append(b, byte(len(pass)))
 		b = append(b, pass...)
 		if _, err := conn.Write(b); err != nil {
-			return failProtocol("send authentication", err)
+			return failHandshake("send authentication", err)
 		}
 		reply := make([]byte, 2)
 		if _, err := io.ReadFull(br, reply); err != nil {
-			return failProtocol("read authentication", err)
+			return failHandshake("read authentication", err)
 		}
 		if reply[0] != 0x01 {
-			return failProtocol("read authentication", fmt.Errorf("unexpected auth version 0x%02x", reply[0]))
+			return failHandshake("read authentication", fmt.Errorf("unexpected auth version 0x%02x", reply[0]))
 		}
 		if reply[1] != 0x00 {
 			conn.Close()
@@ -153,36 +183,36 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 		conn.Close()
 		return nil, &ProxyAuthError{Reason: "endpoint accepted no offered authentication method"}
 	default:
-		return failProtocol("negotiate authentication", fmt.Errorf("unsupported method 0x%02x", choice[1]))
+		return failHandshake("negotiate authentication", fmt.Errorf("unsupported method 0x%02x", choice[1]))
 	}
 
 	host, portStr, err := net.SplitHostPort(targetAddr)
 	if err != nil {
-		return failProtocol("parse target", err)
+		return failSetup("parse target", err)
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port <= 0 || port > 65535 {
-		return failProtocol("parse target", fmt.Errorf("invalid target port %q", portStr))
+		return failSetup("parse target", fmt.Errorf("invalid target port %q", portStr))
 	}
 	req, err := socksConnectRequest(host, uint16(port))
 	if err != nil {
-		return failProtocol("encode target", err)
+		return failSetup("encode target", err)
 	}
 	if _, err := conn.Write(req); err != nil {
-		return failProtocol("send connect", err)
+		return failHandshake("send connect", err)
 	}
 	head := make([]byte, 4)
 	if _, err := io.ReadFull(br, head); err != nil {
-		return failProtocol("read connect", err)
+		return failHandshake("read connect", err)
 	}
 	if head[0] != 0x05 || head[2] != 0x00 {
-		return failProtocol("read connect", fmt.Errorf("invalid SOCKS response"))
+		return failHandshake("read connect", fmt.Errorf("invalid SOCKS response"))
 	}
 	if head[1] != 0x00 {
-		return failProtocol("connect target", fmt.Errorf("SOCKS reply 0x%02x", head[1]))
+		return failHandshake("connect target", fmt.Errorf("SOCKS reply 0x%02x", head[1]))
 	}
 	if err := discardSocksBoundAddress(br, head[3]); err != nil {
-		return failProtocol("read bound address", err)
+		return failHandshake("read bound address", err)
 	}
 	conn.SetDeadline(time.Time{})
 	return withBufferedPrefix(conn, br), nil

@@ -215,9 +215,10 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 	log.Debug("request start", "method", r.Method, "target", target)
 
 	// Known-large bodies can stream immediately. Unknown-length bodies are
-	// buffered up to the cap so small bodies remain replayable after an endpoint
-	// dial or SOCKS authentication fallback. A buffered prefix of a larger
-	// unknown-length body is replayable only until SOCKS setup succeeds.
+	// buffered up to the cap so small bodies remain replayable after an
+	// endpoint dial, SOCKS handshake, or authentication fallback. A buffered
+	// prefix of a larger unknown-length body is replayable only until SOCKS
+	// setup succeeds.
 	var body []byte
 	streamMode := r.ContentLength > settings.maxBodyBuffer
 	directStream := streamMode
@@ -270,7 +271,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 			out.Trailer = r.Trailer
 		}
 		resp, err := s.roundTripWithSettings(r.Context(), p, out, settings)
-		if streamMode && !isProxyDialError(err) && !isProxyAuthError(err) {
+		if streamMode && !isProxyDialError(err) && !isProxyAuthError(err) && !isSocksHandshakeError(err) {
 			r.Body.Close()
 		}
 		if err != nil {
@@ -288,6 +289,14 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 				s.rotations.Add(1)
 				log.Warn("upstream dial failed", "target", target, "upstream", upstreamLogValue(p),
 					"attempt", attemptNumber, "error_kind", errorKindProxyConnect,
+					"error", logErrorValue(err), "cooldown", cooldown.String())
+				continue
+			case isSocksHandshakeError(err):
+				cooldown := gen.Pool.ReportFailure(p, err)
+				exclude[p] = true
+				s.rotations.Add(1)
+				log.Warn("upstream handshake failed", "target", target, "upstream", upstreamLogValue(p),
+					"attempt", attemptNumber, "error_kind", errorKindSocksConnect,
 					"error", logErrorValue(err), "cooldown", cooldown.String())
 				continue
 			case isProxyAuthError(err):
@@ -471,6 +480,14 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 				s.rotations.Add(1)
 				log.Warn("upstream dial failed", "target", logTarget, "upstream", upstreamLogValue(p),
 					"attempt", attempts, "error_kind", errorKindProxyConnect,
+					"error", logErrorValue(err), "cooldown", cooldown.String())
+				continue
+			case isSocksHandshakeError(err):
+				cooldown := gen.Pool.ReportFailure(p, err)
+				exclude[p] = true
+				s.rotations.Add(1)
+				log.Warn("upstream handshake failed", "target", logTarget, "upstream", upstreamLogValue(p),
+					"attempt", attempts, "error_kind", errorKindSocksConnect,
 					"error", logErrorValue(err), "cooldown", cooldown.String())
 				continue
 			case isProxyAuthError(err):

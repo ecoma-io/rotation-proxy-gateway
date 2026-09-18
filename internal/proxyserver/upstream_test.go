@@ -26,6 +26,13 @@ type socksOptions struct {
 	// greetingNoReply consumes the client greeting then closes without a
 	// reply, modeling a truncated greeting.
 	greetingNoReply bool
+	// authRaw, when non-nil, is written as the username/password status
+	// reply after consuming the client credentials. It enables malformed
+	// and truncated auth replies without sleeps.
+	authRaw []byte
+	// authNoReply consumes the client credentials then closes without a
+	// reply, modeling a truncated auth exchange.
+	authNoReply bool
 	// connectRaw, when non-nil, is written as the CONNECT reply after
 	// consuming the client CONNECT request, then the connection closes.
 	// It covers malformed, truncated, and unsupported-bound-type replies.
@@ -160,6 +167,18 @@ func readSocksGreeting(br *bufio.Reader, conn net.Conn, opts socksOptions) error
 				_, err := conn.Write([]byte{0x01, 0x01})
 				return err
 			}
+			if opts.authRaw != nil {
+				if _, err := conn.Write(opts.authRaw); err != nil {
+					return err
+				}
+				if len(opts.authRaw) < 2 {
+					return fmt.Errorf("truncated auth reply")
+				}
+				return nil
+			}
+			if opts.authNoReply {
+				return fmt.Errorf("no auth reply")
+			}
 			_, err = conn.Write([]byte{0x01, 0x00})
 			return err
 		}
@@ -270,12 +289,12 @@ func TestDialViaClassifiesEndpointAndAuthFailures(t *testing.T) {
 	}
 }
 
-func TestDialViaConnectReplyIsProtocolError(t *testing.T) {
+func TestDialViaConnectReplyIsHandshakeError(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
 	_, err := dialVia(context.Background(), fs.URL, "example.com:80", time.Second)
-	var protocolErr *SocksProtocolError
-	if !errors.As(err, &protocolErr) || isProxyDialError(err) || isProxyAuthError(err) {
-		t.Fatalf("connect reply error = %T %v", err, err)
+	handshakeErr := assertSocksHandshakeError(t, err, "connect target")
+	if !strings.Contains(handshakeErr.Error(), "SOCKS reply 0x05") {
+		t.Fatalf("handshake error = %q, want it to name the reply", handshakeErr.Error())
 	}
 }
 
@@ -288,43 +307,81 @@ func assertSocksProtocolError(t *testing.T, err error, op string) *SocksProtocol
 	if protocolErr.Op != op {
 		t.Fatalf("op = %q, want %q (err %v)", protocolErr.Op, op, err)
 	}
-	if isProxyDialError(err) || isProxyAuthError(err) {
-		t.Fatalf("protocol error misclassified as dial/auth: %T %v", err, err)
+	if isProxyDialError(err) || isProxyAuthError(err) || isSocksHandshakeError(err) {
+		t.Fatalf("protocol error misclassified as dial/auth/handshake: %T %v", err, err)
 	}
 	return protocolErr
 }
 
-func TestDialViaGreetingFailuresAreProtocolErrors(t *testing.T) {
+func assertSocksHandshakeError(t *testing.T, err error, op string) *SocksHandshakeError {
+	t.Helper()
+	var handshakeErr *SocksHandshakeError
+	if !errors.As(err, &handshakeErr) {
+		t.Fatalf("expected SocksHandshakeError, got %T %v", err, err)
+	}
+	if handshakeErr.Op != op {
+		t.Fatalf("op = %q, want %q (err %v)", handshakeErr.Op, op, err)
+	}
+	if isProxyDialError(err) || isProxyAuthError(err) {
+		t.Fatalf("handshake error misclassified as dial/auth: %T %v", err, err)
+	}
+	var protocolErr *SocksProtocolError
+	if errors.As(err, &protocolErr) {
+		t.Fatalf("handshake error must not be SocksProtocolError: %v", err)
+	}
+	return handshakeErr
+}
+
+func TestDialViaGreetingFailuresAreHandshakeErrors(t *testing.T) {
 	cases := map[string]socksOptions{
-		"wrong version":        {greetingRaw: []byte{0x04, 0x00}},
-		"unsupported method":   {greetingRaw: []byte{0x05, 0x07}},
-		"no acceptable method": {greetingRaw: []byte{0x05, 0xff}},
-		"truncated choice":     {greetingRaw: []byte{0x05}},
-		"truncated no reply":   {greetingNoReply: true},
+		"wrong version":      {greetingRaw: []byte{0x04, 0x00}},
+		"unsupported method": {greetingRaw: []byte{0x05, 0x07}},
+		"truncated choice":   {greetingRaw: []byte{0x05}},
+		"truncated no reply": {greetingNoReply: true},
 	}
 	for name, opts := range cases {
 		t.Run(name, func(t *testing.T) {
 			fs := startSocks5Proxy(t, opts)
 			_, err := dialVia(context.Background(), fs.URL, "example.com:80", time.Second)
-			switch name {
-			case "no acceptable method":
-				if !isProxyAuthError(err) || isProxyDialError(err) {
-					t.Fatalf("auth error classification = %T %v", err, err)
-				}
-				var protocolErr *SocksProtocolError
-				if errors.As(err, &protocolErr) {
-					t.Fatalf("auth error must not be SocksProtocolError: %v", err)
-				}
-			case "unsupported method":
-				assertSocksProtocolError(t, err, "negotiate authentication")
-			default:
-				assertSocksProtocolError(t, err, "read greeting")
+			op := "read greeting"
+			if name == "unsupported method" {
+				op = "negotiate authentication"
 			}
+			assertSocksHandshakeError(t, err, op)
 		})
 	}
 }
 
-func TestDialViaConnectFramingFailuresAreProtocolErrors(t *testing.T) {
+func TestDialViaNoAcceptableMethodIsAuthError(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{greetingRaw: []byte{0x05, 0xff}})
+	_, err := dialVia(context.Background(), fs.URL, "example.com:80", time.Second)
+	if !isProxyAuthError(err) || isProxyDialError(err) || isSocksHandshakeError(err) {
+		t.Fatalf("auth error classification = %T %v", err, err)
+	}
+	var protocolErr *SocksProtocolError
+	if errors.As(err, &protocolErr) {
+		t.Fatalf("auth error must not be SocksProtocolError: %v", err)
+	}
+}
+
+func TestDialViaAuthFramingFailuresAreHandshakeErrors(t *testing.T) {
+	cases := map[string]socksOptions{
+		"wrong auth version": {user: "u", pass: "p", authRaw: []byte{0x02, 0x00}},
+		"truncated auth":     {user: "u", pass: "p", authRaw: []byte{0x01}},
+		"no auth reply":      {user: "u", pass: "p", authNoReply: true},
+	}
+	for name, opts := range cases {
+		t.Run(name, func(t *testing.T) {
+			fs := startSocks5Proxy(t, opts)
+			pu := *fs.URL
+			pu.User = url.UserPassword("u", "p")
+			_, err := dialVia(context.Background(), &pu, "example.com:80", time.Second)
+			assertSocksHandshakeError(t, err, "read authentication")
+		})
+	}
+}
+
+func TestDialViaConnectFramingFailuresAreHandshakeErrors(t *testing.T) {
 	v4ok := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80}
 	cases := map[string]socksOptions{
 		"wrong version":          {connectRaw: []byte{0x04, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}},
@@ -347,9 +404,9 @@ func TestDialViaConnectFramingFailuresAreProtocolErrors(t *testing.T) {
 				}
 				conn.Close()
 			case "unsupported bound type", "truncated bound ipv4":
-				assertSocksProtocolError(t, err, "read bound address")
+				assertSocksHandshakeError(t, err, "read bound address")
 			default:
-				assertSocksProtocolError(t, err, "read connect")
+				assertSocksHandshakeError(t, err, "read connect")
 			}
 		})
 	}
@@ -412,7 +469,9 @@ func TestDialViaBufferedPrefixDelivered(t *testing.T) {
 	}
 }
 
-func TestPostDialFailuresReturnSingleSanitized502(t *testing.T) {
+// Connect-framing failures are handshake failures: with a single route the
+// request exhausts to the sanitized no-route 502 while recording dial health.
+func TestConnectFramingFailuresExhaustToNoRoute(t *testing.T) {
 	rawCases := []struct {
 		name string
 		raw  []byte
@@ -430,15 +489,12 @@ func TestPostDialFailuresReturnSingleSanitized502(t *testing.T) {
 			}
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			if resp.StatusCode != http.StatusBadGateway {
-				t.Fatalf("status=%d, want 502", resp.StatusCode)
-			}
-			if string(body) != "upstream SOCKS setup failed\n" {
-				t.Fatalf("502 body = %q, want generic sanitized message", body)
+			if resp.StatusCode != http.StatusBadGateway || string(body) != "no usable upstream SOCKS routes\n" {
+				t.Fatalf("status=%d body=%q, want sanitized no-route 502", resp.StatusCode, body)
 			}
 			snap := pl.Snapshot()[0]
-			if snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 || !snap.Available {
-				t.Fatalf("protocol failure changed route health: %+v", snap)
+			if snap.Successes != 0 || snap.AuthFailures != 0 || snap.Failures != 1 || snap.Available {
+				t.Fatalf("handshake failure did not record route health: %+v", snap)
 			}
 			if got := len(fs.hits); got != 1 {
 				t.Fatalf("SOCKS attempts = %d, want 1", got)

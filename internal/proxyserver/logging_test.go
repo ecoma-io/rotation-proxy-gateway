@@ -54,7 +54,9 @@ func TestLogErrorKind(t *testing.T) {
 	}{
 		{"dial", &ProxyDialError{Err: errors.New("refused")}, errorKindProxyConnect},
 		{"auth", &ProxyAuthError{Reason: "rejected"}, errorKindAuthRoute},
-		{"setup", &SocksProtocolError{Op: "connect target", Err: errors.New("refused")}, errorKindSetup},
+		{"handshake reply", &SocksHandshakeError{Op: "connect target", Err: errors.New("SOCKS reply 0x05")}, errorKindSocksConnect},
+		{"handshake framing", &SocksHandshakeError{Op: "read greeting", Err: errors.New("truncated")}, errorKindSocksConnect},
+		{"setup local", &SocksProtocolError{Op: "encode target", Err: errors.New("invalid hostname")}, errorKindSetup},
 		{"generic", errors.New("target TLS failed"), errorKindSetup},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

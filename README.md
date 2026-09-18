@@ -187,16 +187,23 @@ and counter state. Changing userinfo or kind creates a fresh route state.
   endpoint fails.
 - **`auth_route`**: a connected SOCKS endpoint cannot authenticate the
   configured route.
-- **`setup`**: every other error after the endpoint TCP dial succeeds, including
-  SOCKS framing/target replies, TLS, writes, reads, malformed responses,
-  cancellation, and established-tunnel failures.
+- **`socks_connect`**: the SOCKS handshake with a connected endpoint fails
+  before the target tunnel is established: greeting, method or authentication
+  framing, CONNECT framing or reply, and bound-address reads. No client bytes
+  have crossed the tunnel yet, so these are route failures, not request
+  failures.
+- **`setup`**: local request errors that behave the same on every route
+  (unsupported scheme, oversized configured credentials, invalid target) and
+  every error after the tunnel is established, including target TLS, writes,
+  reads, malformed responses, cancellation, and established-tunnel failures.
 - **`no_route`**: no eligible untried route remains.
 
 | Outcome | Pool handling | Request handling |
 |---|---|---|
 | SOCKS endpoint DNS/TCP dial fails | Record `proxy_connect`, exponential cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
 | SOCKS endpoint cannot authenticate | Auth-block the route; no dial cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
-| SOCKS setup/target error after TCP dial | No health mutation and no retry | Sanitized `502` |
+| SOCKS handshake fails before the tunnel is established | Record `socks_connect`, exponential cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
+| Local request error (scheme, credentials, invalid target) or any error after the tunnel is established | No health mutation and no retry | Sanitized `502` |
 | Target TLS, HTTP write/read, malformed response | No health mutation and no retry | `502` unless client cancelled |
 | Valid target HTTP response, including `407`, `408`, `429`, `5xx` | Record success; no rotation/cooldown | Forward once |
 | Client cancellation/disconnect | No health mutation and no retry | End operation |
@@ -219,11 +226,11 @@ request, and performs target TLS inside that tunnel for HTTPS. It removes
 hop-by-hop headers, including `Connection`-listed headers and
 `Proxy-Authorization`, in both directions.
 
-Bodies up to `global.max-body-buffer` are replayable after an endpoint dial or
-SOCKS authentication fallback. Known-larger bodies stream immediately;
-unknown-length bodies are probed up to the limit. Once streamed bytes have been
-consumed, the body cannot safely be retried. Declared request trailers retain
-chunked framing.
+Bodies up to `global.max-body-buffer` are replayable after an endpoint dial,
+SOCKS handshake, or authentication fallback. Known-larger bodies stream
+immediately; unknown-length bodies are probed up to the limit. Once streamed
+bytes have been consumed, the body cannot safely be retried. Declared request
+trailers retain chunked framing.
 
 For CONNECT, the service returns `200 Connection Established` only after the
 SOCKS target CONNECT succeeds, then relays bytes bidirectionally. Failures after
@@ -241,11 +248,14 @@ ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 `/status` keeps `version`, `uptime`, global `requests`, global `rotations`, and
 redacted `pool` state. It additionally reports safe per-listener counters and
 each route's `kind`. Route identities are always `host:port`, never userinfo.
+Each route's `failures` and `lastDialError` cover endpoint dial and SOCKS
+handshake failures.
 
 Each request has a process-local `request_id`. Logs additionally include
 `listener=mixed|v4|v6`, host-only `target` and `upstream`, retry attempts,
-error category, and cooldown only for endpoint dial errors. They never log full
-URLs, headers, bodies, userinfo, or the ignored manual API configuration.
+error category, and cooldown for endpoint dial and SOCKS handshake failures.
+They never log full URLs, headers, bodies, userinfo, or the ignored manual API
+configuration.
 
 ## Docker
 

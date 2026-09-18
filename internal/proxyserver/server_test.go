@@ -281,7 +281,7 @@ func TestTargetStatusesPassThroughWithoutRotation(t *testing.T) {
 	}
 }
 
-func TestRotatesOnlyOnEndpointDialFailure(t *testing.T) {
+func TestRotatesOnEndpointDialFailure(t *testing.T) {
 	closed, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -372,7 +372,28 @@ func TestAuthFailureFallsBackWithoutDialCooldown(t *testing.T) {
 	}
 }
 
-func TestSOCKSTargetFailureDoesNotRetryOrMutateHealth(t *testing.T) {
+func TestRotatesOnHandshakeFailure(t *testing.T) {
+	reject := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
+	good := startSocks5Proxy(t, socksOptions{})
+	target := startEchoTarget(t)
+	pl := pool.NewRoutes(mixedRoutes(reject.URL, good.URL), 30*time.Second, time.Minute)
+	ts := newForwarderCfg(t, pl, defaultRuntime())
+
+	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	snap := pl.Snapshot()
+	if snap[0].Failures != 1 || snap[0].Available || snap[1].Successes != 1 {
+		t.Fatalf("snapshot = %+v", snap)
+	}
+}
+
+func TestSOCKSHandshakeFailureExhaustsToNoRoute(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
 	ts, pl := newForwarder(t, fs)
 
@@ -380,13 +401,14 @@ func TestSOCKSTargetFailureDoesNotRetryOrMutateHealth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
+	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status=%d, want 502", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadGateway || string(body) != "no usable upstream SOCKS routes\n" {
+		t.Fatalf("status=%d body=%q, want sanitized no-route 502", resp.StatusCode, body)
 	}
 	snap := pl.Snapshot()[0]
-	if snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 || !snap.Available {
-		t.Fatalf("target failure changed route health: %+v", snap)
+	if snap.Successes != 0 || snap.AuthFailures != 0 || snap.Failures != 1 || snap.Available {
+		t.Fatalf("handshake failure did not record route health: %+v", snap)
 	}
 	if got := len(fs.hits); got != 1 {
 		t.Fatalf("SOCKS attempts = %d, want 1", got)
@@ -998,7 +1020,7 @@ func TestTunnelAuthFallbackLogsWithoutCooldown(t *testing.T) {
 	}
 }
 
-func TestTunnelTargetFailureDoesNotRetryOrMutateHealth(t *testing.T) {
+func TestTunnelHandshakeFailureExhaustsToNoRoute(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
 	ts, pl := newForwarder(t, fs)
 
@@ -1008,11 +1030,38 @@ func TestTunnelTargetFailureDoesNotRetryOrMutateHealth(t *testing.T) {
 		t.Fatalf("CONNECT status=%d, want 502", resp.StatusCode)
 	}
 	snap := pl.Snapshot()[0]
-	if snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 || !snap.Available {
-		t.Fatalf("target setup failure changed route health: %+v", snap)
+	if snap.Successes != 0 || snap.AuthFailures != 0 || snap.Failures != 1 || snap.Available {
+		t.Fatalf("handshake failure did not record route health: %+v", snap)
 	}
 	if got := len(fs.hits); got != 1 {
 		t.Fatalf("SOCKS attempts=%d, want 1", got)
+	}
+}
+
+func TestTunnelLogsCorrelateHandshakeFallback(t *testing.T) {
+	reject := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
+	good := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(reject.URL, good.URL), time.Second, time.Minute)
+	var logs safeLogBuffer
+	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+
+	conn, _, resp := connectThrough(t, ts.URL, startEchoTarget(t))
+	conn.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
+	}
+	output := waitForLog(t, &logs, "msg=tunnel")
+	for _, want := range []string{
+		"request_id=1",
+		"msg=\"upstream handshake failed\"",
+		"error_kind=socks_connect",
+		"cooldown=1s",
+		"msg=tunnel",
+		"attempts=2",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("logs missing %q:\n%s", want, output)
+		}
 	}
 }
 
