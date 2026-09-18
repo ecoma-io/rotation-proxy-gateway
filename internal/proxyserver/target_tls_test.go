@@ -55,6 +55,43 @@ func TestTargetTLSHandshakeFailureIsSetupNotHealthChange(t *testing.T) {
 	}
 }
 
+// Repeated absolute-form https requests through one Server reuse TLS sessions:
+// without a shared ClientSessionCache every request paid a full handshake
+// inside its freshly dialed tunnel. The target reports DidResume per request,
+// so the first request must complete a full handshake and the second must
+// resume from the cache. Insecure verification is used only to trust the
+// httptest certificate; session resumption is independent of verification.
+func TestTargetTLSSessionsResume(t *testing.T) {
+	var resumed []bool
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		resumed = append(resumed, r.TLS != nil && r.TLS.DidResume)
+	}))
+	t.Cleanup(srv.Close)
+
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
+	cfg := defaultRuntime()
+	cfg.TargetTLSInsecure = true
+	s := newRuntimeServer(pl, cfg, testLogger())
+
+	for range 2 {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, srv.URL+"/", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request status = %d, want 200", rec.Code)
+		}
+	}
+	if len(resumed) != 2 {
+		t.Fatalf("target saw %d requests, want 2", len(resumed))
+	}
+	if resumed[0] {
+		t.Fatal("first handshake resumed; expected a full handshake")
+	}
+	if !resumed[1] {
+		t.Fatal("second handshake did not resume; session cache not effective")
+	}
+}
+
 func newSelfSignedTLSTarget(t *testing.T) string {
 	t.Helper()
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {

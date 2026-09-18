@@ -59,6 +59,10 @@ type Server struct {
 	listener string
 	allow    func(*pool.Proxy) bool
 	dial     func(context.Context, *url.URL, string, time.Duration) (net.Conn, error)
+	// tlsCache lets repeated absolute-form https targets resume TLS sessions
+	// inside their per-request tunnels instead of paying a full handshake
+	// every time. The cache itself is safe for concurrent use.
+	tlsCache tls.ClientSessionCache
 
 	cmu   sync.Mutex
 	conns map[net.Conn]struct{}
@@ -101,6 +105,7 @@ func NewRuntime(store *pool.Store, log *slog.Logger, version, listener string, a
 		listener:  listener,
 		allow:     allow,
 		dial:      dialVia,
+		tlsCache:  tls.NewLRUClientSessionCache(0),
 		conns:     map[net.Conn]struct{}{},
 		startTime: time.Now(),
 	}
@@ -164,6 +169,7 @@ func (s *Server) roundTripViaSOCKSWithOptions(ctx context.Context, p *pool.Proxy
 		tlsConn := tls.Client(conn, &tls.Config{
 			ServerName:         host,
 			InsecureSkipVerify: targetTLSInsecure,
+			ClientSessionCache: s.tlsCache,
 		})
 		hsCtx, cancel := context.WithTimeout(ctx, dialTimeout)
 		err := tlsConn.HandshakeContext(hsCtx)
