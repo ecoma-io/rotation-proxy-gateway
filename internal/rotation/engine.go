@@ -127,7 +127,7 @@ func (e *Engine) bootPrecheck(ctx context.Context, gen *pool.Generation) {
 			return
 		}
 		p := gen.Pool.Lookup(routeID(spec.RouteSpec))
-		if p == nil || !gen.Pool.Contains(p) {
+		if p == nil || !e.store.Load().Pool.Contains(p) {
 			continue
 		}
 		first, ok := e.baselineProbe(ctx, gen, spec, gen.Config.Rotation.IPCheckTimeout)
@@ -210,8 +210,9 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	defer e.finishProcedure(id)
 
 	// gone reports that the procedure must stop: shutdown, or a reload
-	// removed or replaced this route.
-	gone := func() bool { return ctx.Err() != nil || !gen.Pool.Contains(p) }
+	// removed or replaced this route. It consults the store's current pool:
+	// the procedure's own generation always contains the route it admitted.
+	gone := func() bool { return ctx.Err() != nil || !e.store.Load().Pool.Contains(p) }
 	if p == nil || gone() {
 		return
 	}
@@ -329,7 +330,9 @@ func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.M
 		if verified && ip == baseline {
 			continue
 		}
-		if gen.Pool.LastIPs(p)[ip] {
+		// The collision set comes from the live pool so a reload that added
+		// or removed manual routes mid-procedure is reflected.
+		if e.store.Load().Pool.LastIPs(p)[ip] {
 			// The "new" IP is another manual route's current address; that
 			// defeats rotating either route. Keep waiting for a distinct one.
 			continue

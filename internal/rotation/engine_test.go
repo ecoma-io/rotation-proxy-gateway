@@ -597,6 +597,118 @@ func TestProcedureAbortsForRemovedRoute(t *testing.T) {
 	}
 }
 
+// TestProcedureAbortsMidFlightWhenReloadRemovesRoute parks a procedure inside
+// its drain, publishes a reload that removes the route, and releases the
+// drain. The abandoned procedure must stop at its next checkpoint: the
+// provider rotate API is never called and no outcome is recorded.
+func TestProcedureAbortsMidFlightWhenReloadRemovesRoute(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	api := newAPIServer(t)
+	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		ips.set("198.51.100.9") // a completed rotation would be observable
+		w.WriteHeader(http.StatusOK)
+	})
+	spec := manualRoute(t, "m1.test", time.Minute, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+
+	held := s.pl.PickFor(nil, nil) // park the procedure in the drain loop
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.e.runProcedure(context.Background(), s.gen, spec,
+			s.pl.Lookup(routeID(spec.RouteSpec)), routeID(spec.RouteSpec))
+	}()
+	waitRotationState(t, s.pl, "m1.test", "draining")
+
+	// A reload publishes a generation whose pool no longer contains the
+	// route. The procedure still holds the pre-reload generation, so its own
+	// removal check must consult the store's current pool.
+	empty := &config.RuntimeConfig{Rotation: fastSettings()}
+	s.e.store.Publish(empty)
+	held.Release()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("procedure kept running after the route was removed")
+	}
+	if calls := api.calls.Load(); calls != 0 {
+		t.Fatalf("removed route's procedure called the rotate API %d times", calls)
+	}
+	if got := s.e.Rotations(); got != 0 {
+		t.Fatalf("Rotations = %d, want 0 for an abandoned procedure", got)
+	}
+	st := snapshotHost(t, s.pl, "m1.test")
+	if st.Rotation.State != "idle" || st.Rotation.LastIP != "" {
+		t.Fatalf("abandoned procedure recorded an outcome: %+v", st.Rotation)
+	}
+}
+
+func waitRotationState(t *testing.T, pl *pool.Pool, host, state string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for snapshotHost(t, pl, host).Rotation.State != state {
+		if time.Now().After(deadline) {
+			t.Fatalf("route %q never reached rotation state %q", host, state)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestBootPrecheckRecordsBaselines drives the boot-time double probe: it must
+// learn each manual route's starting egress IP, keep the second observation
+// when the provider moves the IP between probes, and leave routes it could
+// not probe unverified.
+func TestBootPrecheckRecordsBaselines(t *testing.T) {
+	newOne := func(t *testing.T, ips *ipServer, routeFail *atomic.Bool) (*setup, config.ManualRouteSpec) {
+		spec := manualRoute(t, "m1.test", time.Minute, apiSpec(newAPIServer(t)))
+		cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+		return newSetup(t, cfg, routeFail, ips), spec
+	}
+
+	t.Run("sticky IP becomes the baseline", func(t *testing.T) {
+		s, _ := newOne(t, newIPServer(t, "203.0.113.7"), nil)
+		s.e.bootPrecheck(context.Background(), s.gen)
+		if st := snapshotHost(t, s.pl, "m1.test"); st.Rotation.LastIP != "203.0.113.7" {
+			t.Fatalf("baseline = %+v, want 203.0.113.7", st.Rotation)
+		}
+	})
+	t.Run("moved IP records the second probe", func(t *testing.T) {
+		ips := newIPServer(t, "203.0.113.7")
+		s, _ := newOne(t, ips, nil)
+		base := s.e.dial
+		var dials atomic.Int64
+		s.e.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+			if dials.Add(1) == 2 {
+				ips.set("198.51.100.9") // the provider moved it between probes
+			}
+			return base(ctx, pu, target, timeout)
+		}
+		s.e.bootPrecheck(context.Background(), s.gen)
+		if st := snapshotHost(t, s.pl, "m1.test"); st.Rotation.LastIP != "198.51.100.9" {
+			t.Fatalf("baseline = %+v, want the second observation 198.51.100.9", st.Rotation)
+		}
+	})
+	t.Run("failed probes leave the route unverified", func(t *testing.T) {
+		routeFail := new(atomic.Bool)
+		routeFail.Store(true)
+		s, _ := newOne(t, newIPServer(t, "203.0.113.7"), routeFail)
+		s.e.bootPrecheck(context.Background(), s.gen)
+		if st := snapshotHost(t, s.pl, "m1.test"); st.Rotation.LastIP != "" {
+			t.Fatalf("baseline = %+v, want none after failed probes", st.Rotation)
+		}
+	})
+	t.Run("route removed by a reload is skipped", func(t *testing.T) {
+		s, _ := newOne(t, newIPServer(t, "203.0.113.7"), nil)
+		s.e.store.Publish(&config.RuntimeConfig{Rotation: fastSettings()})
+		s.e.bootPrecheck(context.Background(), s.gen)
+		if st := snapshotHost(t, s.pl, "m1.test"); st.Rotation.LastIP != "" {
+			t.Fatalf("removed route learned a baseline: %+v", st.Rotation)
+		}
+	})
+}
+
 // TestSchedulerAppliesConcurrencyCap runs the real loop with two routes and a
 // unique-IP endpoint so both procedures succeed; the rotate API must never
 // observe more than the cap procedures at once.
@@ -657,5 +769,62 @@ func TestSchedulerAppliesConcurrencyCap(t *testing.T) {
 				t.Fatalf("max concurrent API calls = %d, want <= %d", got, tc.wantAtOnce)
 			}
 		})
+	}
+}
+
+// TestRunCancelAbandonsActiveProcedure parks a procedure inside the rotate
+// API call and cancels the engine context: Run must return promptly and the
+// route must be returned to serving without a recorded outcome.
+func TestRunCancelAbandonsActiveProcedure(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	api := newAPIServer(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	handlerDone := make(chan struct{})
+	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		close(handlerDone)
+		w.WriteHeader(http.StatusOK)
+	})
+	settings := fastSettings()
+	settings.RotateOnStart = true
+	spec := manualRoute(t, "m1.test", time.Hour, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: settings, ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.e.Run(ctx)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("procedure never reached the rotate API call")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+
+	if got := s.e.Rotations(); got != 0 {
+		t.Fatalf("Rotations = %d, want 0 for an abandoned procedure", got)
+	}
+	waitRotationState(t, s.pl, "m1.test", "idle")
+	st := snapshotHost(t, s.pl, "m1.test")
+	if st.Rotation.LastIP != "" {
+		t.Fatalf("canceled procedure recorded an outcome: %+v", st.Rotation)
+	}
+
+	close(release) // let the parked handler goroutine exit
+	select {
+	case <-handlerDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("rotate API handler never finished")
 	}
 }
