@@ -4,8 +4,11 @@ package pool
 
 import (
 	"net/url"
+	"strings"
 	"sync"
 	"time"
+
+	"proxy-auto-rotate-forwarder/internal/sanitize"
 )
 
 // Proxy is one upstream SOCKS route plus its health state.
@@ -175,7 +178,7 @@ func (pl *Pool) ReportFailure(p *Proxy, err error) time.Duration {
 	}
 	p.cooldownUntil = now.Add(cd)
 	if err != nil {
-		p.lastDialError = err.Error()
+		p.lastDialError = sanitize.ErrorString(err)
 	}
 	return cd
 }
@@ -188,8 +191,30 @@ func (pl *Pool) ReportAuthBlocked(p *Proxy, err error) {
 	p.authFailures++
 	p.authBlocked = true
 	if err != nil {
-		p.lastAuthError = err.Error()
+		p.lastAuthError = sanitizeAuthError(err)
 	}
+}
+
+// sanitizeAuthError stores only the fixed safe labels produced by the SOCKS
+// handshake for auth failures known to this package. Any other error text
+// (including wrapped dial details or future auth reasons) is replaced with a
+// fixed label so /status never exposes raw arbitrary errors.
+func sanitizeAuthError(err error) string {
+	msg := sanitize.ErrorString(err)
+	switch {
+	case containsToken(msg, "endpoint requires credentials but none are configured"):
+		return "endpoint requires credentials but none are configured"
+	case containsToken(msg, "endpoint accepted no offered authentication method"):
+		return "endpoint accepted no offered authentication method"
+	case containsToken(msg, "endpoint rejected credentials"):
+		return "endpoint rejected credentials"
+	default:
+		return "SOCKS authentication failed"
+	}
+}
+
+func containsToken(haystack, needle string) bool {
+	return len(haystack) >= len(needle) && strings.Contains(haystack, needle)
 }
 
 // Reload replaces the pool contents, preserving health state for URLs that

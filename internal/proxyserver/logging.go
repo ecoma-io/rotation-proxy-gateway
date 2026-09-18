@@ -6,9 +6,9 @@ import (
 	"net/url"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"proxy-auto-rotate-forwarder/internal/pool"
+	"proxy-auto-rotate-forwarder/internal/sanitize"
 )
 
 const maxLogErrorLength = 512
@@ -79,9 +79,10 @@ func logErrorKind(err error) string {
 	}
 }
 
-// logErrorValue returns bounded diagnostic context. It redacts URL userinfo so
-// an error wrapped by a future dependency cannot accidentally disclose route
-// credentials. Request headers and bodies never reach this function.
+// logErrorValue returns bounded diagnostic context via the shared sanitizer.
+// Auth reasons are sanitized (never raw): a future dependency or caller must
+// not be able to disclose route credentials through the reason string.
+// Request headers and bodies never reach this function.
 func logErrorValue(err error) string {
 	if err == nil {
 		return ""
@@ -89,48 +90,36 @@ func logErrorValue(err error) string {
 
 	var authErr *ProxyAuthError
 	if errors.As(err, &authErr) {
-		return cleanLogValue(authErr.Reason)
+		return sanitize.Sanitize(authErrorSafeText(authErr))
 	}
-	return cleanLogValue(redactURLUserinfo(err.Error()))
+	return sanitize.ErrorString(err)
 }
 
+// authErrorSafeText maps internal SOCKS auth reasons to fixed safe strings.
+// The three reasons below are the only ProxyAuthError values constructed by
+// dialSocks5; anything else (e.g. a future wrapped error carrying secrets)
+// falls back to a fixed label so raw text is never logged.
+func authErrorSafeText(err *ProxyAuthError) string {
+	switch err.Reason {
+	case "endpoint requires credentials but none are configured":
+		return "endpoint requires credentials but none are configured"
+	case "endpoint rejected credentials":
+		return "endpoint rejected credentials"
+	case "endpoint accepted no offered authentication method":
+		return "endpoint accepted no offered authentication method"
+	default:
+		return "SOCKS authentication failed"
+	}
+}
+
+// cleanLogValue keeps the historical host-only log helper on the shared
+// sanitizer. maxLogErrorLength is retained for the existing test bound.
 func cleanLogValue(value string) string {
-	value = strings.Map(func(r rune) rune {
-		switch r {
-		case '\n', '\r', '\t':
-			return ' '
-		default:
-			return r
-		}
-	}, value)
-	if utf8.RuneCountInString(value) <= maxLogErrorLength {
-		return value
-	}
-	return string([]rune(value)[:maxLogErrorLength]) + "…"
+	return sanitize.Sanitize(value)
 }
 
-// redactURLUserinfo removes the userinfo portion from URLs embedded in error
-// text. It operates on diagnostic text only; route identifiers always come
-// from URL.Host before this point.
+// redactURLUserinfo is retained as a thin wrapper over the shared sanitizer
+// so any external callers keep working.
 func redactURLUserinfo(value string) string {
-	for searchFrom := 0; ; {
-		schemeAt := strings.Index(value[searchFrom:], "://")
-		if schemeAt < 0 {
-			return value
-		}
-		schemeAt += searchFrom
-		userinfoStart := schemeAt + len("://")
-		remainder := value[userinfoStart:]
-		at := strings.IndexByte(remainder, '@')
-		if at < 0 {
-			return value
-		}
-		at += userinfoStart
-		if delimiter := strings.IndexAny(value[userinfoStart:at], "/?#\\\"'"); delimiter >= 0 {
-			searchFrom = at + 1
-			continue
-		}
-		value = value[:userinfoStart] + "[redacted]@" + value[at+1:]
-		searchFrom = userinfoStart + len("[redacted]@")
-	}
+	return sanitize.Sanitize(value)
 }
