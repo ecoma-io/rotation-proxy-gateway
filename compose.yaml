@@ -36,7 +36,7 @@ services:
       # Larger bodies stream once and cannot be retried after consumption.
       MAX_BODY_BUFFER: "67108864"
       # Application log threshold: debug, info, warn, or error.
-      LOG_LEVEL: info
+      LOG_LEVEL: debug
     volumes:
       - ./proxies.txt:/app/proxies.txt:ro
     healthcheck:
