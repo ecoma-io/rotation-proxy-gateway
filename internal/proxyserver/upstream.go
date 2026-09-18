@@ -77,6 +77,9 @@ func dialTCP(ctx context.Context, addr string, timeout time.Duration) (net.Conn,
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, &ProxyDialError{Err: err}
 	}
 	return conn, nil

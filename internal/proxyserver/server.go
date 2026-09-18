@@ -39,7 +39,7 @@ var hopByHopHeaders = map[string]bool{
 // stripHopByHop removes hop-by-hop headers, including any named by the
 // Connection header itself.
 func stripHopByHop(h http.Header) {
-	if tokens := h.Get("Connection"); tokens != "" {
+	for _, tokens := range h.Values("Connection") {
 		for _, tok := range strings.Split(tokens, ",") {
 			h.Del(strings.TrimSpace(tok))
 		}
@@ -57,6 +57,7 @@ type Server struct {
 	cfg     *config.Config
 	log     *slog.Logger
 	version string
+	dial    func(context.Context, *url.URL, string, time.Duration) (net.Conn, error)
 
 	cmu   sync.Mutex
 	conns map[net.Conn]struct{}
@@ -73,6 +74,7 @@ func New(pl *pool.Pool, cfg *config.Config, log *slog.Logger, version string) *S
 		cfg:       cfg,
 		log:       log,
 		version:   version,
+		dial:      dialVia,
 		conns:     map[net.Conn]struct{}{},
 		startTime: time.Now(),
 	}
@@ -112,6 +114,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 	if err != nil {
 		r.Body.Close()
 		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		log.Warn("request rejected", "target", target, "error_kind", "body_read", "error", logErrorValue(err))
 		return
 	}
 	if int64(len(b)) > s.cfg.MaxBodyBuffer {
@@ -128,6 +131,9 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 	for attempt := 0; attempt < s.cfg.MaxRetries; attempt++ {
 		attemptNumber := attempt + 1
 		if r.Context().Err() != nil {
+			if streamMode {
+				r.Body.Close()
+			}
 			log.Debug("request canceled", "target", target, "attempts", attempt)
 			return
 		}
@@ -146,6 +152,13 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 			r.Body.Close()
 		}
 		if err != nil {
+			if r.Context().Err() != nil {
+				if streamMode {
+					r.Body.Close()
+				}
+				log.Debug("request canceled", "target", target, "attempts", attemptNumber)
+				return
+			}
 			switch {
 			case isProxyDialError(err):
 				cooldown := s.pool.ReportFailure(p, err)
@@ -178,6 +191,11 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 
 		if streamMode {
 			r.Body.Close()
+		}
+		if r.Context().Err() != nil {
+			resp.Body.Close()
+			log.Debug("request canceled", "target", target, "attempts", attemptNumber)
+			return
 		}
 		s.pool.ReportSuccess(p)
 		s.writeResponse(w, resp)
@@ -217,7 +235,7 @@ func (s *Server) roundTripViaSOCKS(ctx context.Context, p *pool.Proxy, out *http
 	if err != nil {
 		return nil, err
 	}
-	conn, err := dialVia(ctx, p.URL, target, s.cfg.ConnectTimeout)
+	conn, err := s.dial(ctx, p.URL, target, s.cfg.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -342,8 +360,13 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 		if p == nil {
 			break
 		}
-		up, err := dialVia(r.Context(), p.URL, target, s.cfg.ConnectTimeout)
+		up, err := s.dial(r.Context(), p.URL, target, s.cfg.ConnectTimeout)
 		if err != nil {
+			if r.Context().Err() != nil {
+				log.Debug("tunnel canceled", "target", logTarget, "attempts", attempts)
+				clientConn.Close()
+				return
+			}
 			switch {
 			case isProxyDialError(err):
 				cooldown := s.pool.ReportFailure(p, err)
@@ -414,8 +437,12 @@ func (s *Server) untrackConn(c net.Conn) {
 // not track hijacked connections, so shutdown calls this after its grace period.
 func (s *Server) CloseTunnels() {
 	s.cmu.Lock()
-	defer s.cmu.Unlock()
+	conns := make([]net.Conn, 0, len(s.conns))
 	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.cmu.Unlock()
+	for _, c := range conns {
 		c.Close()
 	}
 }
