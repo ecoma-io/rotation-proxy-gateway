@@ -136,7 +136,16 @@ func (e *Engine) callRotateAPI(ctx context.Context, api config.RotateAPI) (time.
 		req.Header.Set(name, value)
 	}
 
-	client := &http.Client{Timeout: api.Timeout}
+	client := &http.Client{
+		Timeout: api.Timeout,
+		// Never follow redirects: a 3xx would replay the rotate API's
+		// headers (and body on 307/308) to whatever host it names. The
+		// first response is final, so a redirect fails the call like any
+		// other non-2xx status.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		// url.Error embeds the full URL, which may carry credentials in its

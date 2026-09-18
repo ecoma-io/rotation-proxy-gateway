@@ -332,6 +332,25 @@ func TestCallRotateAPIClassifiesResponses(t *testing.T) {
 			t.Fatalf("error leaked the API URL or token: %v", err)
 		}
 	})
+	t.Run("redirects are never followed", func(t *testing.T) {
+		a, api := setup(t)
+		var targetHits atomic.Int64
+		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			targetHits.Add(1)
+		}))
+		defer target.Close()
+		a.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Location", target.URL)
+			w.WriteHeader(http.StatusFound)
+		})
+		_, err := New(nil, discardLogger()).callRotateAPI(context.Background(), api)
+		if err == nil || !strings.Contains(err.Error(), "status 302") {
+			t.Fatalf("err = %v, want status 302", err)
+		}
+		if targetHits.Load() != 0 {
+			t.Fatalf("redirect target was contacted %d times", targetHits.Load())
+		}
+	})
 }
 
 func TestProbeIPParsesTrace(t *testing.T) {
