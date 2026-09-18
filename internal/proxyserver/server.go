@@ -231,11 +231,14 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 	// buffered up to the cap so small bodies remain replayable after an
 	// endpoint dial, SOCKS handshake, or authentication fallback. A buffered
 	// prefix of a larger unknown-length body is replayable only until SOCKS
-	// setup succeeds.
+	// setup succeeds. Certain-bodyless requests (declared length zero, no
+	// chunked framing — the ordinary GET/HEAD/DELETE shape) skip the probe:
+	// nothing to read and nothing to replay.
 	var body []byte
 	streamMode := r.ContentLength > settings.maxBodyBuffer
 	directStream := streamMode
-	if !streamMode {
+	certainlyBodiless := r.ContentLength == 0 && len(r.TransferEncoding) == 0
+	if !streamMode && !certainlyBodiless {
 		b, err := io.ReadAll(io.LimitReader(r.Body, settings.maxBodyBuffer+1))
 		if err != nil {
 			r.Body.Close()
