@@ -65,19 +65,19 @@ type Server struct {
 
 	startTime time.Time
 	requests  atomic.Uint64
-	rotations atomic.Uint64
+	failovers atomic.Uint64
 }
 
 // ListenerStatus is the safe operational view for one inbound proxy listener.
 type ListenerStatus struct {
 	Requests  uint64 `json:"requests"`
-	Rotations uint64 `json:"rotations"`
+	Failovers uint64 `json:"failovers"`
 }
 
 func (s *Server) ListenerStatus() ListenerStatus {
 	return ListenerStatus{
 		Requests:  s.requests.Load(),
-		Rotations: s.rotations.Load(),
+		Failovers: s.failovers.Load(),
 	}
 }
 
@@ -290,7 +290,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 			case isProxyDialError(err):
 				cooldown := gen.Pool.ReportFailure(p, err)
 				exclude[p] = true
-				s.rotations.Add(1)
+				s.failovers.Add(1)
 				log.Warn("upstream dial failed", "target", target, "upstream", upstreamLogValue(p),
 					"attempt", attemptNumber, "error_kind", errorKindProxyConnect,
 					"error", logErrorValue(err), "cooldown", cooldown.String())
@@ -298,7 +298,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 			case isSocksHandshakeError(err):
 				cooldown := gen.Pool.ReportFailure(p, err)
 				exclude[p] = true
-				s.rotations.Add(1)
+				s.failovers.Add(1)
 				log.Warn("upstream handshake failed", "target", target, "upstream", upstreamLogValue(p),
 					"attempt", attemptNumber, "error_kind", errorKindSocksConnect,
 					"error", logErrorValue(err), "cooldown", cooldown.String())
@@ -306,7 +306,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 			case isProxyAuthError(err):
 				gen.Pool.ReportAuthBlocked(p, err)
 				exclude[p] = true
-				s.rotations.Add(1)
+				s.failovers.Add(1)
 				log.Warn("upstream auth failed", "target", target, "upstream", upstreamLogValue(p),
 					"attempt", attemptNumber, "error_kind", errorKindAuthRoute,
 					"error", logErrorValue(err))
@@ -503,7 +503,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 			case isProxyDialError(err):
 				cooldown := gen.Pool.ReportFailure(p, err)
 				exclude[p] = true
-				s.rotations.Add(1)
+				s.failovers.Add(1)
 				log.Warn("upstream dial failed", "target", logTarget, "upstream", upstreamLogValue(p),
 					"attempt", attempts, "error_kind", errorKindProxyConnect,
 					"error", logErrorValue(err), "cooldown", cooldown.String())
@@ -511,7 +511,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 			case isSocksHandshakeError(err):
 				cooldown := gen.Pool.ReportFailure(p, err)
 				exclude[p] = true
-				s.rotations.Add(1)
+				s.failovers.Add(1)
 				log.Warn("upstream handshake failed", "target", logTarget, "upstream", upstreamLogValue(p),
 					"attempt", attempts, "error_kind", errorKindSocksConnect,
 					"error", logErrorValue(err), "cooldown", cooldown.String())
@@ -519,7 +519,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 			case isProxyAuthError(err):
 				gen.Pool.ReportAuthBlocked(p, err)
 				exclude[p] = true
-				s.rotations.Add(1)
+				s.failovers.Add(1)
 				log.Warn("upstream auth failed", "target", logTarget, "upstream", upstreamLogValue(p),
 					"attempt", attempts, "error_kind", errorKindAuthRoute,
 					"error", logErrorValue(err))
@@ -655,14 +655,17 @@ func (s *Server) CloseTunnels() {
 
 // AdminMux serves the health and status endpoints for the admin listener.
 func (s *Server) AdminMux() *http.ServeMux {
-	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s})
+	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s}, nil)
 }
 
 // AdminMux serves aggregate health/status for all proxy listener views sharing
 // a runtime generation store. Existing status fields remain global totals;
-// listeners adds safe per-listener counters. The pool snapshot comes from the
-// current generation so /status changes atomically with serving behavior.
-func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server) *http.ServeMux {
+// listeners adds safe per-listener counters. rotations reports completed
+// manual-route IP rotations from the rotation engine (nil omits the field);
+// failovers counts in-band route fallbacks and stays a listener metric. The
+// pool snapshot comes from the current generation so /status changes
+// atomically with serving behavior.
+func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -671,21 +674,25 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		perListener := make(map[string]ListenerStatus, len(listeners))
-		var requests, rotations uint64
+		var requests, failovers uint64
 		for name, listener := range listeners {
 			status := listener.ListenerStatus()
 			perListener[name] = status
 			requests += status.Requests
-			rotations += status.Rotations
+			failovers += status.Failovers
 		}
-		json.NewEncoder(w).Encode(map[string]any{
+		status := map[string]any{
 			"version":   version,
 			"uptime":    time.Since(started).Truncate(time.Second).String(),
 			"requests":  requests,
-			"rotations": rotations,
+			"failovers": failovers,
 			"listeners": perListener,
 			"pool":      store.Load().Pool.Snapshot(),
-		})
+		}
+		if rotations != nil {
+			status["rotations"] = rotations()
+		}
+		json.NewEncoder(w).Encode(status)
 	})
 	return mux
 }

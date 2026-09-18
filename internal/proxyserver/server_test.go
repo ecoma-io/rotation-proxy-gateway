@@ -814,8 +814,8 @@ func TestCanceledStreamedRequestDoesNotMutatePoolOrRetry(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d, want unwritten recorder", rec.Code)
 	}
-	if s.rotations.Load() != 0 {
-		t.Fatalf("rotations=%d, want 0", s.rotations.Load())
+	if s.failovers.Load() != 0 {
+		t.Fatalf("failovers=%d, want 0", s.failovers.Load())
 	}
 	for _, snap := range pl.Snapshot() {
 		if snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 || !snap.Available {
@@ -880,8 +880,8 @@ func TestCanceledTunnelDoesNotMutatePoolOrSend502(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("canceled tunnel handler did not return")
 	}
-	if s.rotations.Load() != 0 {
-		t.Fatalf("rotations=%d, want 0", s.rotations.Load())
+	if s.failovers.Load() != 0 {
+		t.Fatalf("failovers=%d, want 0", s.failovers.Load())
 	}
 	for _, snap := range pl.Snapshot() {
 		if snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 || !snap.Available {

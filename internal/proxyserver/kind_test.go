@@ -172,7 +172,7 @@ func TestListenerLogsItsNameAndAdminAggregatesStatus(t *testing.T) {
 		t.Fatal("listener log missing")
 	}
 
-	admin := httptest.NewServer(AdminMux("test", time.Now(), runtime, map[string]*Server{"v4": srv}))
+	admin := httptest.NewServer(AdminMux("test", time.Now(), runtime, map[string]*Server{"v4": srv}, nil))
 	defer admin.Close()
 	status, err := http.Get(admin.URL + "/status")
 	if err != nil {

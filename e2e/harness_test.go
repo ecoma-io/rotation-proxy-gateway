@@ -89,10 +89,11 @@ type PoolEntry struct {
 type Status struct {
 	Version   string `json:"version"`
 	Requests  uint64 `json:"requests"`
+	Failovers uint64 `json:"failovers"`
 	Rotations uint64 `json:"rotations"`
 	Listeners map[string]struct {
 		Requests  uint64 `json:"requests"`
-		Rotations uint64 `json:"rotations"`
+		Failovers uint64 `json:"failovers"`
 	} `json:"listeners"`
 	Pool []PoolEntry `json:"pool"`
 }

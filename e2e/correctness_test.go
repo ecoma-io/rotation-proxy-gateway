@@ -285,8 +285,8 @@ func TestE2E_DialFailureFallsBackWithCooldown(t *testing.T) {
 	st := g.WaitForCondition(5*time.Second, "dial fallback recorded", func(st *Status) bool {
 		return len(st.Pool) == 2 && st.Pool[0].Failures == 1 && st.Pool[1].Successes == 1
 	})
-	if st.Rotations < 1 {
-		t.Fatalf("rotations=%d, want >=1", st.Rotations)
+	if st.Failovers < 1 {
+		t.Fatalf("failovers=%d, want >=1", st.Failovers)
 	}
 	if st.Pool[0].CooldownFor == "0s" {
 		t.Fatalf("dead route should cool down: %+v", st.Pool[0])

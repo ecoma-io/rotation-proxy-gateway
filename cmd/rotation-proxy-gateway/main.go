@@ -151,7 +151,7 @@ func run() error {
 	started := time.Now()
 	adminSrv := &http.Server{
 		Addr:              bootstrap.AdminAddr,
-		Handler:           proxyserver.AdminMux(version, started, store, listenerViews),
+		Handler:           proxyserver.AdminMux(version, started, store, listenerViews, engine.Rotations),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}

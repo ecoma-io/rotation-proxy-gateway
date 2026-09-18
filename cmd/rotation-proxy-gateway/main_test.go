@@ -275,7 +275,7 @@ func TestShutdownAllClosesProxyListenersThenAdmin(t *testing.T) {
 
 	lnA, httpA := serveTestListener(t, srvA)
 	lnB, httpB := serveTestListener(t, srvB)
-	lnAdmin, adminSrv := serveTestListener(t, proxyserver.AdminMux("test", time.Now(), store, map[string]*proxyserver.Server{"mixed": srvA}))
+	lnAdmin, adminSrv := serveTestListener(t, proxyserver.AdminMux("test", time.Now(), store, map[string]*proxyserver.Server{"mixed": srvA}, nil))
 
 	listeners := []runningListener{
 		{name: "mixed", server: srvA, http: httpA},
