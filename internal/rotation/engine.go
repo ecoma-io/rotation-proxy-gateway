@@ -223,7 +223,8 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	log.Debug("rotation procedure started", "phase", "draining")
 
 	// 1. Drain in-flight work, bounded by rotation.drain-timeout. Expiry
-	// force-rotates and breaks live tunnels.
+	// abandons the wait and rotates anyway: in-flight work keeps running
+	// on its existing tunnels, none are broken.
 	drainDeadline := e.Now().Add(settings.DrainTimeout)
 	for p.InFlight() > 0 {
 		if !e.Now().Before(drainDeadline) {
