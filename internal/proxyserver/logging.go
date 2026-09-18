@@ -120,9 +120,3 @@ func authErrorSafeText(err *ProxyAuthError) string {
 func cleanLogValue(value string) string {
 	return sanitize.Sanitize(value)
 }
-
-// redactURLUserinfo is retained as a thin wrapper over the shared sanitizer
-// so any external callers keep working.
-func redactURLUserinfo(value string) string {
-	return sanitize.Sanitize(value)
-}
