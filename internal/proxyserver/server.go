@@ -173,7 +173,14 @@ func (s *Server) roundTripViaSOCKSWithOptions(ctx context.Context, p *pool.Proxy
 		}
 		conn = tlsConn
 	}
-	if err := out.Write(conn); err != nil {
+	// Buffer the request write: http.Request.Write emits the start line,
+	// headers, and body in many small writes, which would otherwise each
+	// become a syscall and a small TCP segment on the tunnel.
+	bw := bufio.NewWriterSize(conn, 4<<10)
+	if err := out.Write(bw); err != nil {
+		return fail(fmt.Errorf("write target request: %w", err))
+	}
+	if err := bw.Flush(); err != nil {
 		return fail(fmt.Errorf("write target request: %w", err))
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(conn), out)
