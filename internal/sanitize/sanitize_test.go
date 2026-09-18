@@ -47,6 +47,31 @@ func TestNeutralizesANSIAndControls(t *testing.T) {
 	}
 }
 
+// Every ANSI escape form stripANSI understands must vanish, including the
+// truncated and lone-ESC tails an attacker can craft.
+func TestStripsAllANSIForms(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"CSI with params", "a\x1b[31;1mb", "ab"},
+		{"OSC terminated by BEL", "a\x1b]0;title\x07b", "ab"},
+		{"OSC terminated by ST", "a\x1b]8;;http://x\x1b\\b", "ab"},
+		{"two-byte designator", "a\x1b(Bb", "ab"},
+		{"single-char sequence", "a\x1bMb", "ab"},
+		{"lone ESC at end", "trailing\x1b", "trailing"},
+		{"unterminated CSI", "unterminated\x1b[31", "unterminated"},
+		{"unterminated OSC", "unterminated\x1b]0;title", "unterminated"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Sanitize(tc.in); got != tc.want {
+				t.Fatalf("Sanitize(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBoundsOutput(t *testing.T) {
 	in := strings.Repeat("z", MaxLength+100)
 	got := Sanitize(in)
