@@ -1,7 +1,8 @@
 # Runtime configuration for rotation-proxy-gateway.
-# The process watches this file and also accepts SIGHUP for a validated reload.
-# Copy it to config.yaml, replace the example routes, then start the service.
-# config.yaml is intentionally ignored because it normally contains credentials.
+# The process watches this file's directory (Viper/fsnotify) and hot-reloads
+# validated changes. Copy it to config.yaml, replace the example routes, then
+# start the service. config.yaml is intentionally ignored because it normally
+# contains credentials.
 #
 # `kind` is the public egress IP family guaranteed by the proxy provider. It
 # does not describe the SOCKS endpoint address family or restrict targets. A
@@ -45,4 +46,17 @@ proxies:
 
   # Reserved for phase 2 API-driven rotation. It is accepted but ignored in
   # phase 1: no route is added and no API request is performed.
-  manual: []
+  manual: 
+    - proxy: socks5://username:password@v6-provider.example:1080
+      kind: v6     
+      interval: 90 
+      api:        
+        url: http://provider.example/api/rotate-ip
+        method: POST
+        hearers:
+          - Content-Type: application/json
+        body: |
+          {
+            "proxy_id": 1,
+            "token": "xxxx"
+          }

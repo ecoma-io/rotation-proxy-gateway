@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -194,13 +193,12 @@ func run() error {
 	_ = watcher
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	var reloadMu sync.Mutex
+	// The watcher goroutine delivers debounced events to this loop, so reloads
+	// are already serialized; the source label only records how it was reached.
 	reload := func(source string) {
-		reloadMu.Lock()
-		defer reloadMu.Unlock()
 		next, err := config.LoadRuntime(bootstrap.ConfigFile, bootstrap)
 		if err != nil {
 			log.Warn("reload failed; keeping previous configuration", "source", source, "error", sanitize.ErrorString(err))
@@ -221,10 +219,6 @@ func run() error {
 			shutdownAll(listeners, adminSrv)
 			return err
 		case sig := <-sigCh:
-			if sig == syscall.SIGHUP {
-				reload("sighup")
-				continue
-			}
 			log.Info("shutting down", "signal", sig.String())
 			shutdownAll(listeners, adminSrv)
 			return nil

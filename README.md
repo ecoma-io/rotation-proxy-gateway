@@ -33,7 +33,7 @@ remains live but returns the ordinary no-route `502` until that family is added.
 ## Quick start
 
 ```bash
-cp config.example.yaml config.yaml # add real static SOCKS routes
+cp config.example.yaml config/config.yaml # add real static SOCKS routes
 MIXED_LISTEN_ADDR=:30121 \
 V4_LISTEN_ADDR=:30122 \
 V6_LISTEN_ADDR=:30123 \
@@ -44,7 +44,7 @@ curl -x http://127.0.0.1:30121 https://example.com/
 curl http://127.0.0.1:30120/status
 ```
 
-`config.yaml` normally contains upstream credentials and is ignored by Git and
+`config/config.yaml` normally contains upstream credentials and is ignored by Git and
 Docker build contexts. Do not commit it or bake it into an image.
 
 ## Configuration
@@ -118,13 +118,21 @@ by logs or status. API-driven rotation is a future phase.
 
 ### Reload behavior
 
-Viper watches the runtime YAML file. The process also retains `SIGHUP` as a
-manual and bind-mount-safe reload trigger:
+Viper watches the directory containing the runtime YAML file, so both in-place
+edits and atomic replacements (editor save, `mv`, symlink swap) are detected and
+applied after a short debounce.
 
-```bash
-kill -HUP "$(pgrep -f rotation-proxy-gateway)"
-# Docker:
-docker kill -s HUP rpgw
+In Docker, mount the config's **directory**, not the single file: a single-file
+bind mount pins the file's inode, so replacing the file on the host is invisible
+inside the container and no reload can observe it. With a directory bind mount,
+host-side updates reach the watcher and hot-reload works.
+
+```yaml
+# compose.yaml
+volumes:
+  - ./config:/app/config:ro
+environment:
+  CONFIG_FILE: /app/config/config.yaml
 ```
 
 Each reload parses and validates a complete new configuration before changing
@@ -133,6 +141,30 @@ runtime setting logs a sanitized warning and retains the last-known-good config
 and pool. Validated configuration and its reconfigured pool snapshot publish as
 one atomic generation: every request and CONNECT operation loads that generation
 once, while in-flight operations finish on their original snapshot.
+
+#### Measured watcher behavior (Docker bind mounts)
+
+Verified against Viper 1.21 + fsnotify with the production binary in an Alpine
+container (2026-09): Viper watches the config file's **directory**, so any
+create/rename inside that directory is observed. The results that shaped the
+mount guidance:
+
+| Host update | Directory bind mount | Single-file bind mount |
+|---|---|---|
+| Atomic rename-over (editor save, `mv`) | reload fires | invisible (mount pins the old inode) |
+| In-place write (`echo > file`) | reload fires | no inotify event reaches the container |
+
+The single-file in-place case fails because inotify parent-directory event
+propagation follows the directory hierarchy of the *writing* side (the host
+path), not the container's mountpoint. There is no signal-based workaround:
+a reload triggered by signal re-reads the same pinned inode, and after a
+rename-over the pinned inode is the old file. Directory mounting is the only
+configuration that makes hot reload fully reliable, so the process deliberately
+has no manual reload fallback.
+
+One startup nuance: the watcher installs after the listeners start. An update
+landing in that window is not seen as an event, but the next watch event (or a
+restart, which reads the file at boot) converges the state.
 
 The following settings apply to new client operations without restart:
 
@@ -218,8 +250,8 @@ URLs, headers, bodies, userinfo, or the ignored manual API configuration.
 ## Docker
 
 ```bash
-cp config.example.yaml config.yaml
-# edit config.yaml with real routes
+cp config.example.yaml config/config.yaml
+# edit config/config.yaml with real routes
 docker compose up -d --build
 curl http://127.0.0.1:30120/status
 ```

@@ -54,9 +54,13 @@ addresses and must not overlap (including wildcard binds on the same port).
 
 Runtime settings and active static routes live only in `config.yaml`:
 `log-level`, `max-retries`, `cooldown`, `dial-timeout`, global TLS/body
-settings, and `proxies.auto`. Viper watches that file; `SIGHUP` is a manual
-fallback. A failed parse/validation leaves the last-known-good pool and runtime
-settings serving. `proxies.manual` is accepted but opaque and ignored until the
+settings, and `proxies.auto`. Viper watches the containing directory, so
+in-place edits and atomic replacements both reload. A failed parse/validation
+leaves the last-known-good pool and runtime settings serving. Do not add a
+manual reload fallback (for example SIGHUP): it cannot see through the only
+broken deployment case, a single-file bind mount, and directory mounting makes
+the watcher fully reliable — see README "Measured watcher behavior".
+`proxies.manual` is accepted but opaque and ignored until the
 future API-rotation phase. Per-route `target-tls-insecure` and
 `max-body-buffer` are not allowed: both are global settings.
 
@@ -110,15 +114,16 @@ ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 ```bash
 docker build -t rpgw:dev --build-arg VERSION=0.1.0-dev .
 docker run --rm rpgw:dev version
-# Copy config.example.yaml to config.yaml and add routes first.
+# Copy config.example.yaml to config/config.yaml and add routes first.
 docker compose up -d --build
 curl http://127.0.0.1:30120/status
 ```
 
 `compose.yaml` publishes host 30120/30121/30122/30123 for the admin/mixed/v4/v6
-listeners on all host interfaces. It mounts `config.yaml` read-only, defaults to
-bounded `json-file` logs, and uses the binary `healthcheck` subcommand (no shell
-in the scratch image).
+listeners on all host interfaces. It mounts the `config/` directory read-only
+(single-file bind mounts break watcher-based hot reload; see README "Measured
+watcher behavior"), defaults to bounded `json-file` logs, and uses the binary
+`healthcheck` subcommand (no shell in the scratch image).
 
 ## Layout
 
@@ -126,3 +131,6 @@ in the scratch image).
 - `internal/pool` — LRU filtering, cooldown/auth state, immutable generation snapshots
 - `internal/proxyserver` — SOCKS5 dialing plus inbound HTTP/CONNECT forwarding
 - `cmd/rotation-proxy-gateway` — lifecycle, signals, watcher, admin endpoints
+- `e2e` — black-box tests and benchmarks driving the real binary as a
+  subprocess with SOCKS5/HTTP simulators; `go test ./e2e/` (skip with
+  `-short`), baselines in `e2e/BENCH.md`

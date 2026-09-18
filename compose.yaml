@@ -1,7 +1,9 @@
 # Homelab deployment for rotation-proxy-gateway.
-# config.yaml is a root-level, Git-ignored credential-bearing runtime file.
-# Copy config.example.yaml first; it is mounted read-only and never baked into
-# the image or committed.
+# config/config.yaml is the Git-ignored credential-bearing runtime file.
+# Copy config.example.yaml into config/ first. The config directory is mounted
+# read-only instead of the single file: a single-file bind mount pins the
+# inode, so replacing the file on the host would be invisible to the watcher
+# and hot reload would never fire.
 services:
   rpgw:
     build:
@@ -16,14 +18,14 @@ services:
       - "30120:30120" # admin: healthz and status
     environment:
       # Bootstrap-only settings: changes require a container restart.
-      CONFIG_FILE: /app/config.yaml
+      CONFIG_FILE: /app/config/config.yaml
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+      - ./config:/app/config:ro
     healthcheck:
       test: ["CMD", "/app/rotation-proxy-gateway", "healthcheck"]
       interval: 30s
