@@ -19,6 +19,7 @@ import (
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/proxyserver"
+	"rotation-proxy-gateway/internal/rotation"
 	"rotation-proxy-gateway/internal/sanitize"
 )
 
@@ -120,6 +121,7 @@ func run() error {
 	// pool snapshot and swaps the whole generation atomically. The pool serves
 	// both origins; manual routes additionally carry rotation state.
 	store := pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.AllRoutes(), runtimeCfg.CooldownBase, runtimeCfg.CooldownMax))
+	engine := rotation.New(store, log)
 
 	listeners := make([]runningListener, 0, 3)
 	listenerViews := make(map[string]*proxyserver.Server, 3)
@@ -176,6 +178,13 @@ func run() error {
 	defer cancelPoll()
 	go poller.Run(pollCtx, log)
 
+	// The rotation engine owns manual-route egress IP rotation. Its context is
+	// canceled before the listeners drain so in-flight rotations stop promptly
+	// and never extend shutdown beyond the shared grace budget.
+	engineCtx, engineCancel := context.WithCancel(context.Background())
+	defer engineCancel()
+	go engine.Run(engineCtx)
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
@@ -200,11 +209,11 @@ func run() error {
 	for {
 		select {
 		case err := <-errCh:
-			shutdownAll(listeners, adminSrv, bootstrap.ShutdownGrace)
+			shutdownAll(engineCancel, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return err
 		case sig := <-sigCh:
 			log.Info("shutting down", "signal", sig.String(), "grace", bootstrap.ShutdownGrace.String())
-			shutdownAll(listeners, adminSrv, bootstrap.ShutdownGrace)
+			shutdownAll(engineCancel, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return nil
 		case <-poller.Changes():
 			// The poller hash-gates on applied content, so one signal means one
@@ -214,13 +223,15 @@ func run() error {
 	}
 }
 
-// shutdownAll drains every enabled proxy listener and the admin listener
-// against one shared grace budget, then force-closes hijacked CONNECT tunnels
-// that http.Server.Shutdown does not track. Shutdown returns as soon as a
-// server drains, so an idle process exits immediately; once the budget
-// expires, later Shutdown calls still stop their listeners and close their
-// idle connections but no longer wait for active requests.
-func shutdownAll(listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
+// shutdownAll stops the rotation engine first, then drains every enabled
+// proxy listener and the admin listener against one shared grace budget, then
+// force-closes hijacked CONNECT tunnels that http.Server.Shutdown does not
+// track. Shutdown returns as soon as a server drains, so an idle process
+// exits immediately; once the budget expires, later Shutdown calls still stop
+// their listeners and close their idle connections but no longer wait for
+// active requests.
+func shutdownAll(engineCancel context.CancelFunc, listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
+	engineCancel()
 	ctx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
 	for _, listener := range listeners {

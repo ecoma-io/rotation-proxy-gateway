@@ -112,3 +112,42 @@ func (pl *Pool) LastIPs(exclude *Proxy) map[string]bool {
 	}
 	return out
 }
+
+// SetBaselineIP records an observed egress IP before any rotation has run —
+// the boot precheck uses it so cross-route collision checks and the status
+// view have a starting point. Unlike EndRotation it records no rotation time.
+func (p *Proxy) SetBaselineIP(ip string) {
+	p.mu.Lock()
+	p.lastIP = ip
+	p.mu.Unlock()
+}
+
+// Contains reports whether p is part of this pool's route list. The rotation
+// engine re-checks between procedure steps: a reload that removed or replaced
+// the route makes the procedure's proxy stale, and the procedure must abort.
+func (pl *Pool) Contains(p *Proxy) bool {
+	if p == nil {
+		return false
+	}
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	for _, e := range pl.entries {
+		if e == p {
+			return true
+		}
+	}
+	return false
+}
+
+// Lookup returns the route with the given canonical route ID, or nil. The
+// engine maps config route specs onto pool entries with it.
+func (pl *Pool) Lookup(id string) *Proxy {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	for _, e := range pl.entries {
+		if config.CanonicalRouteID(e.URL)+"|"+string(e.Kind) == id {
+			return e
+		}
+	}
+	return nil
+}

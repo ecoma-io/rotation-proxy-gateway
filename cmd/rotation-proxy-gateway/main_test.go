@@ -284,7 +284,7 @@ func TestShutdownAllClosesProxyListenersThenAdmin(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		shutdownAll(listeners, adminSrv, 5*time.Second)
+		shutdownAll(func() {}, listeners, adminSrv, 5*time.Second)
 		close(done)
 	}()
 	select {
@@ -360,7 +360,7 @@ func TestShutdownAllSharedBudget(t *testing.T) {
 
 	const grace = 500 * time.Millisecond
 	start := time.Now()
-	shutdownAll(listeners, adminSrv, grace)
+	shutdownAll(func() {}, listeners, adminSrv, grace)
 	elapsed := time.Since(start)
 	if elapsed < grace-100*time.Millisecond {
 		t.Fatalf("shutdownAll returned after %s, want at least the %s budget (it must bound the drain)", elapsed, grace)
