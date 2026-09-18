@@ -4,7 +4,9 @@
 # config.yaml is intentionally ignored because it normally contains credentials.
 #
 # `kind` is the public egress IP family guaranteed by the proxy provider. It
-# does not describe the SOCKS endpoint address family or restrict targets.
+# does not describe the SOCKS endpoint address family or restrict targets. A
+# v4-only or v6-only route list is valid; the other dedicated listener returns
+# the ordinary no-route 502 until matching routes are added.
 
 # Application log threshold: debug, info, warn, or error.
 log-level: info

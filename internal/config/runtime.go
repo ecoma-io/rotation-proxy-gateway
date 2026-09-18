@@ -381,27 +381,14 @@ func (c *RuntimeConfig) validate() error {
 	return errors.Join(errs...)
 }
 
+// validateRouteEligibility retains the mixed-listener invariant. Dedicated
+// listeners intentionally may have no matching route: they remain available and
+// return the standard no-route 502 without crossing into the other kind.
 func validateRouteEligibility(routes []RouteSpec, bootstrap *BootstrapConfig) error {
-	var v4, v6 int
-	for _, route := range routes {
-		switch route.Kind {
-		case EgressV4:
-			v4++
-		case EgressV6:
-			v6++
-		}
+	if bootstrap.MixedListenAddr != "" && len(routes) == 0 {
+		return errors.New("mixed listener requires at least one route")
 	}
-	var errs []error
-	if bootstrap.MixedListenAddr != "" && v4+v6 == 0 {
-		errs = append(errs, errors.New("mixed listener requires at least one route"))
-	}
-	if bootstrap.V4ListenAddr != "" && v4 == 0 {
-		errs = append(errs, errors.New("v4 listener requires at least one v4 route"))
-	}
-	if bootstrap.V6ListenAddr != "" && v6 == 0 {
-		errs = append(errs, errors.New("v6 listener requires at least one v6 route"))
-	}
-	return errors.Join(errs...)
+	return nil
 }
 
 // WatchRuntime configures a Viper watcher for path. The callback must return

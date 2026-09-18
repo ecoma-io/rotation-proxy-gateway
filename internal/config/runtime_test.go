@@ -128,13 +128,45 @@ func TestLoadRuntimeRejectsDuplicateRegardlessOfKind(t *testing.T) {
 	}
 }
 
-func TestLoadRuntimeRequiresEnabledKind(t *testing.T) {
+func TestLoadRuntimeAcceptsSingleFamilyRoutes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		remove string
+	}{
+		{
+			name:   "v4 only",
+			remove: "    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6\n",
+		},
+		{
+			name:   "v6 only",
+			remove: "    - proxy: socks5://alice:secret@v4.example:1080\n      kind: v4\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := strings.Replace(validRuntimeConfig, tc.remove, "", 1)
+			cfg, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+			if err != nil {
+				t.Fatalf("LoadRuntime() error = %v", err)
+			}
+			if len(cfg.Routes) != 1 {
+				t.Fatalf("routes = %+v", cfg.Routes)
+			}
+		})
+	}
+}
+
+func TestLoadRuntimeRejectsEmptyAutoRoutes(t *testing.T) {
 	content := strings.Replace(validRuntimeConfig,
-		"    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6\n", "", 1)
+		"    - proxy: socks5://alice:secret@v4.example:1080\n      kind: v4\n    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6\n", "", 1)
 	_, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
-	if err == nil || !strings.Contains(err.Error(), "v6 listener requires") {
+	if err == nil || !strings.Contains(err.Error(), "proxies.auto must contain at least one route") {
 		t.Fatalf("error = %v", err)
 	}
+}
+
+func TestLoadRuntimeAllowsMissingKindWhenListenerDisabled(t *testing.T) {
+	content := strings.Replace(validRuntimeConfig,
+		"    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6\n", "", 1)
 	bootstrap := runtimeBootstrap(t)
 	bootstrap.V6ListenAddr = ""
 	if _, err := LoadRuntime(writeRuntimeConfig(t, content), bootstrap); err != nil {

@@ -21,12 +21,14 @@ The process starts one private admin listener and up to three proxy listeners:
 
 `kind` is the public egress IP family supplied by a proxy provider. It is not
 the SOCKS endpoint address family and it does not impose an IPv4/IPv6 policy on
-the client’s target destination.
+the client's target destination.
 
 A single shared pool owns health state. Therefore, a dial cooldown or SOCKS
 authentication block observed through the v4 listener is also observed by the
 mixed listener when it considers that route. A listener never falls through to
-a route of another kind.
+a route of another kind. A v4-only or v6-only route pool is valid: mixed selects
+the available family, and the enabled dedicated listener without matching routes
+remains live but returns the ordinary no-route `502` until that family is added.
 
 ## Quick start
 
@@ -47,7 +49,7 @@ Docker build contexts. Do not commit it or bake it into an image.
 
 ## Configuration
 
-### Bootstrap settings — environment, restart required
+### Bootstrap settings -- environment, restart required
 
 These values create sockets or choose the watched file and are read only when
 the process starts. Empty proxy listener addresses disable their listener, but
@@ -61,12 +63,12 @@ at least one proxy listener must remain enabled.
 | `V4_LISTEN_ADDR` | `:30122` | v4-egress-only listener |
 | `V6_LISTEN_ADDR` | `:30123` | v6-egress-only listener |
 
-All enabled addresses must be valid, use a numeric port, and not overlap —
+All enabled addresses must be valid, use a numeric port, and not overlap --
 including wildcard binds on the same port. Docker Healthcheck uses only
 `ADMIN_ADDR`; a bad runtime reload cannot make an otherwise-running service
 unhealthy.
 
-### Runtime YAML — validated and hot-reloaded
+### Runtime YAML -- validated and hot-reloaded
 
 See [`config.example.yaml`](config.example.yaml). The file is the complete
 source for runtime behavior and static routes:
@@ -203,7 +205,7 @@ ADMIN_ADDR=127.0.0.1:30120 ./bin/paf healthcheck
 
 `/status` keeps `version`, `uptime`, global `requests`, global `rotations`, and
 redacted `pool` state. It additionally reports safe per-listener counters and
-each route’s `kind`. Route identities are always `host:port`, never userinfo.
+each route's `kind`. Route identities are always `host:port`, never userinfo.
 
 Each request has a process-local `request_id`. Logs additionally include
 `listener=mixed|v4|v6`, host-only `target` and `upstream`, retry attempts,
@@ -228,7 +230,7 @@ files.
 ## Migration from `proxies.txt`
 
 For each old line, create one `proxies.auto` item and choose `kind` from your
-provider’s documented public egress family. There is no safe automatic family
+provider's documented public egress family. There is no safe automatic family
 detection from the SOCKS hostname/IP. `proxies.txt` is no longer loaded.
 
 ## Build and verification

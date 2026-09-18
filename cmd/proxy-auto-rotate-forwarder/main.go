@@ -93,6 +93,24 @@ type runningListener struct {
 	http   *http.Server
 }
 
+func warnUnavailableKindListeners(log *slog.Logger, cfg *config.RuntimeConfig, bootstrap *config.BootstrapConfig) {
+	var v4, v6 int
+	for _, route := range cfg.Routes {
+		switch route.Kind {
+		case config.EgressV4:
+			v4++
+		case config.EgressV6:
+			v6++
+		}
+	}
+	if bootstrap.V4ListenAddr != "" && v4 == 0 {
+		log.Warn("listener has no eligible routes; returning 502", "listener", "v4")
+	}
+	if bootstrap.V6ListenAddr != "" && v6 == 0 {
+		log.Warn("listener has no eligible routes; returning 502", "listener", "v6")
+	}
+}
+
 func run() error {
 	bootstrap, err := config.LoadBootstrap()
 	if err != nil {
@@ -104,6 +122,7 @@ func run() error {
 	}
 
 	log, level := setupDynamicLogger(runtimeCfg.LogLevel)
+	warnUnavailableKindListeners(log, runtimeCfg, bootstrap)
 	store := config.NewStore(runtimeCfg)
 	pl := pool.NewRoutes(runtimeCfg.Routes, runtimeCfg.CooldownBase, runtimeCfg.CooldownMax)
 
@@ -190,6 +209,7 @@ func run() error {
 		pl.SetCooldowns(next.CooldownBase, next.CooldownMax)
 		store.Store(next)
 		level.Set(parseSlogLevel(next.LogLevel))
+		warnUnavailableKindListeners(log, next, bootstrap)
 		log.Info("configuration reloaded", "source", source, "upstreams", len(next.Routes))
 	}
 

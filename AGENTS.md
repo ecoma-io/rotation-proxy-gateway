@@ -79,7 +79,9 @@ Read [`README.md`](README.md) before changing failure classification.
 - Valid target responses, including `407`, `408`, `429`, and `5xx`, are
   forwarded once. A target `407` is ordinary data, not SOCKS authentication.
 - The kind filter applies to ordinary LRU selection and all-cooling fallback;
-  v4/v6 listeners must never leak into the other kind.
+  v4/v6 listeners must never leak into the other kind. A pool containing only
+  one family is valid: mixed uses it, while a dedicated listener without a
+  matching route remains live and returns the ordinary no-route `502`.
 - Hop-by-hop headers and `Proxy-Authorization` are removed in both directions.
   Declared request trailers retain chunked framing. Userinfo must never appear
   in logs, `/status`, errors, or responses.
