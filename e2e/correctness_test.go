@@ -383,8 +383,8 @@ func TestE2E_HandshakeFailureFallsBackWithCooldown(t *testing.T) {
 	st := g.WaitForCondition(5*time.Second, "handshake fallback recorded", func(st *Status) bool {
 		return len(st.Pool) == 2 && st.Pool[0].Failures == 1 && st.Pool[1].Successes == 1
 	})
-	if st.Rotations < 1 {
-		t.Fatalf("rotations=%d, want >=1", st.Rotations)
+	if st.Failovers < 1 {
+		t.Fatalf("failovers=%d, want >=1", st.Failovers)
 	}
 	if st.Pool[0].CooldownFor == "0s" {
 		t.Fatalf("rejecting route should cool down: %+v", st.Pool[0])
@@ -546,50 +546,76 @@ func TestE2E_NoCredentialLeak(t *testing.T) {
 	}
 }
 
-// The manual section is accepted but ignored: its contents never reach the
-// pool, /status, or logs, and no API request is made on its behalf.
-func TestE2E_ManualSectionIgnoredAndNeverExposed(t *testing.T) {
+// Manual routes serve traffic like auto routes, but their credentials,
+// rotate-API URL, headers, and body never reach /status or logs. The route's
+// public egress IP is the only rotation detail /status exposes.
+func TestE2E_ManualRouteServesWithoutExposingSecrets(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
-	socks := NewSocksSim(t, SocksOK, "", "")
+	const proxySecret, apiToken, apiHeader = "e2e-manual-secret", "e2e-api-token", "e2e-api-header"
+	socks := NewSocksSim(t, SocksOK, "manual-user", proxySecret)
 	target := NewEchoTarget(t)
-	cfg := defaultGatewayConfig([]RouteConfig{{Proxy: socks.RouteValue(), Kind: "v4"}})
-	cfg.Manual = `    - proxy: 'socks5://manual-user:e2e-manual-secret@manual.example:1080'
-      kind: v6
-      interval: 90
-      api:
-        url: http://provider.example/api/rotate-ip
-        method: POST
-        headers:
-          - Content-Type: application/json
-        body: |
-          {"proxy_id": 1, "token": "e2e-manual-secret"}`
-	g := NewGateway(t, cfg)
+	trace := NewTraceSim(t, "203.0.113.1")
+	api := NewRotateAPISim(t)
+	cfg := defaultGatewayConfig(nil)
+	cfg.Manual = []ManualRouteConfig{{
+		Proxy:          "socks5://manual-user:" + proxySecret + "@" + socks.Addr,
+		Kind:           "v4",
+		RotateInterval: "1h", // no rotation fires during the test
+		API: ManualAPIConfig{
+			URL:     api.URL,
+			Method:  "POST",
+			Timeout: "2s",
+			Headers: map[string]string{"Content-Type": "application/json", "X-Api-Token": apiHeader},
+			Body:    `{"proxy_id": 1, "token": "` + apiToken + `"}`,
+		},
+	}}
+	cfg.Rotation = &RotationConfig{
+		MaxConcurrent:   "1",
+		DrainTimeout:    "2s",
+		IPCheckURL:      trace.URL,
+		IPCheckTimeout:  "3s",
+		IPCheckInterval: "100ms",
+	}
+	g := NewGatewayWithEnv(t, cfg, "SSL_CERT_FILE="+trace.CAFile)
 
+	// The pool's only route is the manual one, so a successful request
+	// proves manual routes serve.
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
 	waitForLog(t, g, "msg=request", 5*time.Second)
+	// Wait out the boot baseline precheck so its logging is complete before
+	// the leak assertions below.
+	waitRotation(t, g, socks, "recorded its boot baseline", func(v *RotationView) bool {
+		return v != nil && v.LastIP == "203.0.113.1"
+	}, 10*time.Second)
 
-	resp, err := http.Get("http://" + g.AdminAddr + "/status")
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	for _, secret := range []string{"e2e-manual-secret", "manual.example", "rotate-ip"} {
-		if strings.Contains(string(raw), secret) {
-			t.Fatalf("/status exposed manual section entry %q: %s", secret, raw)
-		}
-		if strings.Contains(g.Logs(), secret) {
-			t.Fatalf("logs exposed manual section entry %q:\n%s", secret, g.Logs())
-		}
+	if api.Hits.Load() != 0 {
+		t.Fatalf("rotate API called outside a rotation: %d hits", api.Hits.Load())
 	}
 	st, err := g.Status()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(st.Pool) != 1 || st.Pool[0].Proxy != socks.Addr || st.Pool[0].Kind != "v4" {
-		t.Fatalf("manual section leaked into the pool: %+v", st.Pool)
+		t.Fatalf("manual route exposed its endpoint address: %+v", st.Pool)
+	}
+	if st.Pool[0].Origin != "manual" || st.Pool[0].Rotation == nil {
+		t.Fatalf("manual route not reported as manual rotation state: %+v", st.Pool[0])
+	}
+	resp, err := http.Get("http://" + g.AdminAddr + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	for _, secret := range []string{proxySecret, "manual-user", apiToken, apiHeader, "api/rotate"} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatalf("/status exposed manual route secret %q: %s", secret, raw)
+		}
+		if strings.Contains(g.Logs(), secret) {
+			t.Fatalf("logs exposed manual route secret %q:\n%s", secret, g.Logs())
+		}
 	}
 }
 

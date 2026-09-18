@@ -44,6 +44,34 @@ type RouteConfig struct {
 	Kind  string
 }
 
+// ManualRouteConfig is one API-driven rotation route in the generated config.
+type ManualRouteConfig struct {
+	Proxy          string
+	Kind           string
+	RotateInterval string
+	API            ManualAPIConfig
+}
+
+// ManualAPIConfig is the provider rotate endpoint of one manual route.
+type ManualAPIConfig struct {
+	URL     string
+	Method  string
+	Headers map[string]string
+	Body    string
+	Timeout string
+}
+
+// RotationConfig is the global rotation block; nil in GatewayConfig omits it.
+type RotationConfig struct {
+	MaxConcurrent   string // raw: fixed count or "NN%"
+	DrainTimeout    string
+	RotateOnStart   bool
+	IPCheckURL      string
+	IPCheckTimeout  string
+	IPCheckInterval string
+	RetryBackoffMax string
+}
+
 // GatewayConfig is the full runtime YAML written for one gateway instance.
 type GatewayConfig struct {
 	LogLevel      string
@@ -54,9 +82,8 @@ type GatewayConfig struct {
 	TLSInsecure   bool
 	MaxBodyBuffer int64
 	Routes        []RouteConfig
-	// Manual is raw YAML rendered verbatim under proxies.manual (items
-	// indented four spaces). Empty renders the phase-1 default [].
-	Manual string
+	Manual        []ManualRouteConfig
+	Rotation      *RotationConfig
 }
 
 func defaultGatewayConfig(routes []RouteConfig) GatewayConfig {
@@ -74,15 +101,27 @@ func defaultGatewayConfig(routes []RouteConfig) GatewayConfig {
 
 // PoolEntry is the redacted per-route view from /status.
 type PoolEntry struct {
-	Proxy               string `json:"proxy"`
-	Kind                string `json:"kind"`
-	Available           bool   `json:"available"`
-	ConsecutiveFailures int    `json:"consecutiveFailures"`
-	CooldownFor         string `json:"cooldownFor"`
-	Successes           uint64 `json:"successes"`
-	Failures            uint64 `json:"failures"`
-	AuthFailures        uint64 `json:"authFailures"`
-	AuthBlocked         bool   `json:"authBlocked"`
+	Proxy               string        `json:"proxy"`
+	Kind                string        `json:"kind"`
+	Origin              string        `json:"origin"`
+	Available           bool          `json:"available"`
+	InFlight            int           `json:"inFlight"`
+	ConsecutiveFailures int           `json:"consecutiveFailures"`
+	CooldownFor         string        `json:"cooldownFor"`
+	Successes           uint64        `json:"successes"`
+	Failures            uint64        `json:"failures"`
+	AuthFailures        uint64        `json:"authFailures"`
+	AuthBlocked         bool          `json:"authBlocked"`
+	Rotation            *RotationView `json:"rotation,omitempty"`
+}
+
+// RotationView is the manual-route rotation state in one pool entry.
+type RotationView struct {
+	State             string `json:"state"`
+	LastIP            string `json:"lastIP"`
+	LastRotationAt    string `json:"lastRotationAt"`
+	NextRetryIn       string `json:"nextRetryIn"`
+	ConsecutiveSameIP int    `json:"consecutiveSameIP"`
 }
 
 // Status is the decoded /status body.
@@ -112,15 +151,31 @@ type Gateway struct {
 	V6Addr    string
 }
 
+// handedOut records every loopback address freeAddr returned in this process.
+// The OS can hand back a just-closed ephemeral port immediately, which would
+// collide two listeners of one gateway (or of parallel gateways); the registry
+// makes every allocation unique for the test run.
+var (
+	handedOutMu sync.Mutex
+	handedOut   = map[string]bool{}
+)
+
 func freeAddr(t testing.TB) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	handedOutMu.Lock()
+	defer handedOutMu.Unlock()
+	for {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		ln.Close()
+		if !handedOut[addr] {
+			handedOut[addr] = true
+			return addr
+		}
 	}
-	addr := ln.Addr().String()
-	ln.Close()
-	return addr
 }
 
 func yamlQuote(s string) string {
@@ -133,15 +188,52 @@ func renderConfig(cfg GatewayConfig) string {
 	fmt.Fprintf(&sb, "max-retries: %d\n", cfg.MaxRetries)
 	fmt.Fprintf(&sb, "cooldown:\n  base: %s\n  max: %s\n", cfg.CooldownBase, cfg.CooldownMax)
 	fmt.Fprintf(&sb, "dial-timeout: %s\n", cfg.DialTimeout)
+	if cfg.Rotation != nil {
+		fmt.Fprintf(&sb, "rotation:\n  max-concurrent: %s\n", cfg.Rotation.MaxConcurrent)
+		fmt.Fprintf(&sb, "  drain-timeout: %s\n", cfg.Rotation.DrainTimeout)
+		fmt.Fprintf(&sb, "  rotate-on-start: %v\n", cfg.Rotation.RotateOnStart)
+		if cfg.Rotation.IPCheckURL != "" {
+			fmt.Fprintf(&sb, "  ip-check-url: %s\n", cfg.Rotation.IPCheckURL)
+		}
+		if cfg.Rotation.IPCheckTimeout != "" {
+			fmt.Fprintf(&sb, "  ip-check-timeout: %s\n", cfg.Rotation.IPCheckTimeout)
+		}
+		if cfg.Rotation.IPCheckInterval != "" {
+			fmt.Fprintf(&sb, "  ip-check-interval: %s\n", cfg.Rotation.IPCheckInterval)
+		}
+		if cfg.Rotation.RetryBackoffMax != "" {
+			fmt.Fprintf(&sb, "  retry-backoff-max: %s\n", cfg.Rotation.RetryBackoffMax)
+		}
+	}
 	fmt.Fprintf(&sb, "global:\n  target-tls-insecure: %v\n  max-body-buffer: %d\n", cfg.TLSInsecure, cfg.MaxBodyBuffer)
 	sb.WriteString("proxies:\n  auto:\n")
 	for _, r := range cfg.Routes {
 		fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n", yamlQuote(r.Proxy), r.Kind)
 	}
-	if cfg.Manual == "" {
+	if len(cfg.Manual) == 0 {
 		sb.WriteString("  manual: []\n")
-	} else {
-		fmt.Fprintf(&sb, "  manual:\n%s\n", cfg.Manual)
+		return sb.String()
+	}
+	sb.WriteString("  manual:\n")
+	for _, m := range cfg.Manual {
+		fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n      rotate-interval: %s\n",
+			yamlQuote(m.Proxy), m.Kind, m.RotateInterval)
+		fmt.Fprintf(&sb, "      api:\n        url: %s\n", m.API.URL)
+		if m.API.Method != "" {
+			fmt.Fprintf(&sb, "        method: %s\n", m.API.Method)
+		}
+		if m.API.Timeout != "" {
+			fmt.Fprintf(&sb, "        timeout: %s\n", m.API.Timeout)
+		}
+		if len(m.API.Headers) > 0 {
+			sb.WriteString("        headers:\n")
+			for k, v := range m.API.Headers {
+				fmt.Fprintf(&sb, "          %s: %s\n", k, yamlQuote(v))
+			}
+		}
+		if m.API.Body != "" {
+			fmt.Fprintf(&sb, "        body: %s\n", yamlQuote(m.API.Body))
+		}
 	}
 	return sb.String()
 }

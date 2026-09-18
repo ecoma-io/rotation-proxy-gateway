@@ -31,6 +31,12 @@ type SocksSim struct {
 	User string
 	Pass string
 	Mode SocksMode
+	// Outbound, when set to a 127.x.x.x address, binds the tunnel's dial to
+	// it so upstreams observe a per-route source (loopback /8 needs no setup).
+	Outbound string
+	// Down, when true, closes accepted connections immediately, modeling an
+	// endpoint whose TCP socket answers but the SOCKS service is gone.
+	Down atomic.Bool
 
 	Hits atomic.Uint64
 	Addr string
@@ -68,6 +74,9 @@ func (s *SocksSim) RouteValue() string {
 func (s *SocksSim) handle(conn net.Conn) {
 	defer conn.Close()
 	s.Hits.Add(1)
+	if s.Down.Load() {
+		return
+	}
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	br := bufio.NewReader(conn)
 
@@ -163,7 +172,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 		_, _ = conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
-	up, err := net.DialTimeout("tcp", target, 5*time.Second)
+	up, err := s.dialOutbound(target)
 	if err != nil {
 		_, _ = conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
@@ -183,4 +192,14 @@ func (s *SocksSim) handle(conn net.Conn) {
 		_ = up.Close()
 	}()
 	_, _ = io.Copy(conn, up)
+}
+
+// dialOutbound dials the tunnel target, binding a per-route loopback source
+// when Outbound is set so upstreams can tell routes apart by source address.
+func (s *SocksSim) dialOutbound(target string) (net.Conn, error) {
+	d := net.Dialer{Timeout: 5 * time.Second}
+	if s.Outbound != "" {
+		d.LocalAddr = &net.TCPAddr{IP: net.ParseIP(s.Outbound)}
+	}
+	return d.Dial("tcp", target)
 }

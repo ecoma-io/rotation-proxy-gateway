@@ -3,10 +3,12 @@ package e2e_test
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 )
 
 // TargetSim is an HTTP(S) origin under test control: echo, fixed status,
@@ -81,6 +83,36 @@ func NewBulkBodyTarget(t testing.TB, size int) *TargetSim {
 	t.Cleanup(srv.Close)
 	s := fromServer(srv)
 	return s
+}
+
+// NewSourceEchoTarget answers with the TCP source address it observes, so
+// tests can tell which SOCKS route served a request.
+func NewSourceEchoTarget(t testing.TB) *TargetSim {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		_, _ = io.WriteString(w, "source:"+host)
+	}))
+	t.Cleanup(srv.Close)
+	return fromServer(srv)
+}
+
+// NewSlowBodyTarget streams half a body, holds the connection for hold, then
+// completes it — a request that stays in flight while a rotation proceeds.
+func NewSlowBodyTarget(t testing.TB, hold time.Duration) *TargetSim {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "32")
+		_, _ = io.WriteString(w, "0123456789abcdef")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(hold)
+		_, _ = io.WriteString(w, "ghijklmnopqrstuv")
+	}))
+	t.Cleanup(srv.Close)
+	return fromServer(srv)
 }
 
 // NewEchoBodyTarget reads the whole request body and echoes it back; sized
