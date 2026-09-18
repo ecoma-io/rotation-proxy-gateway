@@ -95,6 +95,11 @@ func (c *Config) validate() error {
 	if c.MaxBodyBuffer < 0 {
 		errs = append(errs, fmt.Errorf("MAX_BODY_BUFFER must be >= 0, got %d", c.MaxBodyBuffer))
 	}
+	switch c.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		errs = append(errs, fmt.Errorf("LOG_LEVEL must be one of debug, info, warn, error, got %q", c.LogLevel))
+	}
 	if c.AdminAddr == c.ListenAddr {
 		errs = append(errs, fmt.Errorf("ADMIN_ADDR %q must differ from LISTEN_ADDR %q", c.AdminAddr, c.ListenAddr))
 	}
@@ -164,7 +169,10 @@ var validSchemes = map[string]bool{"socks5": true}
 // ParseProxies reads the SOCKS5 pool file: one upstream per line, blank lines
 // and #-comments ignored. Each line is a socks5:// URL or either bare form
 // "host:port:user:pass" / "user:pass@host:port", both interpreted as SOCKS5.
-// It returns an error if any line is invalid or if the file yields no proxies.
+// Every route must carry an explicit port, must not carry a URL path, query,
+// or fragment, and must be unique by canonical route identity (scheme,
+// lowercase host, port, and credentials). It returns an error if any line is
+// invalid or if the file yields no proxies.
 func ParseProxies(path string) ([]*url.URL, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -175,6 +183,7 @@ func ParseProxies(path string) ([]*url.URL, error) {
 	var (
 		entries []*url.URL
 		errs    []error
+		seen    = make(map[string]int)
 	)
 	sc := bufio.NewScanner(f)
 	lineNo := 0
@@ -192,13 +201,21 @@ func ParseProxies(path string) ([]*url.URL, error) {
 			errs = append(errs, fmt.Errorf("%s line %d: unsupported scheme %q (want socks5://..., host:port:user:pass, or user:pass@host:port)", path, lineNo, u.Scheme))
 		case u.Hostname() == "":
 			errs = append(errs, fmt.Errorf("%s line %d: missing host", path, lineNo))
-		case u.Port() != "":
+		case u.Port() == "":
+			errs = append(errs, fmt.Errorf("%s line %d: missing port (want host:port)", path, lineNo))
+		case u.Path != "" || u.RawQuery != "" || u.Fragment != "":
+			errs = append(errs, fmt.Errorf("%s line %d: proxy URL path, query, and fragment are not supported", path, lineNo))
+		default:
 			if err := checkPort(u.Port()); err != nil {
 				errs = append(errs, fmt.Errorf("%s line %d: %w", path, lineNo, err))
 				continue
 			}
-			fallthrough
-		default:
+			id := canonicalRouteID(u)
+			if first, dup := seen[id]; dup {
+				errs = append(errs, fmt.Errorf("%s line %d: duplicate proxy route (first on line %d)", path, lineNo, first))
+				continue
+			}
+			seen[id] = lineNo
 			entries = append(entries, u)
 		}
 	}
@@ -215,13 +232,17 @@ func ParseProxies(path string) ([]*url.URL, error) {
 }
 
 // parseProxyLine accepts a socks5:// URL or either bare SOCKS5 form:
-// "host:port:user:pass" or "user:pass@host:port".
+// "host:port:user:pass" or "user:pass@host:port". Bracketed IPv6 hosts are
+// supported in all forms. Explicit ports and empty URL path/query/fragment are
+// enforced by ParseProxies; here bare "user:pass@host:port" callers get an
+// early missing-port error so the failure is attributed to the right line.
 func parseProxyLine(line string) (*url.URL, error) {
 	if strings.Contains(line, "://") {
 		u, err := url.Parse(line)
 		if err != nil {
 			return nil, errors.New("invalid proxy URL")
 		}
+		u.Scheme = strings.ToLower(u.Scheme)
 		return u, nil
 	}
 	if strings.Contains(line, "@") {
@@ -233,22 +254,21 @@ func parseProxyLine(line string) (*url.URL, error) {
 		if u.Hostname() == "" {
 			return nil, errors.New("proxy host is required")
 		}
+		if u.Port() == "" {
+			return nil, errors.New("proxy port is required (want host:port)")
+		}
+		if u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return nil, errors.New("proxy URL path, query, and fragment are not supported")
+		}
 		if err := checkPort(u.Port()); err != nil {
 			return nil, err
 		}
 		return u, nil
 	}
-	// Bare "host:port:user:pass" defaults to SOCKS5.
-	host, rest, ok := strings.Cut(line, ":")
-	if !ok || host == "" {
-		return nil, errors.New("invalid proxy format (want socks5://..., host:port:user:pass, or user:pass@host:port)")
-	}
-	port, creds, ok := strings.Cut(rest, ":")
-	if !ok || port == "" || creds == "" {
-		return nil, errors.New("invalid proxy format (want socks5://..., host:port:user:pass, or user:pass@host:port)")
-	}
-	user, pass, ok := strings.Cut(creds, ":")
-	if !ok || user == "" || pass == "" || strings.Contains(pass, ":") {
+	// Bare "host:port:user:pass" defaults to SOCKS5. The host may be a
+	// bracketed IPv6 literal such as "[2001:db8::1]:1080:user:pass".
+	host, port, user, pass, ok := splitHostPortCreds(line)
+	if !ok {
 		return nil, errors.New("invalid proxy format (want socks5://..., host:port:user:pass, or user:pass@host:port)")
 	}
 	if err := checkPort(port); err != nil {
@@ -259,6 +279,55 @@ func parseProxyLine(line string) (*url.URL, error) {
 		User:   url.UserPassword(user, pass),
 		Host:   net.JoinHostPort(host, port),
 	}, nil
+}
+
+// splitHostPortCreds splits bare "host:port:user:pass", accepting a bracketed
+// IPv6 host. It reports false for any malformed shape.
+func splitHostPortCreds(line string) (host, port, user, pass string, ok bool) {
+	rest := line
+	if strings.HasPrefix(rest, "[") {
+		end := strings.Index(rest, "]")
+		if end < 0 {
+			return "", "", "", "", false
+		}
+		host = rest[1:end]
+		rest = rest[end+1:]
+		if !strings.HasPrefix(rest, ":") || host == "" {
+			return "", "", "", "", false
+		}
+		rest = rest[1:]
+	} else {
+		var found bool
+		host, rest, found = strings.Cut(rest, ":")
+		if !found || host == "" || strings.Contains(host, ":") {
+			return "", "", "", "", false
+		}
+	}
+	port, rest, ok = strings.Cut(rest, ":")
+	if !ok || port == "" || rest == "" {
+		return "", "", "", "", false
+	}
+	user, pass, ok = strings.Cut(rest, ":")
+	if !ok || user == "" || pass == "" || strings.Contains(pass, ":") {
+		return "", "", "", "", false
+	}
+	return host, port, user, pass, true
+}
+
+// canonicalRouteID identifies a configured route for duplicate detection. It
+// preserves credentials so distinct credentials remain distinct, while
+// normalizing scheme case and host case (including IPv6) so equivalent spellings
+// collapse to one identity.
+func canonicalRouteID(u *url.URL) string {
+	var creds string
+	if u.User != nil {
+		if pw, has := u.User.Password(); has {
+			creds = u.User.Username() + ":" + pw
+		} else {
+			creds = u.User.Username()
+		}
+	}
+	return strings.ToLower(u.Scheme) + "://" + creds + "@" + strings.ToLower(u.Hostname()) + ":" + u.Port()
 }
 
 // checkPort validates a proxy port is numeric and in range without including a
