@@ -311,7 +311,7 @@ func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.M
 		}
 		if attempt > 0 {
 			pause := settings.IPCheckInterval
-			if remaining := time.Until(deadline); remaining < pause {
+			if remaining := deadline.Sub(e.Now()); remaining < pause {
 				pause = remaining
 			}
 			if !sleepCtx(ctx, pause) || !e.Now().Before(deadline) {
@@ -319,7 +319,7 @@ func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.M
 			}
 		}
 		remaining := settings.IPCheckTimeout
-		if d := time.Until(deadline); d > 0 && d < remaining {
+		if d := deadline.Sub(e.Now()); d > 0 && d < remaining {
 			remaining = d
 		}
 		ip, err := e.probeIP(ctx, gen, spec, remaining)
