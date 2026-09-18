@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -465,6 +466,103 @@ func TestRotationReloadRemovesRouteAbortsProcedure(t *testing.T) {
 	}
 	if logs := g.Logs(); strings.Contains(logs, "panic") {
 		t.Fatalf("gateway panicked during removal:\n%s", logs)
+	}
+}
+
+// TestRotationReloadMidDrainNeverCallsRotateAPI removes a manual route by
+// reload while its rotation procedure is parked in the drain behind an
+// in-flight request. The abandoned procedure must stop at its next checkpoint:
+// the provider rotate API is never called and no rotation is recorded.
+func TestRotationReloadMidDrainNeverCallsRotateAPI(t *testing.T) {
+	skipShort(t)
+	rt := newRotationTest(t, 1)
+	rt.flipOnCall()
+	held := NewSlowBodyTarget(t, 8*time.Second)
+	cfg := defaultGatewayConfig(nil)
+	cfg.Manual = []ManualRouteConfig{rt.entry(rt.sims[0], "3s")}
+	cfg.Rotation = fastRotation(rt.trace)
+	cfg.Rotation.DrainTimeout = "30s" // the parked drain outlives the reload
+	g := startRotationGateway(t, cfg, rt.trace)
+
+	// Keep the route busy so the 3s rotation parks in the drain. The body is
+	// read to completion: returning at the headers would release the
+	// gateway-side in-flight hold long before the drain must park.
+	time.Sleep(500 * time.Millisecond)
+	done := make(chan error, 1)
+	go func() {
+		resp, err := ProxyClient(g.MixedAddr).Get(held.URL + "/held")
+		if err != nil {
+			done <- err
+			return
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr == nil && len(body) != 32 {
+			readErr = fmt.Errorf("short body: %d bytes", len(body))
+		}
+		done <- readErr
+	}()
+	waitRotation(t, g, rt.sims[0], "to park in the drain",
+		func(v *RotationView) bool { return v.State == "draining" }, 8*time.Second)
+
+	// Remove the manual route while the procedure waits for the in-flight
+	// request. In-flight work keeps running on its own generation; the
+	// procedure itself must quit instead of proceeding to the API.
+	dead := deadRouteValue(t)
+	g.ReloadConfig(defaultGatewayConfig([]RouteConfig{{Proxy: dead, Kind: "v4"}}),
+		[]string{strings.TrimPrefix(dead, "socks5://")})
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("in-flight request did not survive the reload: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("held request never completed")
+	}
+
+	// Ample time for an incorrectly surviving procedure to reach the API.
+	time.Sleep(3 * time.Second)
+	if n := rt.api.Hits.Load(); n != 0 {
+		t.Fatalf("removed route's procedure called the rotate API %d times, want 0", n)
+	}
+	if got := stRotations(t, g); got != 0 {
+		t.Fatalf("removed route recorded %d rotations, want 0", got)
+	}
+	if logs := g.Logs(); strings.Contains(logs, "panic") {
+		t.Fatalf("gateway panicked during removal:\n%s", logs)
+	}
+}
+
+// TestRotationReloadAddsManualRouteRotates adds a manual route by reload: the
+// scheduler must pick it up on the next cycle and run its first rotation
+// without a restart, while the pre-existing route keeps its own schedule.
+func TestRotationReloadAddsManualRouteRotates(t *testing.T) {
+	skipShort(t)
+	rt := newRotationTest(t, 2)
+	// Only the added route rotates: its API call moves its own egress IP.
+	rt.api.OnCall(func() {
+		rt.trace.SetIP(rt.source[rt.sims[1]], "198.51.100.10")
+	})
+	base := defaultGatewayConfig(nil)
+	base.Manual = []ManualRouteConfig{rt.entry(rt.sims[0], "1h")}
+	base.Rotation = fastRotation(rt.trace)
+	g := startRotationGateway(t, base, rt.trace)
+
+	added := base
+	added.Manual = []ManualRouteConfig{rt.entry(rt.sims[0], "1h"), rt.entry(rt.sims[1], "1s")}
+	g.ReloadConfig(added, []string{rt.sims[0].Addr, rt.sims[1].Addr})
+
+	waitRotation(t, g, rt.sims[1], "to complete its first rotation after the reload",
+		func(v *RotationView) bool { return v.State == "idle" && v.LastIP == "198.51.100.10" }, 12*time.Second)
+	if n := rt.api.Hits.Load(); n != 1 {
+		t.Fatalf("rotate API calls=%d, want 1 (only the added route)", n)
+	}
+	if got := stRotations(t, g); got != 1 {
+		t.Fatalf("rotations=%d, want 1", got)
+	}
+	if v := rotationView(t, g, rt.sims[0]); v.State != "idle" || v.LastRotationAt != "" {
+		t.Fatalf("pre-existing route was disturbed: %+v", v)
 	}
 }
 
