@@ -21,7 +21,7 @@ go build -ldflags "-X main.version=0.1.0-dev" -o bin/rpgw ./cmd/rotation-proxy-g
 
 The source supports Go ≥ 1.25; Docker builds with Go 1.27. Viper is used for
 runtime YAML loading and validation; hot reload is a self-contained 1s
-content-hash poller in `cmd/rotation-proxy-gateway`. Style rules: use
+content-hash poller (`internal/config.Poller`). Style rules: use
 `math/rand/v2` (never `math/rand`) and `for range n` loops.
 
 ## Configure and run
@@ -131,10 +131,10 @@ binary `healthcheck` subcommand (no shell in the scratch image).
 
 ## Layout
 
-- `internal/config` — bootstrap environment, Viper YAML validation, route parsing
+- `internal/config` — bootstrap environment, Viper YAML validation, route parsing, content-hash change poller
 - `internal/pool` — LRU filtering, cooldown/auth state, immutable generation snapshots
 - `internal/proxyserver` — SOCKS5 dialing plus inbound HTTP/CONNECT forwarding
-- `cmd/rotation-proxy-gateway` — lifecycle, signals, config poller, admin endpoints
+- `cmd/rotation-proxy-gateway` — lifecycle, signals, admin endpoints
 - `e2e` — black-box tests and benchmarks driving the real binary as a
   subprocess with SOCKS5/HTTP simulators; `go test ./e2e/` (skip with
   `-short`), baselines in `e2e/BENCH.md`

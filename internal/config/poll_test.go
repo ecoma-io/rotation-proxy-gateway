@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"context"
@@ -10,21 +10,21 @@ import (
 	"time"
 )
 
-func TestConfigWatcherDetectsContentChanges(t *testing.T) {
+func TestPollerDetectsContentChanges(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte("a: 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	w := newConfigWatcher(path, 5*time.Millisecond, log)
+	p := NewPoller(path, 5*time.Millisecond, log)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go w.Run(ctx, log)
+	go p.Run(ctx, log)
 
 	waitChange := func(what string) {
 		t.Helper()
 		select {
-		case <-w.Changes():
+		case <-p.Changes():
 		case <-time.After(2 * time.Second):
 			t.Fatalf("no change signal for %s", what)
 		}
@@ -52,7 +52,7 @@ func TestConfigWatcherDetectsContentChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case <-w.Changes():
+	case <-p.Changes():
 		t.Fatal("identical content produced a change signal")
 	case <-time.After(100 * time.Millisecond):
 	}
@@ -64,7 +64,7 @@ func TestConfigWatcherDetectsContentChanges(t *testing.T) {
 	}
 	waitChange("delete")
 	select {
-	case <-w.Changes():
+	case <-p.Changes():
 		t.Fatal("deleted file signaled more than once")
 	case <-time.After(100 * time.Millisecond):
 	}

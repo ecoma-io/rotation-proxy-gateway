@@ -172,10 +172,10 @@ func run() error {
 		}
 	}()
 
-	watcher := newConfigWatcher(bootstrap.ConfigFile, configPollInterval, log)
-	watchCtx, cancelWatch := context.WithCancel(context.Background())
-	defer cancelWatch()
-	go watcher.Run(watchCtx, log)
+	poller := config.NewPoller(bootstrap.ConfigFile, config.DefaultPollInterval, log)
+	pollCtx, cancelPoll := context.WithCancel(context.Background())
+	defer cancelPoll()
+	go poller.Run(pollCtx, log)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -207,7 +207,7 @@ func run() error {
 			log.Info("shutting down", "signal", sig.String())
 			shutdownAll(listeners, adminSrv)
 			return nil
-		case <-watcher.Changes():
+		case <-poller.Changes():
 			// The poller hash-gates on applied content, so one signal means one
 			// distinct configuration; no debounce is needed.
 			reload("poll")
