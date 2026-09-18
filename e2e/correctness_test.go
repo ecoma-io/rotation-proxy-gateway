@@ -1,6 +1,7 @@
 package e2e_test
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -475,5 +476,135 @@ func TestE2E_NoCredentialLeak(t *testing.T) {
 		if strings.Contains(g.Logs(), secret) {
 			t.Fatalf("logs leaked credential %q:\n%s", secret, g.Logs())
 		}
+	}
+}
+
+// The manual section is accepted but ignored: its contents never reach the
+// pool, /status, or logs, and no API request is made on its behalf.
+func TestE2E_ManualSectionIgnoredAndNeverExposed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	socks := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{{Proxy: socks.RouteValue(), Kind: "v4"}})
+	cfg.Manual = `    - proxy: 'socks5://manual-user:e2e-manual-secret@manual.example:1080'
+      kind: v6
+      interval: 90
+      api:
+        url: http://provider.example/api/rotate-ip
+        method: POST
+        headers:
+          - Content-Type: application/json
+        body: |
+          {"proxy_id": 1, "token": "e2e-manual-secret"}`
+	g := NewGateway(t, cfg)
+
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+	waitForLog(t, g, "msg=request", 5*time.Second)
+
+	resp, err := http.Get("http://" + g.AdminAddr + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	for _, secret := range []string{"e2e-manual-secret", "manual.example", "rotate-ip"} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatalf("/status exposed manual section entry %q: %s", secret, raw)
+		}
+		if strings.Contains(g.Logs(), secret) {
+			t.Fatalf("logs exposed manual section entry %q:\n%s", secret, g.Logs())
+		}
+	}
+	st, err := g.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Pool) != 1 || st.Pool[0].Proxy != socks.Addr || st.Pool[0].Kind != "v4" {
+		t.Fatalf("manual section leaked into the pool: %+v", st.Pool)
+	}
+}
+
+// An HTTPS target whose TLS handshake fails inside the SOCKS tunnel is a
+// setup failure: one sanitized 502, no fallback, no health mutation. This
+// runs with the secure default (target-tls-insecure: false), which must
+// actually verify certificates.
+func TestE2E_TargetTLSFailureIsSingleSanitized502(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	socks := NewSocksSim(t, SocksOK, "", "")
+	target := NewTLSEchoTarget(t) // self-signed: the secure default rejects it
+	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
+		{Proxy: socks.RouteValue(), Kind: "v4"},
+	}))
+
+	status, _, body := RawProxyRequest(t, g.MixedAddr, http.MethodGet, target.URL+"/secure", nil, nil)
+	if status != http.StatusBadGateway || string(body) != "upstream SOCKS setup failed\n" {
+		t.Fatalf("status=%d body=%q, want sanitized 502", status, body)
+	}
+	if got := socks.Hits.Load(); got != 1 {
+		t.Fatalf("SOCKS attempts=%d, want 1 (no retry)", got)
+	}
+	st, err := g.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Pool[0].Available || st.Pool[0].Failures != 0 || st.Pool[0].Successes != 0 {
+		t.Fatalf("TLS handshake failure changed health: %+v", st.Pool[0])
+	}
+}
+
+// Non-absolute-form and non-HTTP(S) request targets are rejected with 400
+// before any route is dialed, leaving the pool untouched.
+func TestE2E_InvalidAbsoluteFormRequestsAreRejected(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	socks := NewSocksSim(t, SocksOK, "", "")
+	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
+		{Proxy: socks.RouteValue(), Kind: "v4"},
+	}))
+
+	rawGet := func(t *testing.T, requestLine, host string) (int, string) {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", g.MixedAddr, 5*time.Second)
+		if err != nil {
+			t.Fatalf("dial mixed listener: %v", err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		fmt.Fprintf(conn, "%s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", requestLine, host) //nolint:errcheck // the response code is the assertion
+		resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+		if err != nil {
+			t.Fatalf("read rejection response: %v", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body)
+	}
+
+	for name, tc := range map[string]struct{ line, host string }{
+		"origin-form path": {"GET /only-a-path", "example.com"},
+		"ftp scheme":       {"GET ftp://example.com/file", "example.com"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			status, body := rawGet(t, tc.line, tc.host)
+			if status != http.StatusBadRequest || !strings.Contains(body, "proxy request requires") {
+				t.Fatalf("status=%d body=%q, want 400 with a rejection message", status, body)
+			}
+		})
+	}
+	waitForLog(t, g, "error_kind=bad_request", 5*time.Second)
+	if got := socks.Hits.Load(); got != 0 {
+		t.Fatalf("SOCKS attempts=%d, want 0 for rejected requests", got)
+	}
+	st, err := g.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Pool[0].Successes != 0 || st.Pool[0].Failures != 0 {
+		t.Fatalf("rejected requests changed health: %+v", st.Pool[0])
 	}
 }

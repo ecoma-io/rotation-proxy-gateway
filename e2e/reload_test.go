@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -272,6 +273,32 @@ func TestE2E_ReloadPreservesHealthForUnchangedRoutes(t *testing.T) {
 	if st.Pool[1].Successes != 1 {
 		t.Fatalf("reload dropped success counters: %+v", st.Pool[1])
 	}
+}
+
+// log-level is one of the settings that applies to new operations without a
+// restart: after a reload to debug, fresh requests must emit debug lines that
+// info level suppressed.
+func TestE2E_ReloadAppliesLogLevel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	socks := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{{Proxy: socks.RouteValue(), Kind: "v4"}})
+	g := NewGateway(t, cfg)
+
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+	if out := g.Logs(); strings.Contains(out, `msg="request start"`) {
+		t.Fatalf("debug line present at info level:\n%s", out)
+	}
+
+	cfg.LogLevel = "debug"
+	g.ReloadConfig(cfg, []string{socks.Addr})
+	// This reload leaves the pool unchanged, so ReloadConfig cannot wait for
+	// it to apply; wait for the reload log instead of the pool snapshot.
+	waitForLog(t, g, `msg="configuration reloaded"`, reloadSettle)
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+	waitForLog(t, g, `msg="request start"`, reloadSettle)
 }
 
 func TestE2E_ReloadDoesNotDropInFlight(t *testing.T) {

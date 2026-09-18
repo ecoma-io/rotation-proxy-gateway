@@ -54,6 +54,9 @@ type GatewayConfig struct {
 	TLSInsecure   bool
 	MaxBodyBuffer int64
 	Routes        []RouteConfig
+	// Manual is raw YAML rendered verbatim under proxies.manual (items
+	// indented four spaces). Empty renders the phase-1 default [].
+	Manual string
 }
 
 func defaultGatewayConfig(routes []RouteConfig) GatewayConfig {
@@ -134,7 +137,11 @@ func renderConfig(cfg GatewayConfig) string {
 	for _, r := range cfg.Routes {
 		fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n", yamlQuote(r.Proxy), r.Kind)
 	}
-	sb.WriteString("  manual: []\n")
+	if cfg.Manual == "" {
+		sb.WriteString("  manual: []\n")
+	} else {
+		fmt.Fprintf(&sb, "  manual:\n%s\n", cfg.Manual)
+	}
 	return sb.String()
 }
 

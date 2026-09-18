@@ -140,6 +140,64 @@ func TestE2E_TunnelSurvivesReload(t *testing.T) {
 	}
 }
 
+// An established tunnel that breaks mid-relay is ordinary connection
+// teardown: the client observes the close, route health is untouched, and the
+// listener keeps serving new requests.
+func TestE2E_TunnelBreakDoesNotMutateHealth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	socks := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoTarget(t)
+	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
+		{Proxy: socks.RouteValue(), Kind: "v4"},
+	}))
+
+	conn, err := net.DialTimeout("tcp", g.MixedAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial mixed listener: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target.Host, target.Host) //nolint:errcheck // the read is the assertion
+	br := bufio.NewReader(conn)
+	tunnelResp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	tunnelResp.Body.Close()
+	if tunnelResp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status=%d, want 200", tunnelResp.StatusCode)
+	}
+
+	// Tear the target down under the live tunnel, then push a request through:
+	// the relay must end and the client must observe the close.
+	target.Server.Close()
+	fmt.Fprintf(conn, "GET /gone HTTP/1.1\r\nHost: %s\r\n\r\n", target.Host) //nolint:errcheck // a racing close may reject the write; the read decides
+	if _, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet}); err == nil {
+		t.Fatal("read from broken tunnel unexpectedly succeeded")
+	}
+
+	st, err := g.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Pool[0].Successes != 1 || st.Pool[0].Failures != 0 || !st.Pool[0].Available {
+		t.Fatalf("tunnel break mutated health: %+v", st.Pool[0])
+	}
+
+	// The same listener keeps serving fresh requests afterwards.
+	after := NewEchoTarget(t)
+	GetVia(t, ProxyClient(g.MixedAddr), after.URL+"/after", "e2e-echo:/after")
+	st, err = g.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Pool[0].Successes != 2 || st.Pool[0].Failures != 0 {
+		t.Fatalf("post-break pool = %+v, want exactly the new success", st.Pool[0])
+	}
+}
+
 // TerminateAndWait sends SIGTERM, waits for exit, and returns the exit code.
 func (g *Gateway) TerminateAndWait() int {
 	g.t.Helper()

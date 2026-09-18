@@ -133,6 +133,40 @@ func TestAllAuthBlockedReturnsNil(t *testing.T) {
 	}
 }
 
+// ReportSuccess resets dial health (cooldown, consecutive failures, last
+// error) but deliberately leaves an authentication block in place: unchanged
+// credentials cannot recover without a reload that changes route identity.
+func TestReportSuccessClearsDialCooldownButKeepsAuthBlock(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2")
+
+	a := pl.entries[0]
+	pl.ReportFailure(a, errors.New("dial refused"))
+	pl.ReportFailure(a, errors.New("dial refused"))
+	if snap := pl.Snapshot()[0]; snap.Available || snap.ConsecutiveFailures != 2 {
+		t.Fatalf("cooling route snapshot = %+v", pl.Snapshot()[0])
+	}
+	pl.ReportSuccess(a)
+	snap := pl.Snapshot()[0]
+	if !snap.Available || snap.ConsecutiveFailures != 0 || snap.CooldownFor != "0s" || snap.LastDialError != "" {
+		t.Fatalf("success did not clear dial health: %+v", snap)
+	}
+	if snap.Failures != 2 {
+		t.Fatalf("cumulative failures = %d, want retained 2", snap.Failures)
+	}
+
+	b := pl.entries[1]
+	pl.ReportAuthBlocked(b, errors.New("endpoint rejected credentials"))
+	pl.ReportSuccess(b)
+	snapB := pl.Snapshot()[1]
+	if !snapB.AuthBlocked || snapB.Available {
+		t.Fatalf("success cleared an authentication block: %+v", snapB)
+	}
+	if got := pl.PickFor(nil, nil); got == nil || got.URL.Host != "a:1" {
+		t.Fatalf("auth-blocked route re-entered rotation: got %v", got)
+	}
+}
+
 func TestSnapshotFields(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2")

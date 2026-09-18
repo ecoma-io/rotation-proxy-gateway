@@ -189,6 +189,42 @@ func TestPlainHTTPForwardThroughSOCKS(t *testing.T) {
 	}
 }
 
+// Only absolute-form http/https requests are forwardable. Anything else is
+// rejected before a route is considered: 400, a bad_request log line, and an
+// untouched pool.
+func TestInvalidInboundRequestsAreRejectedBeforeDialing(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
+	var logs bytes.Buffer
+	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+
+	for _, tc := range []struct{ name, target string }{
+		{"origin-form path", "/only-a-path"},
+		{"unsupported scheme", "ftp://example.test/file"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d, want 400", rec.Code)
+			}
+			if body := rec.Body.String(); !strings.Contains(body, "proxy request requires") {
+				t.Fatalf("body=%q, want a rejection message", body)
+			}
+		})
+	}
+	if got := len(fs.hits); got != 0 {
+		t.Fatalf("SOCKS dialed %d times for rejected requests, want 0", got)
+	}
+	if snap := pl.Snapshot()[0]; snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 {
+		t.Fatalf("rejected requests changed pool state: %+v", snap)
+	}
+	if out := logs.String(); strings.Count(out, "error_kind=bad_request") != 2 {
+		t.Fatalf("logs = %s, want one bad_request line per rejected request", out)
+	}
+}
+
 func TestHTTPSRoundTripThroughSOCKS(t *testing.T) {
 	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		io.WriteString(w, "https-via-socks")
