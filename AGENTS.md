@@ -48,6 +48,7 @@ Environment variables are bootstrap-only and require restart:
 | `MIXED_LISTEN_ADDR` | `:30121` | Mixed v4/v6 egress listener |
 | `V4_LISTEN_ADDR` | `:30122` | IPv4-egress-only listener |
 | `V6_LISTEN_ADDR` | `:30123` | IPv6-egress-only listener |
+| `SHUTDOWN_GRACE` | `55s` | Total shared drain budget for graceful shutdown |
 
 Empty proxy listener addresses disable their listener, but at least one proxy
 listener must remain enabled. All enabled addresses must be valid host:port
@@ -101,7 +102,11 @@ Read [`README.md`](README.md) before changing failure classification.
   userinfo or kind creates a new route state. Validated configuration and its
   reconfigured pool snapshot publish as one atomic generation; in-flight
   operations finish on their original generation.
-- Shutdown order: each proxy listener gets 10s → admin gets 10s → hijacked tunnels.
+- Shutdown drains all proxy listeners and admin against one shared
+  `SHUTDOWN_GRACE` budget (default 55s; one deadline for the whole process,
+  not a window per listener), then force-closes hijacked tunnels. Keep the
+  surrounding orchestrator's kill timer above the budget (`stop_grace_period:
+  60s` in compose).
 
 ## Admin
 

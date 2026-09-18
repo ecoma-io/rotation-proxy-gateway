@@ -62,6 +62,7 @@ at least one proxy listener must remain enabled.
 | `MIXED_LISTEN_ADDR` | `:30121` | Mixed v4/v6 egress listener |
 | `V4_LISTEN_ADDR` | `:30122` | v4-egress-only listener |
 | `V6_LISTEN_ADDR` | `:30123` | v6-egress-only listener |
+| `SHUTDOWN_GRACE` | `55s` | Total shared drain budget for graceful shutdown |
 
 All enabled addresses must be valid, use a numeric port, and not overlap --
 including wildcard binds on the same port. Docker Healthcheck uses only
@@ -282,6 +283,12 @@ go test -race ./...
 go build -ldflags "-X main.version=0.1.0-dev" -o bin/rpgw ./cmd/rotation-proxy-gateway
 ```
 
-Graceful shutdown gives each enabled proxy listener its own ten-second drain
-window, then gives the admin listener a separate ten-second window, and finally
-closes hijacked CONNECT tunnels that `http.Server.Shutdown` does not track.
+Graceful shutdown stops accepting, then drains every enabled proxy listener
+and the admin listener against one shared budget, `SHUTDOWN_GRACE` (default
+55s). It is one deadline for the whole process, not a window per listener, so
+even a fully busy worst case exits near the budget; an idle process exits
+immediately. When the budget expires, the remaining listeners are still closed,
+and hijacked CONNECT tunnels that `http.Server.Shutdown` does not track are
+force-closed. Size the surrounding orchestrator above the budget -- for
+example `stop_grace_period: 60s` in compose -- so its kill timer never cuts
+the drain short.

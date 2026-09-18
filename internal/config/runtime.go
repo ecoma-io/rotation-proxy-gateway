@@ -18,6 +18,10 @@ const (
 	DefaultMixedListenAddr  = ":30121"
 	DefaultV4ListenAddr     = ":30122"
 	DefaultV6ListenAddr     = ":30123"
+	// DefaultShutdownGrace is one shared drain budget for the whole process:
+	// every enabled proxy listener plus the admin listener. 55s fits under a
+	// 60s docker stop_grace_period and a 90s systemd TimeoutStopSec.
+	DefaultShutdownGrace = 55 * time.Second
 )
 
 // EgressKind is the public IP family supplied by an upstream proxy provider.
@@ -45,6 +49,9 @@ type BootstrapConfig struct {
 	MixedListenAddr string
 	V4ListenAddr    string
 	V6ListenAddr    string
+	// ShutdownGrace bounds the entire graceful drain: one shared deadline for
+	// all listeners, not a per-listener window.
+	ShutdownGrace time.Duration
 }
 
 // RuntimeConfig is the immutable set of values used by new client operations.
@@ -99,12 +106,22 @@ func LoadBootstrap() (*BootstrapConfig, error) {
 		MixedListenAddr: DefaultMixedListenAddr,
 		V4ListenAddr:    DefaultV4ListenAddr,
 		V6ListenAddr:    DefaultV6ListenAddr,
+		ShutdownGrace:   DefaultShutdownGrace,
 	}
 	envStr("CONFIG_FILE", &cfg.ConfigFile)
 	envStr("ADMIN_ADDR", &cfg.AdminAddr)
 	envAddr("MIXED_LISTEN_ADDR", &cfg.MixedListenAddr)
 	envAddr("V4_LISTEN_ADDR", &cfg.V4ListenAddr)
 	envAddr("V6_LISTEN_ADDR", &cfg.V6ListenAddr)
+	// Parsed inline rather than through a helper so a malformed value fails
+	// fast instead of silently falling back to the default.
+	if raw, ok := os.LookupEnv("SHUTDOWN_GRACE"); ok && raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("SHUTDOWN_GRACE %q must be a Go duration", raw)
+		}
+		cfg.ShutdownGrace = d
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -115,6 +132,9 @@ func (c *BootstrapConfig) validate() error {
 	var errs []error
 	if strings.TrimSpace(c.ConfigFile) == "" {
 		errs = append(errs, errors.New("CONFIG_FILE must not be empty"))
+	}
+	if c.ShutdownGrace <= 0 {
+		errs = append(errs, fmt.Errorf("SHUTDOWN_GRACE must be positive, got %s", c.ShutdownGrace))
 	}
 	if c.MixedListenAddr == "" && c.V4ListenAddr == "" && c.V6ListenAddr == "" {
 		errs = append(errs, errors.New("at least one proxy listener must be enabled"))

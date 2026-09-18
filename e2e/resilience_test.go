@@ -211,6 +211,66 @@ func TestE2E_ShutdownDrainsInFlightRequest(t *testing.T) {
 	}
 }
 
+// The configured SHUTDOWN_GRACE is one shared budget for the whole drain: an
+// in-flight request that never completes must still let the process exit near
+// the budget with a graceful exit code instead of hanging on it.
+func TestE2E_ShutdownGraceBoundsDrain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	const grace = time.Second
+	socks := NewSocksSim(t, SocksOK, "", "")
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		// Hold the target response until the client (the gateway) goes away:
+		// the request context cancels when the gateway's connection closes.
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	g := NewGatewayWithEnv(t, defaultGatewayConfig([]RouteConfig{
+		{Proxy: socks.RouteValue(), Kind: "v4"},
+	}), "SHUTDOWN_GRACE="+grace.String())
+
+	type result struct {
+		status int
+		body   []byte
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := ProxyClient(g.MixedAddr).Get(srv.URL + "/stuck")
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		done <- result{status: resp.StatusCode, body: b}
+	}()
+	time.Sleep(150 * time.Millisecond) // let the request go in flight
+
+	start := time.Now()
+	if code := g.TerminateAndWait(); code != 0 {
+		t.Fatalf("exit=%d, want graceful 0\nlogs:\n%s", code, g.Logs())
+	}
+	elapsed := time.Since(start)
+	if elapsed < grace-100*time.Millisecond {
+		t.Fatalf("exit after %s, want at least the %s budget", elapsed, grace)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("exit after %s, want near the %s budget", elapsed, grace)
+	}
+
+	// The stuck request must observe the exit as a connection error.
+	select {
+	case r := <-done:
+		if r.err == nil {
+			t.Fatalf("stuck request completed with status=%d body=%q, want a connection error", r.status, r.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stuck request never observed the exit")
+	}
+}
+
 // runGatewayOnce starts the binary with explicit bootstrap env, waits for it
 // to exit, and returns the exit code with the combined output. Bootstrap
 // failures exit before any listener binds, so this never blocks.

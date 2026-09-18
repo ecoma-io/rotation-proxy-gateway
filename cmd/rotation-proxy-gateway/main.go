@@ -25,8 +25,6 @@ import (
 // version is overridden at build time via -ldflags "-X main.version=...".
 var version = "0.1.0-dev"
 
-const shutdownGrace = 10 * time.Second
-
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -201,11 +199,11 @@ func run() error {
 	for {
 		select {
 		case err := <-errCh:
-			shutdownAll(listeners, adminSrv)
+			shutdownAll(listeners, adminSrv, bootstrap.ShutdownGrace)
 			return err
 		case sig := <-sigCh:
-			log.Info("shutting down", "signal", sig.String())
-			shutdownAll(listeners, adminSrv)
+			log.Info("shutting down", "signal", sig.String(), "grace", bootstrap.ShutdownGrace.String())
+			shutdownAll(listeners, adminSrv, bootstrap.ShutdownGrace)
 			return nil
 		case <-poller.Changes():
 			// The poller hash-gates on applied content, so one signal means one
@@ -215,19 +213,25 @@ func run() error {
 	}
 }
 
-func shutdownAll(listeners []runningListener, adminSrv *http.Server) {
+// shutdownAll drains every enabled proxy listener and the admin listener
+// against one shared grace budget, then force-closes hijacked CONNECT tunnels
+// that http.Server.Shutdown does not track. Shutdown returns as soon as a
+// server drains, so an idle process exits immediately; once the budget
+// expires, later Shutdown calls still stop their listeners and close their
+// idle connections but no longer wait for active requests.
+func shutdownAll(listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
 	for _, listener := range listeners {
-		shutdownServer(listener.http)
+		shutdownServer(listener.http, ctx)
 	}
-	shutdownServer(adminSrv)
+	shutdownServer(adminSrv, ctx)
 	for _, listener := range listeners {
 		listener.server.CloseTunnels() // Shutdown ignores hijacked CONNECT conns
 	}
 }
 
-func shutdownServer(server *http.Server) {
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-	defer cancel()
+func shutdownServer(server *http.Server, ctx context.Context) {
 	server.Shutdown(ctx) //nolint:errcheck // best-effort
 }
 

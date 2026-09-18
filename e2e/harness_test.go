@@ -141,6 +141,16 @@ func renderConfig(cfg GatewayConfig) string {
 // NewGateway writes cfg to a temp config file, starts the real binary, and
 // waits for /healthz. Every instance owns its ports so tests run in parallel.
 func NewGateway(t testing.TB, cfg GatewayConfig) *Gateway {
+	return newGateway(t, cfg, nil)
+}
+
+// NewGatewayWithEnv is NewGateway with extra bootstrap environment entries
+// (for example "SHUTDOWN_GRACE=1s") appended to the standard set.
+func NewGatewayWithEnv(t testing.TB, cfg GatewayConfig, extraEnv ...string) *Gateway {
+	return newGateway(t, cfg, extraEnv)
+}
+
+func newGateway(t testing.TB, cfg GatewayConfig, extraEnv []string) *Gateway {
 	t.Helper()
 	if testBinaryPath == "" {
 		t.Skip("e2e binary not built (short mode?)")
@@ -159,14 +169,14 @@ func NewGateway(t testing.TB, cfg GatewayConfig) *Gateway {
 	g.writeConfig(cfg)
 	cmd := exec.Command(testBinaryPath)
 	cmd.Dir = dir
-	cmd.Env = []string{
+	cmd.Env = append([]string{
 		"CONFIG_FILE=" + g.configPath,
 		"ADMIN_ADDR=" + g.AdminAddr,
 		"MIXED_LISTEN_ADDR=" + g.MixedAddr,
 		"V4_LISTEN_ADDR=" + g.V4Addr,
 		"V6_LISTEN_ADDR=" + g.V6Addr,
 		"PATH=" + os.Getenv("PATH"),
-	}
+	}, extraEnv...)
 	cmd.Stdout = g.output
 	cmd.Stderr = g.output
 	if err := cmd.Start(); err != nil {

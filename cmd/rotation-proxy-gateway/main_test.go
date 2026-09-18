@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -196,10 +197,43 @@ func TestWarnUnavailableKindListeners(t *testing.T) {
 	}
 }
 
-func TestShutdownGraceIsPerListenerTenSeconds(t *testing.T) {
-	if shutdownGrace != 10*time.Second {
-		t.Fatalf("shutdownGrace = %s, want 10s per enabled listener plus admin", shutdownGrace)
+func TestDefaultShutdownGrace(t *testing.T) {
+	if config.DefaultShutdownGrace != 55*time.Second {
+		t.Fatalf("DefaultShutdownGrace = %s, want 55s", config.DefaultShutdownGrace)
 	}
+	t.Setenv("SHUTDOWN_GRACE", "") // neutralize the environment
+	cfg, err := config.LoadBootstrap()
+	if err != nil {
+		t.Fatalf("LoadBootstrap: %v", err)
+	}
+	if cfg.ShutdownGrace != config.DefaultShutdownGrace {
+		t.Fatalf("default ShutdownGrace = %s, want %s", cfg.ShutdownGrace, config.DefaultShutdownGrace)
+	}
+}
+
+func TestBootstrapShutdownGraceEnv(t *testing.T) {
+	t.Run("override", func(t *testing.T) {
+		t.Setenv("SHUTDOWN_GRACE", "2s")
+		cfg, err := config.LoadBootstrap()
+		if err != nil {
+			t.Fatalf("LoadBootstrap: %v", err)
+		}
+		if cfg.ShutdownGrace != 2*time.Second {
+			t.Fatalf("ShutdownGrace = %s, want 2s", cfg.ShutdownGrace)
+		}
+	})
+	t.Run("not a duration", func(t *testing.T) {
+		t.Setenv("SHUTDOWN_GRACE", "soon")
+		if _, err := config.LoadBootstrap(); err == nil || !strings.Contains(err.Error(), "must be a Go duration") {
+			t.Fatalf("err = %v, want a Go-duration error", err)
+		}
+	})
+	t.Run("not positive", func(t *testing.T) {
+		t.Setenv("SHUTDOWN_GRACE", "0s")
+		if _, err := config.LoadBootstrap(); err == nil || !strings.Contains(err.Error(), "must be positive") {
+			t.Fatalf("err = %v, want a positivity error", err)
+		}
+	})
 }
 
 func serveTestListener(t *testing.T, handler http.Handler) (net.Listener, *http.Server) {
@@ -250,7 +284,7 @@ func TestShutdownAllClosesProxyListenersThenAdmin(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		shutdownAll(listeners, adminSrv)
+		shutdownAll(listeners, adminSrv, 5*time.Second)
 		close(done)
 	}()
 	select {
@@ -265,6 +299,91 @@ func TestShutdownAllClosesProxyListenersThenAdmin(t *testing.T) {
 		if conn, err := net.DialTimeout("tcp", ln.Addr().String(), 200*time.Millisecond); err == nil {
 			conn.Close()
 			t.Fatalf("server %s still reachable after shutdownAll", ln.Addr())
+		}
+	}
+}
+
+// shutdownAll must bound the whole drain with the single shared grace budget,
+// not hand each listener its own window: with every listener holding an active
+// request that can never finish, total shutdown time stays near one budget.
+func TestShutdownAllSharedBudget(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHandlers := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseHandlers)
+	entered := make(chan struct{}, 2)
+	block := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		entered <- struct{}{}
+		<-release
+	})
+
+	var logBuf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelError}))
+	runtime := &config.RuntimeConfig{
+		MaxRetries:    1,
+		DialTimeout:   time.Second,
+		MaxBodyBuffer: 1 << 20,
+		CooldownBase:  time.Second,
+		CooldownMax:   time.Minute,
+	}
+	store := pool.NewStore(runtime, pool.NewRoutes(nil, time.Second, time.Minute))
+	srvA := proxyserver.NewRuntime(store, log, "test", "mixed", config.EgressV4, config.EgressV6)
+	srvB := proxyserver.NewRuntime(store, log, "test", "v4", config.EgressV4)
+	lnA, httpA := serveTestListener(t, block)
+	lnB, httpB := serveTestListener(t, block)
+	lnAdmin, adminSrv := serveTestListener(t, http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+	listeners := []runningListener{
+		{name: "mixed", server: srvA, http: httpA},
+		{name: "v4", server: srvB, http: httpB},
+	}
+
+	type clientResult struct{ err error }
+	results := make(chan clientResult, 2)
+	client := &http.Client{Transport: &http.Transport{}}
+	for _, ln := range []net.Listener{lnA, lnB} {
+		ln := ln
+		go func() {
+			resp, err := client.Get("http://" + ln.Addr().String() + "/held")
+			if err == nil {
+				resp.Body.Close()
+			}
+			results <- clientResult{err: err}
+		}()
+	}
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("handlers never ran")
+		}
+	}
+
+	const grace = 500 * time.Millisecond
+	start := time.Now()
+	shutdownAll(listeners, adminSrv, grace)
+	elapsed := time.Since(start)
+	if elapsed < grace-100*time.Millisecond {
+		t.Fatalf("shutdownAll returned after %s, want at least the %s budget (it must bound the drain)", elapsed, grace)
+	}
+	if elapsed >= 2*grace-100*time.Millisecond {
+		t.Fatalf("shutdownAll took %s, want within one shared %s budget, not one window per listener", elapsed, grace)
+	}
+
+	// Shutdown stops listeners and closes idle connections even when the
+	// shared budget expired before that listener's turn.
+	for _, ln := range []net.Listener{lnA, lnB, lnAdmin} {
+		if conn, err := net.DialTimeout("tcp", ln.Addr().String(), 200*time.Millisecond); err == nil {
+			conn.Close()
+			t.Fatalf("server %s still reachable after shutdownAll", ln.Addr())
+		}
+	}
+
+	releaseHandlers()
+	for range 2 {
+		select {
+		case <-results:
+		case <-time.After(5 * time.Second):
+			t.Fatal("client requests never finished after release")
 		}
 	}
 }
