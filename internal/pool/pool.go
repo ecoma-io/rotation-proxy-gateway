@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"math"
 	"net/url"
 	"strings"
 	"sync"
@@ -131,6 +132,9 @@ func (pl *Pool) Pick(exclude map[*Proxy]bool) *Proxy {
 				best = e
 			}
 		}
+		if best != nil {
+			best.markUsed(pl.nextSeq())
+		}
 		return best
 	}
 
@@ -149,9 +153,11 @@ func (pl *Pool) Pick(exclude map[*Proxy]bool) *Proxy {
 // It does not clear an authentication block: unchanged credentials cannot be
 // expected to recover without a pool reload that changes the route URL.
 func (pl *Pool) ReportSuccess(p *Proxy) {
-	seq := pl.nextSeq() // before p.mu: keep lock order pool -> proxy
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	seq := pl.nextSeq()
 	p.consecutiveFailures = 0
 	p.cooldownUntil = time.Time{}
 	p.lastDialError = ""
@@ -163,22 +169,48 @@ func (pl *Pool) ReportSuccess(p *Proxy) {
 // proxy into an exponentially growing cooldown: base doubled per consecutive
 // dial failure, capped at max. It returns the applied cooldown.
 func (pl *Pool) ReportFailure(p *Proxy, err error) time.Duration {
+	pl.mu.Lock()
+	base, max := pl.base, pl.max
+	pl.mu.Unlock()
 	now := pl.Now() // before p.mu: keep lock order pool -> proxy
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.consecutiveFailures++
 	p.failures++
-	shift := p.consecutiveFailures - 1
-	if shift > 16 {
-		shift = 16
-	}
-	cd := pl.base << uint(shift)
-	if cd > pl.max {
-		cd = pl.max
-	}
+	cd := saturatingCooldown(base, max, p.consecutiveFailures)
 	p.cooldownUntil = now.Add(cd)
 	if err != nil {
 		p.lastDialError = sanitize.ErrorString(err)
+	}
+	return cd
+}
+
+// saturatingCooldown returns base doubled (failures-1) times, capped at max.
+// It never overflows and never returns a negative duration, even when base or
+// max bypass Config validation (e.g. a direct pool.New caller).
+func saturatingCooldown(base, max time.Duration, failures int) time.Duration {
+	if base <= 0 || max <= 0 {
+		return 0
+	}
+	if base >= max {
+		return max
+	}
+	cd := base
+	shift := failures - 1
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 63 {
+		return max
+	}
+	for range shift {
+		if cd > max/2 {
+			return max
+		}
+		if cd > time.Duration(math.MaxInt64)/2 {
+			return max
+		}
+		cd *= 2
 	}
 	return cd
 }

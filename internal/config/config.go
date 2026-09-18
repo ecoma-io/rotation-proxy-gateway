@@ -89,6 +89,9 @@ func (c *Config) validate() error {
 	if c.CooldownMax <= 0 {
 		errs = append(errs, fmt.Errorf("COOLDOWN_MAX must be positive, got %s", c.CooldownMax))
 	}
+	if c.CooldownBase > 0 && c.CooldownMax > 0 && c.CooldownBase > c.CooldownMax {
+		errs = append(errs, fmt.Errorf("COOLDOWN_BASE %s must not exceed COOLDOWN_MAX %s", c.CooldownBase, c.CooldownMax))
+	}
 	if c.ConnectTimeout <= 0 {
 		errs = append(errs, fmt.Errorf("CONNECT_TIMEOUT must be positive, got %s", c.ConnectTimeout))
 	}
