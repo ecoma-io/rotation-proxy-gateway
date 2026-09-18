@@ -16,8 +16,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
-
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/proxyserver"
@@ -27,10 +25,7 @@ import (
 // version is overridden at build time via -ldflags "-X main.version=...".
 var version = "0.1.0-dev"
 
-const (
-	shutdownGrace  = 10 * time.Second
-	reloadDebounce = 250 * time.Millisecond
-)
+const shutdownGrace = 10 * time.Second
 
 func main() {
 	if len(os.Args) > 1 {
@@ -177,27 +172,17 @@ func run() error {
 		}
 	}()
 
-	watchEvents := make(chan fsnotify.Event, 1)
-	watcher, err := config.WatchRuntime(bootstrap.ConfigFile, func(event fsnotify.Event) {
-		select {
-		case watchEvents <- event:
-		default:
-		}
-	})
-	if err != nil {
-		shutdownAll(listeners, adminSrv)
-		return fmt.Errorf("watch runtime config: %w", err)
-	}
-	// Viper owns the fsnotify watcher. Keep the instance reachable for the
-	// process lifetime; its callback feeds the serialized loop below.
-	_ = watcher
+	watcher := newConfigWatcher(bootstrap.ConfigFile, configPollInterval, log)
+	watchCtx, cancelWatch := context.WithCancel(context.Background())
+	defer cancelWatch()
+	go watcher.Run(watchCtx, log)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 
-	// The watcher goroutine delivers debounced events to this loop, so reloads
-	// are already serialized; the source label only records how it was reached.
+	// Reloads from the poller arrive on one channel and are handled by this
+	// serialized loop; the source label only records how it was reached.
 	reload := func(source string) {
 		next, err := config.LoadRuntime(bootstrap.ConfigFile, bootstrap)
 		if err != nil {
@@ -222,26 +207,10 @@ func run() error {
 			log.Info("shutting down", "signal", sig.String())
 			shutdownAll(listeners, adminSrv)
 			return nil
-		case <-watchEvents:
-			// Editors and bind-mount updaters commonly emit several events for
-			// one atomic rewrite. Coalesce the burst before parsing the file.
-			timer := time.NewTimer(reloadDebounce)
-			draining := true
-			for draining {
-				select {
-				case <-watchEvents:
-					if !timer.Stop() {
-						select {
-						case <-timer.C:
-						default:
-						}
-					}
-					timer.Reset(reloadDebounce)
-				case <-timer.C:
-					draining = false
-				}
-			}
-			reload("watch")
+		case <-watcher.Changes():
+			// The poller hash-gates on applied content, so one signal means one
+			// distinct configuration; no debounce is needed.
+			reload("poll")
 		}
 	}
 }

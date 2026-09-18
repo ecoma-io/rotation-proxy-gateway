@@ -119,11 +119,11 @@ func TestE2E_TunnelSurvivesReload(t *testing.T) {
 	}
 
 	// Grow and shrink the pool while the tunnel stays open.
-	g.ReloadWatch(defaultGatewayConfig([]RouteConfig{
+	g.ReloadConfig(defaultGatewayConfig([]RouteConfig{
 		{Proxy: socksA.RouteValue(), Kind: "v4"},
 		{Proxy: socksB.RouteValue(), Kind: "v4"},
 	}), []string{socksA.Addr, socksB.Addr})
-	g.ReloadWatch(defaultGatewayConfig([]RouteConfig{
+	g.ReloadConfig(defaultGatewayConfig([]RouteConfig{
 		{Proxy: socksA.RouteValue(), Kind: "v4"},
 	}), []string{socksA.Addr})
 

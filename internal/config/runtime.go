@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/viper"
 )
 
@@ -364,16 +363,4 @@ func validateRouteEligibility(routes []RouteSpec, bootstrap *BootstrapConfig) er
 		return errors.New("mixed listener requires at least one route")
 	}
 	return nil
-}
-
-// WatchRuntime configures a Viper watcher for path. The callback must return
-// quickly; callers are responsible for debounce and serialized reload work.
-func WatchRuntime(path string, callback func(fsnotify.Event)) (*viper.Viper, error) {
-	v, err := newViper(path)
-	if err != nil {
-		return nil, err
-	}
-	v.OnConfigChange(callback)
-	v.WatchConfig()
-	return v, nil
 }

@@ -1,4 +1,3 @@
-config/*
-!config/config.example.yaml
+config.yaml
 bin/
 .claude/

@@ -1,9 +1,10 @@
 # Homelab deployment for rotation-proxy-gateway.
-# config/config.yaml is the Git-ignored credential-bearing runtime file.
-# Copy config.example.yaml into config/ first. The config directory is mounted
-# read-only instead of the single file: a single-file bind mount pins the
-# inode, so replacing the file on the host would be invisible to the watcher
-# and hot reload would never fire.
+# config.yaml is the Git-ignored credential-bearing runtime file at the repo
+# root; copy config.example.yaml to config.yaml first. Hot reload polls file
+# content, so editing config.yaml in place on the host applies without a
+# restart. One caveat of the single-file bind mount: replacing the file
+# atomically (mv, editor safe-save) splices in a new inode that the mount
+# never follows — edit in place, or restart the container after a replace.
 services:
   rpgw:
     build:
@@ -18,14 +19,14 @@ services:
       - "30120:30120" # admin: healthz and status
     environment:
       # Bootstrap-only settings: changes require a container restart.
-      CONFIG_FILE: /app/config/config.yaml
+      CONFIG_FILE: /app/config.yaml
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
     volumes:
-      - ./config:/app/config:ro
+      - ./config.yaml:/app/config.yaml:ro
     healthcheck:
       test: ["CMD", "/app/rotation-proxy-gateway", "healthcheck"]
       interval: 30s

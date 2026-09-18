@@ -6,8 +6,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/fsnotify/fsnotify"
 )
 
 func runtimeBootstrap(t *testing.T) *BootstrapConfig {
@@ -273,26 +271,3 @@ func TestValidListenerHostname(t *testing.T) {
 // The atomic generation store lives in internal/pool (which already imports
 // this package); its nil-rejection, publication, and in-flight snapshot
 // behavior is covered by internal/pool/generation_test.go.
-
-func TestWatchRuntimeReportsFileChange(t *testing.T) {
-	path := writeRuntimeConfig(t, validRuntimeConfig)
-	events := make(chan struct{}, 1)
-	watcher, err := WatchRuntime(path, func(_ fsnotify.Event) {
-		select {
-		case events <- struct{}{}:
-		default:
-		}
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = watcher // Its lifetime must cover the write below.
-	if err := os.WriteFile(path, []byte(strings.Replace(validRuntimeConfig, "max-retries: 4", "max-retries: 5", 1)), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-events:
-	case <-time.After(2 * time.Second):
-		t.Fatal("runtime watcher did not report a file change")
-	}
-}

@@ -1,8 +1,8 @@
 # Runtime configuration for rotation-proxy-gateway.
-# The process watches this file's directory (Viper/fsnotify) and hot-reloads
-# validated changes. Copy it to config.yaml, replace the example routes, then
-# start the service. config.yaml is intentionally ignored because it normally
-# contains credentials.
+# The process polls this file each second and hot-reloads validated changes
+# when its content hash changes. Copy it to config.yaml, replace the example
+# routes, then start the service. config.yaml is intentionally ignored because
+# it normally contains credentials.
 #
 # `kind` is the public egress IP family guaranteed by the proxy provider. It
 # does not describe the SOCKS endpoint address family or restrict targets. A
@@ -53,7 +53,7 @@ proxies:
       api:        
         url: http://provider.example/api/rotate-ip
         method: POST
-        hearers:
+        headers:
           - Content-Type: application/json
         body: |
           {

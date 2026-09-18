@@ -179,7 +179,7 @@ func NewGateway(t testing.TB, cfg GatewayConfig) *Gateway {
 }
 
 // writeConfig atomically replaces the config file (temp + rename) so the
-// watcher never parses a partial write.
+// gateway's poller never reads a partial write.
 func (g *Gateway) writeConfig(cfg GatewayConfig) {
 	g.t.Helper()
 	tmp := filepath.Join(g.dir, "config.yaml.tmp")
@@ -223,26 +223,26 @@ func (g *Gateway) waitHealthy(timeout time.Duration) {
 	g.t.Fatalf("gateway never became healthy; output:\n%s", g.output.String())
 }
 
-// ReloadWatch rewrites the config file (atomic tmp+rename, modeling an editor
-// or bind-mount update) and relies on the gateway's fsnotify watcher plus its
-// 250ms debounce to apply it. It fails when /status does not report exactly
-// wantProxies within the debounce window.
-func (g *Gateway) ReloadWatch(cfg GatewayConfig, wantProxies []string) {
+// ReloadConfig rewrites the config file (atomic tmp+rename, modeling an editor
+// or bind-mount update) and relies on the gateway's content-hash config poller
+// to apply it. It fails when /status does not report exactly wantProxies
+// within one poll cycle.
+func (g *Gateway) ReloadConfig(cfg GatewayConfig, wantProxies []string) {
 	g.t.Helper()
 	g.writeConfig(cfg)
 	g.WaitForPool(wantProxies, reloadSettle)
 }
 
-// ReloadWatchRaw installs literal content and returns without waiting: callers
+// ReloadConfigRaw installs literal content and returns without waiting: callers
 // assert either that the pool stays unchanged (invalid input) or that a warn
 // line appeared in the logs.
-func (g *Gateway) ReloadWatchRaw(content string) {
+func (g *Gateway) ReloadConfigRaw(content string) {
 	g.t.Helper()
 	g.WriteRaw(content)
 }
 
-// reloadSettle bounds one watch cycle: fsnotify latency plus the gateway's
-// 250ms reload debounce, with comfortable headroom for slow CI machines.
+// reloadSettle bounds one poll cycle: the gateway's 1s content-hash poll
+// interval plus reload work, with comfortable headroom for slow CI machines.
 const reloadSettle = 6 * time.Second
 
 // WaitForPool polls /status until the pool reports exactly want in order.
