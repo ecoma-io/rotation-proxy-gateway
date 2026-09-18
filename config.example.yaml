@@ -26,6 +26,33 @@ cooldown:
 # Timeout covering SOCKS endpoint TCP dialing and SOCKS setup.
 dial-timeout: 10s
 
+# Manual-route rotation knobs. Every value below is also the default.
+rotation:
+  # How many rotations may run at once: a fixed count (1) or a percent of the
+  # manual pool ("25%", rounds up, minimum 1, never above the pool size).
+  # Rotating takes a route offline briefly, so this bounds how much of the
+  # pool can be unavailable at the same moment.
+  max-concurrent: 1
+  # How long to wait for a rotating route's in-flight requests and tunnels to
+  # finish before rotating anyway. Independent of the SHUTDOWN_GRACE
+  # environment variable.
+  drain-timeout: 55s
+  # Rotate every manual route once at process start (max-concurrent still
+  # applies). Off by default: startup only probes and records the current
+  # egress IP of each manual route.
+  rotate-on-start: false
+  # IP verification. A rotation counts as successful only when the egress IP
+  # observed through this endpoint actually changed. Must be https; the
+  # response is parsed as key=value lines containing an ip= entry.
+  ip-check-url: https://www.cloudflare.com/cdn-cgi/trace
+  # Total window to observe the changed IP after calling the rotate API...
+  ip-check-timeout: 20s
+  # ...probing at this cadence.
+  ip-check-interval: 2s
+  # Ceiling for the retry backoff after a rotation that did not change the
+  # egress IP. Retries never stop; they only slow down to this limit.
+  retry-backoff-max: 15m
+
 global:
   # Skip HTTPS target certificate verification through SOCKS. The secure default
   # is false; never enable this for untrusted targets.
@@ -44,19 +71,27 @@ proxies:
     - proxy: socks5://username:password@[2001:db8::1]:1080
       kind: v6
 
-  # Reserved for phase 2 API-driven rotation. It is accepted but ignored in
-  # phase 1: no route is added and no API request is performed.
-  manual: 
+  # API-rotated routes. The provider swaps the route's public egress IP when
+  # the rotate API is called; the gateway drives that call every
+  # rotate-interval, drains the route first, and verifies the IP actually
+  # changed afterwards.
+  manual:
     - proxy: socks5://username:password@v6-provider.example:1080
-      kind: v6     
-      interval: 90 
-      api:        
+      kind: v6
+      # Minimum time between two rotations of this route. It is also the
+      # first backoff step when a rotation did not change the IP.
+      rotate-interval: 90s
+      # The provider call that performs the rotation. headers and body may
+      # carry provider credentials: they are never logged and never appear
+      # in errors or /status.
+      api:
         url: http://provider.example/api/rotate-ip
         method: POST
         headers:
-          - Content-Type: application/json
+          Content-Type: application/json
         body: |
           {
             "proxy_id": 1,
             "token": "xxxx"
           }
+        timeout: 10s

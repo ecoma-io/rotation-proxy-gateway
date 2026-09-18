@@ -4,8 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +25,16 @@ const (
 	// every enabled proxy listener plus the admin listener. 55s fits under a
 	// 60s docker stop_grace_period and a 90s systemd TimeoutStopSec.
 	DefaultShutdownGrace = 55 * time.Second
+
+	// Rotation defaults. These bound how manual routes rotate their egress IP
+	// through their provider API; every one is overridable in the rotation
+	// block of the runtime YAML.
+	DefaultDrainTimeout     = 55 * time.Second
+	DefaultIPCheckURL       = "https://www.cloudflare.com/cdn-cgi/trace"
+	DefaultIPCheckTimeout   = 20 * time.Second
+	DefaultIPCheckInterval  = 2 * time.Second
+	DefaultRetryBackoffMax  = 15 * time.Minute
+	DefaultRotateAPITimeout = 10 * time.Second
 )
 
 // EgressKind is the public IP family supplied by an upstream proxy provider.
@@ -34,10 +47,91 @@ const (
 	EgressV6 EgressKind = "v6"
 )
 
+// RouteOrigin records whether a route came from proxies.auto (static) or
+// proxies.manual (API-rotated). Both origins serve client traffic through the
+// same shared pool; the origin only drives rotation bookkeeping.
+type RouteOrigin string
+
+const (
+	RouteOriginAuto   RouteOrigin = "auto"
+	RouteOriginManual RouteOrigin = "manual"
+)
+
 // RouteSpec is one validated static SOCKS route from the runtime config.
 type RouteSpec struct {
-	URL  *url.URL
-	Kind EgressKind
+	URL    *url.URL
+	Kind   EgressKind
+	Origin RouteOrigin
+}
+
+// ManualRouteSpec is one validated API-rotated SOCKS route. Besides the SOCKS
+// endpoint it carries the provider rotation cadence and the HTTP call that
+// swaps the route's public egress IP.
+type ManualRouteSpec struct {
+	RouteSpec
+	RotateInterval time.Duration
+	API            RotateAPI
+}
+
+// RotateAPI describes the provider HTTP request that rotates a manual route's
+// egress IP. Headers and body may carry provider credentials: they are never
+// logged, never returned in errors, and never exposed by /status.
+type RotateAPI struct {
+	URL     *url.URL
+	Method  string
+	Headers map[string]string
+	Body    string
+	Timeout time.Duration
+}
+
+// RotationSettings holds the global knobs for manual-route rotation.
+// MaxConcurrentFixed and MaxConcurrentPercent are mutually exclusive; resolve
+// the effective cap per cycle with ResolveMaxConcurrent so reloads that change
+// the manual route count take effect without restart.
+type RotationSettings struct {
+	MaxConcurrentFixed   *int
+	MaxConcurrentPercent *int
+	DrainTimeout         time.Duration
+	RotateOnStart        bool
+	IPCheckURL           string
+	IPCheckTimeout       time.Duration
+	IPCheckInterval      time.Duration
+	RetryBackoffMax      time.Duration
+}
+
+// ResolveMaxConcurrent returns the effective rotation concurrency for n manual
+// routes: fixed counts pass through, percents round up, the result is at least
+// 1 and at most n. It returns 0 when there is nothing to rotate.
+func (r RotationSettings) ResolveMaxConcurrent(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	limit := 1
+	switch {
+	case r.MaxConcurrentFixed != nil:
+		limit = *r.MaxConcurrentFixed
+	case r.MaxConcurrentPercent != nil:
+		limit = (n**r.MaxConcurrentPercent + 99) / 100
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > n {
+		limit = n
+	}
+	return limit
+}
+
+// AllRoutes returns every serving route, auto first. The pool and the rotation
+// engine both key state by canonical URL+kind, so ordering only affects
+// duplicate reporting and new-entry construction.
+func (c *RuntimeConfig) AllRoutes() []RouteSpec {
+	all := make([]RouteSpec, 0, len(c.Routes)+len(c.ManualRoutes))
+	all = append(all, c.Routes...)
+	for _, manual := range c.ManualRoutes {
+		all = append(all, manual.RouteSpec)
+	}
+	return all
 }
 
 // BootstrapConfig contains process-level settings. They are intentionally read
@@ -65,6 +159,8 @@ type RuntimeConfig struct {
 	MaxBodyBuffer     int64
 	LogLevel          string
 	Routes            []RouteSpec
+	ManualRoutes      []ManualRouteSpec
+	Rotation          RotationSettings
 }
 
 type fileConfig struct {
@@ -72,6 +168,7 @@ type fileConfig struct {
 	MaxRetries  int                `mapstructure:"max-retries"`
 	Cooldown    cooldownFileConfig `mapstructure:"cooldown"`
 	DialTimeout string             `mapstructure:"dial-timeout"`
+	Rotation    rotationFileConfig `mapstructure:"rotation"`
 	Global      globalFileConfig   `mapstructure:"global"`
 	Proxies     proxiesFileConfig  `mapstructure:"proxies"`
 }
@@ -86,14 +183,39 @@ type globalFileConfig struct {
 	MaxBodyBuffer     int64 `mapstructure:"max-body-buffer"`
 }
 
+type rotationFileConfig struct {
+	MaxConcurrent   any    `mapstructure:"max-concurrent"`
+	DrainTimeout    string `mapstructure:"drain-timeout"`
+	RotateOnStart   *bool  `mapstructure:"rotate-on-start"`
+	IPCheckURL      string `mapstructure:"ip-check-url"`
+	IPCheckTimeout  string `mapstructure:"ip-check-timeout"`
+	IPCheckInterval string `mapstructure:"ip-check-interval"`
+	RetryBackoffMax string `mapstructure:"retry-backoff-max"`
+}
+
 type proxiesFileConfig struct {
-	Auto   []autoProxyFileConfig `mapstructure:"auto"`
-	Manual any                   `mapstructure:"manual"`
+	Auto   []autoProxyFileConfig   `mapstructure:"auto"`
+	Manual []manualProxyFileConfig `mapstructure:"manual"`
 }
 
 type autoProxyFileConfig struct {
 	Proxy string `mapstructure:"proxy"`
 	Kind  string `mapstructure:"kind"`
+}
+
+type manualProxyFileConfig struct {
+	Proxy          string        `mapstructure:"proxy"`
+	Kind           string        `mapstructure:"kind"`
+	RotateInterval string        `mapstructure:"rotate-interval"`
+	API            apiFileConfig `mapstructure:"api"`
+}
+
+type apiFileConfig struct {
+	URL     string            `mapstructure:"url"`
+	Method  string            `mapstructure:"method"`
+	Headers map[string]string `mapstructure:"headers"`
+	Body    string            `mapstructure:"body"`
+	Timeout string            `mapstructure:"timeout"`
 }
 
 // LoadBootstrap applies bootstrap defaults and explicit environment overrides.
@@ -239,7 +361,7 @@ func LoadRuntime(path string, bootstrap *BootstrapConfig) (*RuntimeConfig, error
 		return nil, err
 	}
 	if bootstrap != nil {
-		if err := validateRouteEligibility(cfg.Routes, bootstrap); err != nil {
+		if err := validateRouteEligibility(cfg, bootstrap); err != nil {
 			return nil, err
 		}
 	}
@@ -277,6 +399,11 @@ func runtimeFromFile(raw fileConfig) (*RuntimeConfig, error) {
 		return nil, err
 	}
 
+	rotation, err := parseRotationSettings(raw.Rotation)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &RuntimeConfig{
 		MaxRetries:        raw.MaxRetries,
 		CooldownBase:      base,
@@ -285,6 +412,7 @@ func runtimeFromFile(raw fileConfig) (*RuntimeConfig, error) {
 		TargetTLSInsecure: raw.Global.TargetTLSInsecure,
 		MaxBodyBuffer:     raw.Global.MaxBodyBuffer,
 		LogLevel:          raw.LogLevel,
+		Rotation:          rotation,
 	}
 	for i, route := range raw.Proxies.Auto {
 		spec, err := parseRouteSpec(route)
@@ -293,10 +421,129 @@ func runtimeFromFile(raw fileConfig) (*RuntimeConfig, error) {
 		}
 		cfg.Routes = append(cfg.Routes, spec)
 	}
+	for i, route := range raw.Proxies.Manual {
+		spec, err := parseManualRouteSpec(route)
+		if err != nil {
+			return nil, fmt.Errorf("proxies.manual[%d]: %w", i, err)
+		}
+		cfg.ManualRoutes = append(cfg.ManualRoutes, spec)
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// parseRotationSettings applies defaults, then validates the overrides. Values
+// that fail duration parsing are reported without echoing the raw input, which
+// may be a typo of a secret in a shared config file.
+func parseRotationSettings(raw rotationFileConfig) (RotationSettings, error) {
+	settings := RotationSettings{
+		DrainTimeout:    DefaultDrainTimeout,
+		IPCheckURL:      DefaultIPCheckURL,
+		IPCheckTimeout:  DefaultIPCheckTimeout,
+		IPCheckInterval: DefaultIPCheckInterval,
+		RetryBackoffMax: DefaultRetryBackoffMax,
+	}
+	fixed, percent, err := parseMaxConcurrent(raw.MaxConcurrent)
+	if err != nil {
+		return settings, err
+	}
+	settings.MaxConcurrentFixed, settings.MaxConcurrentPercent = fixed, percent
+	if raw.RotateOnStart != nil {
+		settings.RotateOnStart = *raw.RotateOnStart
+	}
+	if raw.DrainTimeout != "" {
+		d, err := parseRuntimeDuration("rotation.drain-timeout", raw.DrainTimeout)
+		if err != nil {
+			return settings, err
+		}
+		settings.DrainTimeout = d
+	}
+	if raw.IPCheckTimeout != "" {
+		d, err := parseRuntimeDuration("rotation.ip-check-timeout", raw.IPCheckTimeout)
+		if err != nil {
+			return settings, err
+		}
+		settings.IPCheckTimeout = d
+	}
+	if raw.IPCheckInterval != "" {
+		d, err := parseRuntimeDuration("rotation.ip-check-interval", raw.IPCheckInterval)
+		if err != nil {
+			return settings, err
+		}
+		settings.IPCheckInterval = d
+	}
+	if raw.RetryBackoffMax != "" {
+		d, err := parseRuntimeDuration("rotation.retry-backoff-max", raw.RetryBackoffMax)
+		if err != nil {
+			return settings, err
+		}
+		settings.RetryBackoffMax = d
+	}
+	if raw.IPCheckURL != "" {
+		settings.IPCheckURL = raw.IPCheckURL
+	}
+	if err := settings.validate(); err != nil {
+		return settings, err
+	}
+	return settings, nil
+}
+
+func (r RotationSettings) validate() error {
+	var errs []error
+	u, err := url.Parse(r.IPCheckURL)
+	switch {
+	case err != nil || !u.IsAbs():
+		errs = append(errs, errors.New("rotation.ip-check-url must be an absolute URL"))
+	case u.Scheme != "https":
+		// The verification answer must resist tampering by the very network
+		// path under test, so plaintext check endpoints are rejected outright.
+		errs = append(errs, errors.New("rotation.ip-check-url must use https"))
+	}
+	if r.DrainTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("rotation.drain-timeout must be positive, got %s", r.DrainTimeout))
+	}
+	if r.IPCheckTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("rotation.ip-check-timeout must be positive, got %s", r.IPCheckTimeout))
+	}
+	if r.IPCheckInterval <= 0 {
+		errs = append(errs, fmt.Errorf("rotation.ip-check-interval must be positive, got %s", r.IPCheckInterval))
+	}
+	if r.IPCheckInterval > r.IPCheckTimeout {
+		errs = append(errs, fmt.Errorf("rotation.ip-check-interval %s must not exceed rotation.ip-check-timeout %s", r.IPCheckInterval, r.IPCheckTimeout))
+	}
+	if r.RetryBackoffMax <= 0 {
+		errs = append(errs, fmt.Errorf("rotation.retry-backoff-max must be positive, got %s", r.RetryBackoffMax))
+	}
+	return errors.Join(errs...)
+}
+
+// parseMaxConcurrent accepts a fixed count (1) or a percent of the manual pool
+// ("25%"). Exactly one representation is returned.
+func parseMaxConcurrent(raw any) (*int, *int, error) {
+	switch v := raw.(type) {
+	case nil:
+		fixed := 1
+		return &fixed, nil, nil
+	case int:
+		if v < 1 {
+			return nil, nil, fmt.Errorf("rotation.max-concurrent must be >= 1, got %d", v)
+		}
+		return &v, nil, nil
+	case string:
+		digits, found := strings.CutSuffix(strings.TrimSpace(v), "%")
+		if !found {
+			return nil, nil, errors.New("rotation.max-concurrent must be a count or a percent such as 25%")
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(digits))
+		if err != nil || n < 1 || n > 100 {
+			return nil, nil, errors.New("rotation.max-concurrent percent must be a whole number between 1 and 100")
+		}
+		return nil, &n, nil
+	default:
+		return nil, nil, errors.New("rotation.max-concurrent must be a count or a percent such as 25%")
+	}
 }
 
 func parseRuntimeDuration(name, value string) (time.Duration, error) {
@@ -308,18 +555,153 @@ func parseRuntimeDuration(name, value string) (time.Duration, error) {
 }
 
 func parseRouteSpec(raw autoProxyFileConfig) (RouteSpec, error) {
-	kind := EgressKind(raw.Kind)
-	if kind != EgressV4 && kind != EgressV6 {
+	spec, err := parseKindedProxy(raw.Proxy, raw.Kind)
+	if err != nil {
+		return RouteSpec{}, err
+	}
+	spec.Origin = RouteOriginAuto
+	return spec, nil
+}
+
+// parseManualRouteSpec validates one manual entry: the same SOCKS endpoint
+// rules as auto routes plus a mandatory rotation cadence and rotate API.
+func parseManualRouteSpec(raw manualProxyFileConfig) (ManualRouteSpec, error) {
+	spec, err := parseKindedProxy(raw.Proxy, raw.Kind)
+	if err != nil {
+		return ManualRouteSpec{}, err
+	}
+	manual := ManualRouteSpec{RouteSpec: spec}
+	manual.Origin = RouteOriginManual
+	if raw.RotateInterval == "" {
+		return ManualRouteSpec{}, errors.New("rotate-interval is required (Go duration, e.g. 90s)")
+	}
+	interval, err := parseRuntimeDuration("rotate-interval", raw.RotateInterval)
+	if err != nil {
+		return ManualRouteSpec{}, err
+	}
+	if interval <= 0 {
+		return ManualRouteSpec{}, fmt.Errorf("rotate-interval must be positive, got %s", interval)
+	}
+	manual.RotateInterval = interval
+	api, err := parseRotateAPI(raw.API)
+	if err != nil {
+		return ManualRouteSpec{}, err
+	}
+	manual.API = api
+	return manual, nil
+}
+
+// parseRotateAPI validates the provider rotate call. Error messages name the
+// offending field but never quote url/headers/body values: those routinely
+// carry provider tokens.
+func parseRotateAPI(raw apiFileConfig) (RotateAPI, error) {
+	if raw.URL == "" {
+		return RotateAPI{}, errors.New("api.url is required")
+	}
+	u, err := url.Parse(raw.URL)
+	if err != nil || !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") {
+		return RotateAPI{}, errors.New("api.url must be an absolute http or https URL")
+	}
+	method := http.MethodPost
+	if raw.Method != "" {
+		method = strings.ToUpper(raw.Method)
+		if !validHTTPMethod(method) {
+			return RotateAPI{}, errors.New("api.method must be a valid HTTP method token")
+		}
+	}
+	timeout := DefaultRotateAPITimeout
+	if raw.Timeout != "" {
+		timeout, err = parseRuntimeDuration("api.timeout", raw.Timeout)
+		if err != nil {
+			return RotateAPI{}, err
+		}
+		if timeout <= 0 {
+			return RotateAPI{}, fmt.Errorf("api.timeout must be positive, got %s", timeout)
+		}
+	}
+	headers := make(map[string]string, len(raw.Headers))
+	for name, value := range raw.Headers {
+		// Viper lowercases YAML keys; MIME-canonicalize so `content-type`
+		// behaves like the `Content-Type` the user wrote.
+		canonical := textproto.CanonicalMIMEHeaderKey(name)
+		if !validHeaderFieldName(canonical) {
+			return RotateAPI{}, errors.New("api.headers contains an invalid header name")
+		}
+		if !validHeaderFieldValue(value) {
+			return RotateAPI{}, errors.New("api.headers contains an invalid header value")
+		}
+		headers[canonical] = value
+	}
+	return RotateAPI{URL: u, Method: method, Headers: headers, Body: raw.Body, Timeout: timeout}, nil
+}
+
+// validHeaderFieldName checks the RFC 9110 token shape used for header field
+// names.
+func validHeaderFieldName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'A' && r <= 'Z':
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case strings.ContainsRune("!#$%&'*+-.^_`|~", r):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validHeaderFieldValue checks the RFC 9110 field-value shape: visible ASCII
+// plus SP and HTAB, with no control characters.
+func validHeaderFieldValue(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		switch {
+		case r == '\t' || r == ' ':
+		case r >= 0x21 && r <= 0x7e:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validHTTPMethod checks the RFC 9110 token shape after canonical uppercasing.
+func validHTTPMethod(method string) bool {
+	if method == "" || len(method) > 32 {
+		return false
+	}
+	for _, r := range method {
+		switch {
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case strings.ContainsRune("!#$%&'*+-.^_`|~", r):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// parseKindedProxy is the shared proxy+kind validation for both route origins.
+func parseKindedProxy(proxy, kind string) (RouteSpec, error) {
+	parsed := EgressKind(kind)
+	if parsed != EgressV4 && parsed != EgressV6 {
 		return RouteSpec{}, fmt.Errorf("kind must be exactly v4 or v6")
 	}
-	u, err := parseProxyLine(raw.Proxy)
+	u, err := parseProxyLine(proxy)
 	if err != nil {
 		return RouteSpec{}, err
 	}
 	if err := validateProxyURL(u); err != nil {
 		return RouteSpec{}, err
 	}
-	return RouteSpec{URL: u, Kind: kind}, nil
+	return RouteSpec{URL: u, Kind: parsed}, nil
 }
 
 func validateProxyURL(u *url.URL) error {
@@ -361,14 +743,17 @@ func (c *RuntimeConfig) validate() error {
 	default:
 		errs = append(errs, fmt.Errorf("log-level must be one of debug, info, warn, error, got %q", c.LogLevel))
 	}
-	if len(c.Routes) == 0 {
-		errs = append(errs, errors.New("proxies.auto must contain at least one route"))
+	if len(c.Routes) == 0 && len(c.ManualRoutes) == 0 {
+		errs = append(errs, errors.New("proxies must contain at least one route (auto or manual)"))
 	}
-	seen := make(map[string]struct{}, len(c.Routes))
-	for _, route := range c.Routes {
+	// One identity namespace across both origins: a route reachable through
+	// two entries would be selectable twice per request and hold two rotation
+	// states for one endpoint.
+	seen := make(map[string]struct{}, len(c.Routes)+len(c.ManualRoutes))
+	for _, route := range c.AllRoutes() {
 		id := CanonicalRouteID(route.URL)
 		if _, duplicate := seen[id]; duplicate {
-			errs = append(errs, errors.New("proxies.auto contains a duplicate route"))
+			errs = append(errs, errors.New("proxies contains a duplicate route"))
 		}
 		seen[id] = struct{}{}
 	}
@@ -378,8 +763,8 @@ func (c *RuntimeConfig) validate() error {
 // validateRouteEligibility retains the mixed-listener invariant. Dedicated
 // listeners intentionally may have no matching route: they remain available and
 // return the standard no-route 502 without crossing into the other kind.
-func validateRouteEligibility(routes []RouteSpec, bootstrap *BootstrapConfig) error {
-	if bootstrap.MixedListenAddr != "" && len(routes) == 0 {
+func validateRouteEligibility(cfg *RuntimeConfig, bootstrap *BootstrapConfig) error {
+	if bootstrap.MixedListenAddr != "" && len(cfg.Routes) == 0 && len(cfg.ManualRoutes) == 0 {
 		return errors.New("mixed listener requires at least one route")
 	}
 	return nil
