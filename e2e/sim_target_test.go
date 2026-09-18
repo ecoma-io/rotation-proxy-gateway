@@ -18,7 +18,7 @@ type TargetSim struct {
 }
 
 // NewEchoTarget serves 200 with body "e2e-echo:<path>" for plain HTTP tests.
-func NewEchoTarget(t *testing.T) *TargetSim {
+func NewEchoTarget(t testing.TB) *TargetSim {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "e2e-echo:%s", r.URL.Path)
@@ -30,7 +30,7 @@ func NewEchoTarget(t *testing.T) *TargetSim {
 // NewStatusTarget serves a fixed status/body pair, including 407/429/5xx
 // passthrough cases. It also sets a Proxy-Authorization response header that
 // the gateway must strip before reaching the client.
-func NewStatusTarget(t *testing.T, status int, body string) *TargetSim {
+func NewStatusTarget(t testing.TB, status int, body string) *TargetSim {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Proxy-Authorization", "must-not-reach-client")
@@ -42,7 +42,7 @@ func NewStatusTarget(t *testing.T, status int, body string) *TargetSim {
 }
 
 // NewTLSEchoTarget serves an echo body over TLS for CONNECT-tunnel tests.
-func NewTLSEchoTarget(t *testing.T) *TargetSim {
+func NewTLSEchoTarget(t testing.TB) *TargetSim {
 	t.Helper()
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "e2e-tls-echo")
@@ -52,7 +52,7 @@ func NewTLSEchoTarget(t *testing.T) *TargetSim {
 }
 
 // NewHeaderCaptureTarget records the headers the gateway forwards upstream.
-func NewHeaderCaptureTarget(t *testing.T, seen chan<- http.Header) *TargetSim {
+func NewHeaderCaptureTarget(t testing.TB, seen chan<- http.Header) *TargetSim {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen <- r.Header.Clone()
@@ -68,7 +68,7 @@ func fromServer(srv *httptest.Server) *TargetSim {
 }
 
 // BulkBodyTarget serves a fixed-size body for benchmark downloads.
-func NewBulkBodyTarget(t *testing.T, size int) *TargetSim {
+func NewBulkBodyTarget(t testing.TB, size int) *TargetSim {
 	t.Helper()
 	payload := make([]byte, size)
 	for i := range payload {
@@ -81,4 +81,21 @@ func NewBulkBodyTarget(t *testing.T, size int) *TargetSim {
 	t.Cleanup(srv.Close)
 	s := fromServer(srv)
 	return s
+}
+
+// NewEchoBodyTarget reads the whole request body and echoes it back; sized
+// POST benchmarks use it to measure the full round trip.
+func NewEchoBodyTarget(t testing.TB) *TargetSim {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(len(b)))
+		_, _ = w.Write(b)
+	}))
+	t.Cleanup(srv.Close)
+	return fromServer(srv)
 }

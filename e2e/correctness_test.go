@@ -1,6 +1,7 @@
 package e2e_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -33,6 +34,131 @@ func deadRouteValue(t *testing.T) string {
 	addr := ln.Addr().String()
 	ln.Close()
 	return "socks5://" + addr
+}
+
+// postVia sends a POST with the given payload through a gateway listener and
+// returns the status plus the echoed body.
+func postVia(t *testing.T, client *http.Client, targetURL string, payload []byte) (int, []byte) {
+	t.Helper()
+	resp, err := client.Post(targetURL+"/body", "application/octet-stream", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, body
+}
+
+// Bodies at or under max-body-buffer are buffered and therefore replayable:
+// a dial or auth fallback must still deliver the whole request body.
+func TestE2E_POSTReplayAfterDialFallback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	good := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoBodyTarget(t)
+	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
+		{Proxy: deadRouteValue(t), Kind: "v4"},
+		{Proxy: good.RouteValue(), Kind: "v4"},
+	}))
+
+	payload := bytes.Repeat([]byte("b"), 1024) // buffered: far under the 64MiB cap
+	status, body := postVia(t, ProxyClient(g.MixedAddr), target.URL, payload)
+	if status != http.StatusOK || !bytes.Equal(body, payload) {
+		t.Fatalf("status=%d len(body)=%d, want 200 with the full payload replayed", status, len(body))
+	}
+
+	g.WaitForCondition(5*time.Second, "POST dial fallback recorded", func(st *Status) bool {
+		return len(st.Pool) == 2 && st.Pool[0].Failures == 1 && st.Pool[1].Successes == 1
+	})
+}
+
+func TestE2E_POSTReplayAfterAuthFallback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	bad := NewSocksSim(t, SocksAuthRequired, "e2e-user", "e2e-pass")
+	good := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoBodyTarget(t)
+	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
+		{Proxy: "socks5://wrong-user:wrong-pass@" + bad.Addr, Kind: "v4"},
+		{Proxy: good.RouteValue(), Kind: "v4"},
+	}))
+
+	payload := bytes.Repeat([]byte("a"), 2048)
+	status, body := postVia(t, ProxyClient(g.MixedAddr), target.URL, payload)
+	if status != http.StatusOK || !bytes.Equal(body, payload) {
+		t.Fatalf("status=%d len(body)=%d, want 200 with the full payload replayed", status, len(body))
+	}
+
+	st := g.WaitForCondition(5*time.Second, "POST auth fallback recorded", func(st *Status) bool {
+		return len(st.Pool) == 2 && st.Pool[0].AuthBlocked && st.Pool[0].AuthFailures == 1 && st.Pool[1].Successes == 1
+	})
+	if st.Pool[0].Failures != 0 || st.Pool[0].CooldownFor != "0s" {
+		t.Fatalf("auth fallback created dial health damage: %+v", st.Pool[0])
+	}
+}
+
+// A body known larger than max-body-buffer streams immediately. A setup
+// failure is terminal: no fallback, the second route is never dialed.
+func TestE2E_LargePOSTSetupFailureDoesNotRetry(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	reject := NewSocksSim(t, SocksRejectTarget, "", "")
+	good := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoBodyTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{
+		{Proxy: reject.RouteValue(), Kind: "v4"},
+		{Proxy: good.RouteValue(), Kind: "v4"},
+	})
+	cfg.MaxBodyBuffer = 1024 // 4KiB payload is known-large: streams immediately
+	g := NewGateway(t, cfg)
+
+	payload := bytes.Repeat([]byte("s"), 4096)
+	status, body := postVia(t, ProxyClient(g.MixedAddr), target.URL, payload)
+	if status != http.StatusBadGateway || string(body) != "upstream SOCKS setup failed\n" {
+		t.Fatalf("status=%d body=%q, want sanitized 502", status, body)
+	}
+	if got := good.Hits.Load(); got != 0 {
+		t.Fatalf("fallback dialed the good route %d times after a setup failure", got)
+	}
+	st, err := g.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Pool[0].Available || st.Pool[0].Failures != 0 || st.Pool[0].Successes != 0 {
+		t.Fatalf("setup failure changed health: %+v", st.Pool[0])
+	}
+	if st.Pool[1].Successes != 0 {
+		t.Fatalf("good route recorded activity: %+v", st.Pool[1])
+	}
+}
+
+// A streamed body that fails before the route is dialed must be replayed in
+// full on the fallback: the echo proves no bytes were consumed.
+func TestE2E_LargePOSTDialFailureRetriesWithFullBody(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	good := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoBodyTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{
+		{Proxy: deadRouteValue(t), Kind: "v4"},
+		{Proxy: good.RouteValue(), Kind: "v4"},
+	})
+	cfg.MaxBodyBuffer = 1024 // 4KiB payload streams; ContentLength is known
+	g := NewGateway(t, cfg)
+
+	payload := bytes.Repeat([]byte("d"), 4096)
+	status, body := postVia(t, ProxyClient(g.MixedAddr), target.URL, payload)
+	if status != http.StatusOK || !bytes.Equal(body, payload) {
+		t.Fatalf("status=%d len(body)=%d, want 200 with all 4096 bytes echoed", status, len(body))
+	}
+
+	g.WaitForCondition(5*time.Second, "streamed dial fallback recorded", func(st *Status) bool {
+		return len(st.Pool) == 2 && st.Pool[0].Failures == 1 && st.Pool[1].Successes == 1
+	})
 }
 
 func TestE2E_MixedV4ForwardHTTP(t *testing.T) {

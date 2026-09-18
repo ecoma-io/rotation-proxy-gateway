@@ -37,7 +37,7 @@ type SocksSim struct {
 }
 
 // NewSocksSim starts the simulator on 127.0.0.1:0.
-func NewSocksSim(t *testing.T, mode SocksMode, user, pass string) *SocksSim {
+func NewSocksSim(t testing.TB, mode SocksMode, user, pass string) *SocksSim {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

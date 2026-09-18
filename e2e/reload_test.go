@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,7 +18,7 @@ func proxyAddrs(st *Status) []string {
 	return out
 }
 
-func TestE2E_ReloadAddsRoute(t *testing.T) {
+func TestE2E_WatchReloadAddsRoute(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
@@ -32,7 +31,8 @@ func TestE2E_ReloadAddsRoute(t *testing.T) {
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
 
 	cfg.Routes = append(cfg.Routes, RouteConfig{Proxy: second.RouteValue(), Kind: "v6"})
-	g.SignalReload(cfg, []string{first.Addr, second.Addr})
+	g.ReloadWatch(cfg, []string{first.Addr, second.Addr})
+	waitForLog(t, g, `source=watch`, reloadSettle)
 
 	// Both families now serve through their dedicated listeners.
 	GetVia(t, ProxyClient(g.V4Addr), target.URL+"/", "e2e-echo:/")
@@ -40,7 +40,7 @@ func TestE2E_ReloadAddsRoute(t *testing.T) {
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
 }
 
-func TestE2E_ReloadRemovesRoute(t *testing.T) {
+func TestE2E_WatchReloadRemovesRoute(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
@@ -57,7 +57,7 @@ func TestE2E_ReloadRemovesRoute(t *testing.T) {
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
 
 	cfg.Routes = cfg.Routes[:1]
-	g.SignalReload(cfg, []string{keep.Addr})
+	g.ReloadWatch(cfg, []string{keep.Addr})
 
 	// The survivor keeps serving; shrinking 2->1 does not break the pool.
 	for range 5 {
@@ -65,7 +65,7 @@ func TestE2E_ReloadRemovesRoute(t *testing.T) {
 	}
 }
 
-func TestE2E_ReloadShrinksToOtherFamily(t *testing.T) {
+func TestE2E_WatchReloadShrinksToOtherFamily(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
@@ -83,7 +83,7 @@ func TestE2E_ReloadShrinksToOtherFamily(t *testing.T) {
 	// Drop the v4 route entirely: mixed and v6 keep working, v4 returns the
 	// ordinary no-route 502 while staying live.
 	cfg.Routes = []RouteConfig{{Proxy: v6.RouteValue(), Kind: "v6"}}
-	g.SignalReload(cfg, []string{v6.Addr})
+	g.ReloadWatch(cfg, []string{v6.Addr})
 
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
 	GetVia(t, ProxyClient(g.V6Addr), target.URL+"/", "e2e-echo:/")
@@ -98,7 +98,7 @@ func TestE2E_ReloadShrinksToOtherFamily(t *testing.T) {
 	}
 }
 
-func TestE2E_InvalidReloadKeepsServing(t *testing.T) {
+func TestE2E_WatchInvalidConfigKeepsServing(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
@@ -148,40 +148,44 @@ proxies:
 	}
 	for name, raw := range cases {
 		t.Run(name, func(t *testing.T) {
-			g.SignalRawReload(raw, []string{socks.Addr})
-			// Old config still serves.
+			g.ReloadWatchRaw(raw)
+			// The watcher must reject the file inside one debounce cycle and
+			// log the sanitized warning while the old generation keeps serving.
+			waitForLog(t, g, "reload failed", reloadSettle)
 			GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
 		})
 	}
 
+	// Restore the valid config through the same watch path.
+	g.ReloadWatch(cfg, []string{socks.Addr})
 	st, _ := g.Status()
 	if len(st.Pool) != len(before.Pool) || st.Pool[0].Proxy != before.Pool[0].Proxy {
 		t.Fatalf("pool changed after invalid reloads: %+v", st.Pool)
 	}
-	if out := g.Logs(); !strings.Contains(out, "reload failed") {
-		t.Fatalf("logs missing reload failure warning:\n%s", out)
-	}
 }
 
-func TestE2E_ReloadChangedCredsResetState(t *testing.T) {
+func TestE2E_WatchReloadChangedCredsResetState(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
 	socks := NewSocksSim(t, SocksAuthRequired, "e2e-user", "e2e-right-pass")
 	target := NewEchoTarget(t)
-	wrong := fmt.Sprintf("socks5://e2e-user:e2e-wrong-pass@%s", socks.Addr)
 	right := fmt.Sprintf("socks5://e2e-user:e2e-right-pass@%s", socks.Addr)
 	cfg := defaultGatewayConfig([]RouteConfig{
-		{Proxy: wrong, Kind: "v4"},
-		{Proxy: deadRouteValue(t), Kind: "v4"}, // second route keeps requests alive
+		{Proxy: fmt.Sprintf("socks5://e2e-user:e2e-wrong-pass@%s", socks.Addr), Kind: "v4"},
+		{Proxy: deadRouteValue(t), Kind: "v4"},
 	})
-	// Large cooldown base so the dead route stays out of the way.
 	g := NewGateway(t, cfg)
 
-	// Burn the wrong-creds route into an auth block via the good... actually
-	// the dead route never answers, so force order: request until auth block.
-	st := g.WaitForCondition(10*time.Second, "auth block on wrong-creds route", func(st *Status) bool {
-		_, _ = ProxyClient(g.MixedAddr).Get(target.URL + "/")
+	// Request until the wrong-creds route is auth-blocked. The dead second
+	// route cools down, so the auth fallback exhausts and returns 502; both
+	// outcomes burn the block into pool state, which is what we assert on.
+	g.WaitForCondition(15*time.Second, "auth block on wrong-creds route", func(st *Status) bool {
+		resp, err := ProxyClient(g.MixedAddr).Get(target.URL + "/")
+		if err == nil {
+			_, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+		}
 		for _, e := range st.Pool {
 			if e.AuthBlocked {
 				return true
@@ -189,21 +193,27 @@ func TestE2E_ReloadChangedCredsResetState(t *testing.T) {
 		}
 		return false
 	})
-	_ = st
 
 	// Fix the password: same host:port but different userinfo is a new route
-	// identity with fresh state, so requests succeed again.
+	// identity with fresh state, so requests succeed again. The address list
+	// is unchanged, so wait on the zeroed counters that prove the swap.
 	cfg.Routes = []RouteConfig{{Proxy: right, Kind: "v4"}}
-	g.SignalReload(cfg, []string{socks.Addr})
+	g.ReloadWatch(cfg, []string{socks.Addr})
+	g.WaitForCondition(reloadSettle, "userinfo swap reset route state", func(st *Status) bool {
+		return len(st.Pool) == 1 && !st.Pool[0].AuthBlocked && st.Pool[0].AuthFailures == 0
+	})
 
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
-	st, _ = g.Status()
+	st, err := g.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if st.Pool[0].AuthBlocked || st.Pool[0].Successes < 1 {
 		t.Fatalf("fixed-creds route should be fresh and successful: %+v", st.Pool[0])
 	}
 }
 
-func TestE2E_ReloadChangedKindResetsState(t *testing.T) {
+func TestE2E_WatchReloadChangedKindResetsState(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
@@ -218,18 +228,22 @@ func TestE2E_ReloadChangedKindResetsState(t *testing.T) {
 		t.Fatalf("pool=%+v", before.Pool)
 	}
 
-	// Same URL, new kind: fresh route state, counters reset.
+	// Same URL, new kind: the proxy address is unchanged, so wait on the kind
+	// flip itself rather than the address list.
 	cfg.Routes = []RouteConfig{{Proxy: socks.RouteValue(), Kind: "v6"}}
-	g.SignalReload(cfg, []string{socks.Addr})
+	g.ReloadWatch(cfg, []string{socks.Addr})
+	g.WaitForCondition(reloadSettle, "kind change reset route state", func(st *Status) bool {
+		return len(st.Pool) == 1 && st.Pool[0].Kind == "v6" && st.Pool[0].Successes == 0
+	})
 
-	st, _ := g.Status()
-	if st.Pool[0].Kind != "v6" || st.Pool[0].Successes != 0 {
-		t.Fatalf("kind change should reset state: %+v", st.Pool[0])
-	}
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+	st, _ := g.Status()
+	if st.Pool[0].Kind != "v6" || st.Pool[0].Successes != 1 {
+		t.Fatalf("serving after kind change broken: %+v", st.Pool[0])
+	}
 }
 
-func TestE2E_ReloadPreservesHealthForUnchangedRoutes(t *testing.T) {
+func TestE2E_WatchReloadPreservesHealthForUnchangedRoutes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
@@ -249,7 +263,7 @@ func TestE2E_ReloadPreservesHealthForUnchangedRoutes(t *testing.T) {
 
 	// Same URL+kind routes, only log-level changes: health must survive.
 	cfg.LogLevel = "debug"
-	g.SignalReload(cfg, proxyAddrs(st))
+	g.ReloadWatch(cfg, proxyAddrs(st))
 
 	st, _ = g.Status()
 	if st.Pool[0].Failures != deadFailures || st.Pool[0].CooldownFor == "0s" {
@@ -260,7 +274,7 @@ func TestE2E_ReloadPreservesHealthForUnchangedRoutes(t *testing.T) {
 	}
 }
 
-func TestE2E_ReloadDoesNotDropInFlight(t *testing.T) {
+func TestE2E_WatchReloadDoesNotDropInFlight(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
@@ -293,14 +307,15 @@ func TestE2E_ReloadDoesNotDropInFlight(t *testing.T) {
 		}()
 	}
 
-	// Reload several times (grow, shrink, grow) while load is in flight.
+	// Rewrite the file several times (grow, shrink, grow) while load is in
+	// flight. Reloads happen purely through the watcher's debounce cycle.
 	time.Sleep(200 * time.Millisecond)
 	cfg.Routes = append(cfg.Routes, RouteConfig{Proxy: second.RouteValue(), Kind: "v4"})
-	g.SignalReload(cfg, []string{first.Addr, second.Addr})
+	g.ReloadWatch(cfg, []string{first.Addr, second.Addr})
 	cfg.Routes = cfg.Routes[:1]
-	g.SignalReload(cfg, []string{first.Addr})
+	g.ReloadWatch(cfg, []string{first.Addr})
 	cfg.Routes = append(cfg.Routes, RouteConfig{Proxy: second.RouteValue(), Kind: "v4"})
-	g.SignalReload(cfg, []string{first.Addr, second.Addr})
+	g.ReloadWatch(cfg, []string{first.Addr, second.Addr})
 	done.Store(true)
 	wg.Wait()
 

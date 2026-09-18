@@ -96,7 +96,7 @@ type Status struct {
 
 // Gateway is one real gateway subprocess with its own config file and ports.
 type Gateway struct {
-	t          *testing.T
+	t          testing.TB
 	dir        string
 	configPath string
 	cmd        *exec.Cmd
@@ -108,7 +108,7 @@ type Gateway struct {
 	V6Addr    string
 }
 
-func freeAddr(t *testing.T) string {
+func freeAddr(t testing.TB) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -140,7 +140,7 @@ func renderConfig(cfg GatewayConfig) string {
 
 // NewGateway writes cfg to a temp config file, starts the real binary, and
 // waits for /healthz. Every instance owns its ports so tests run in parallel.
-func NewGateway(t *testing.T, cfg GatewayConfig) *Gateway {
+func NewGateway(t testing.TB, cfg GatewayConfig) *Gateway {
 	t.Helper()
 	if testBinaryPath == "" {
 		t.Skip("e2e binary not built (short mode?)")
@@ -223,27 +223,27 @@ func (g *Gateway) waitHealthy(timeout time.Duration) {
 	g.t.Fatalf("gateway never became healthy; output:\n%s", g.output.String())
 }
 
-// SignalReload sends SIGHUP (deterministic reload, no watch debounce) and
-// waits until /status reports exactly wantProxies in order.
-func (g *Gateway) SignalReload(cfg GatewayConfig, wantProxies []string) {
+// ReloadWatch rewrites the config file (atomic tmp+rename, modeling an editor
+// or bind-mount update) and relies on the gateway's fsnotify watcher plus its
+// 250ms debounce to apply it. It fails when /status does not report exactly
+// wantProxies within the debounce window.
+func (g *Gateway) ReloadWatch(cfg GatewayConfig, wantProxies []string) {
 	g.t.Helper()
 	g.writeConfig(cfg)
-	if err := g.cmd.Process.Signal(syscall.SIGHUP); err != nil {
-		g.t.Fatalf("SIGHUP: %v", err)
-	}
-	g.WaitForPool(wantProxies, 10*time.Second)
+	g.WaitForPool(wantProxies, reloadSettle)
 }
 
-// SignalRawReload installs literal content, sends SIGHUP, and waits until the
-// pool is unchanged (invalid input) or matches wantProxies (valid input).
-func (g *Gateway) SignalRawReload(content string, wantProxies []string) {
+// ReloadWatchRaw installs literal content and returns without waiting: callers
+// assert either that the pool stays unchanged (invalid input) or that a warn
+// line appeared in the logs.
+func (g *Gateway) ReloadWatchRaw(content string) {
 	g.t.Helper()
 	g.WriteRaw(content)
-	if err := g.cmd.Process.Signal(syscall.SIGHUP); err != nil {
-		g.t.Fatalf("SIGHUP: %v", err)
-	}
-	g.WaitForPool(wantProxies, 10*time.Second)
 }
+
+// reloadSettle bounds one watch cycle: fsnotify latency plus the gateway's
+// 250ms reload debounce, with comfortable headroom for slow CI machines.
+const reloadSettle = 6 * time.Second
 
 // WaitForPool polls /status until the pool reports exactly want in order.
 func (g *Gateway) WaitForPool(want []string, timeout time.Duration) {
