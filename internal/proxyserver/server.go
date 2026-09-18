@@ -437,6 +437,24 @@ func (fw flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// copyBufPool lends 64KiB relay buffers. Relaying is the hot path for both
+// streamed responses and CONNECT tunnels, and io.Copy's implicit 32KiB buffer
+// would be allocated per relay; the pool keeps one larger buffer per
+// in-flight copy instead.
+var copyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 64<<10)
+		return &buf
+	},
+}
+
+func copyWithPooledBuffer(dst io.Writer, src io.Reader) (int64, error) {
+	bufp := copyBufPool.Get().(*[]byte)
+	n, err := io.CopyBuffer(dst, src, *bufp)
+	copyBufPool.Put(bufp)
+	return n, err
+}
+
 func (s *Server) writeResponse(log *slog.Logger, w http.ResponseWriter, resp *http.Response) {
 	stripHopByHop(resp.Header)
 	for k, vv := range resp.Header {
@@ -445,7 +463,7 @@ func (s *Server) writeResponse(log *slog.Logger, w http.ResponseWriter, resp *ht
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(flushWriter{w: w}, resp.Body); err != nil {
+	if _, err := copyWithPooledBuffer(flushWriter{w: w}, resp.Body); err != nil {
 		// The client sees a truncated body: nothing to retry and no health to
 		// mutate, but the log attributes the mid-body drop to this request.
 		log.Warn("response relay failed", "error_kind", logErrorKind(err), "error", logErrorValue(err))
@@ -573,7 +591,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 	// side ended the stream first and why.
 	closes := make(chan relayResult, 2)
 	go func() {
-		n, err := io.Copy(clientConn, upstream)
+		n, err := copyWithPooledBuffer(clientConn, upstream)
 		// Send before teardown: whichever result lands first is the cause;
 		// the one our own closes unblock is the artifact.
 		closes <- relayResult{direction: relayToClient, bytes: n, err: err}
@@ -586,7 +604,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 		}
 		clientConn.Close() // unblocks the client-to-upstream direction
 	}()
-	n, err := io.Copy(upstream, clientConn)
+	n, err := copyWithPooledBuffer(upstream, clientConn)
 	closes <- relayResult{direction: relayToUpstream, bytes: n, err: err}
 	upstream.Close()
 	clientConn.Close() // unblocks the other direction
