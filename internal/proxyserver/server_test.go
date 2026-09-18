@@ -329,7 +329,9 @@ func TestLogsCorrelateDialFallbackAndRedactCredentials(t *testing.T) {
 		t.Fatalf("status=%d, want 200", resp.StatusCode)
 	}
 
-	output := logs.String()
+	// Responses flush before the completion record is written, so wait for
+	// the final line instead of snapshotting at client completion.
+	output := waitForLog(t, &logs, "msg=request")
 	for _, want := range []string{
 		"request_id=1",
 		"msg=\"upstream dial failed\"",
@@ -1249,6 +1251,10 @@ func abortTargetConn(conn net.Conn) {
 	// No request is read: over CONNECT the client only opens the tunnel and
 	// reads, so the partial response goes out unprompted.
 	fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\npartial") //nolint:errcheck
+	// Let the SOCKS success reply travel to the gateway before the reset: a
+	// too-early RST can destroy the unread reply in flight, and the gateway
+	// then (correctly) counts a handshake failure and retries until 502.
+	time.Sleep(100 * time.Millisecond)
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetLinger(0) // reset instead of a clean close
 	}
