@@ -66,7 +66,9 @@ jobs:
           # The Go module itself: config, pool, proxyserver, socksdial,
           # rotation, cmd, e2e.
           - language: go
-            build-mode: none
+            # Go's extractor needs a traced build; unlike the Actions
+            # extractor, it does not support build-mode `none`.
+            build-mode: autobuild
           # `actions` needs a leg of its own even though no workflow file is
           # executable Go — that invocation extracts the workflow YAML and
           # interprets `actions` queries and nothing else. Without it every
@@ -122,13 +124,13 @@ jobs:
       # main red for a change nobody made; the blocking step below stays the
       # repository's own rules only.
       #
-      # `p/go` is for the whole of this repository that executes; `p/github-actions`
+      # `p/golang` is for the whole of this repository that executes; `p/github-actions`
       # covers workflow defect classes these own rules do not hand-write
       # (credential handling, cache and artifact shapes), measured clean
       # against this tree before it was added.
       - name: Scan
         run: >-
-          semgrep scan --config .github/semgrep --config p/go
+          semgrep scan --config .github/semgrep --config p/golang
           --config p/github-actions --exclude .github/semgrep --sarif
           --output semgrep.sarif
 
