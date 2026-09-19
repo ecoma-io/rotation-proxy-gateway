@@ -199,10 +199,12 @@ type Pool struct {
 	// picks inside it. Reconfigure carries kindPass across generations so a
 	// reload does not reset the split's phase. scratch is the per-pick family
 	// bucket used by pickBalanced, reused across picks to keep the balanced
-	// path allocation-free.
-	kindPass   [2]uint64
-	kindStride [2]uint64
-	scratch    [2][]*Proxy
+	// path allocation-free. availScratch is the per-pick available-routes
+	// buffer, reused under the same lock for the same reason.
+	kindPass     [2]uint64
+	kindStride   [2]uint64
+	scratch      [2][]*Proxy
+	availScratch []*Proxy
 
 	// Now is the clock used for cooldowns; tests replace it.
 	Now func() time.Time
@@ -436,7 +438,7 @@ func (pl *Pool) pick(exclude map[*Proxy]bool, allow func(*Proxy) bool, mixed boo
 	// just failed availableAt), and the fallback ignores cooldown but never
 	// auth blocks or in-progress rotations.
 	allowed := func(p *Proxy) bool { return allow == nil || allow(p) }
-	var avail []*Proxy
+	avail := pl.availScratch[:0]
 	var fallback *Proxy
 	var fallbackCooldown int64
 	for _, e := range pl.entries {
@@ -454,6 +456,9 @@ func (pl *Pool) pick(exclude map[*Proxy]bool, allow func(*Proxy) bool, mixed boo
 			}
 		}
 	}
+	// Park the possibly-grown backing array for the next pick; the caller's
+	// use of avail ends within this critical section.
+	pl.availScratch = avail[:0]
 	if len(avail) == 0 {
 		if fallback != nil {
 			pl.serve(fallback, mixed)
