@@ -206,7 +206,7 @@ func (e *Engine) evaluate(ctx context.Context) {
 }
 
 func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec config.ManualRouteSpec, p *pool.Proxy, id string) {
-	defer e.finishProcedure(id)
+	defer e.finishProcedure(id, p)
 
 	// gone reports that the procedure must stop: shutdown, or a reload
 	// removed or replaced this route. It consults the store's current pool:
@@ -338,9 +338,17 @@ func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.M
 	}
 }
 
-func (e *Engine) finishProcedure(id string) {
+// finishProcedure releases the route's active slot when its procedure ends.
+// The pointer guard matters under remove→re-add reloads: a stale procedure
+// from before the swap must not unregister its replacement, which would make
+// the concurrency cap a slot looser than configured. finishProcedure still
+// wakes the scheduler either way — a finished procedure always frees real
+// capacity, and the spurious wake for the stale caller is harmless.
+func (e *Engine) finishProcedure(id string, p *pool.Proxy) {
 	e.mu.Lock()
-	delete(e.active, id)
+	if e.active[id] == p {
+		delete(e.active, id)
+	}
 	e.mu.Unlock()
 	select {
 	case e.wake <- struct{}{}:

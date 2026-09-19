@@ -698,6 +698,159 @@ func waitRotationState(t *testing.T, pl *pool.Pool, host, state string) {
 	}
 }
 
+// finishProcedure must not unregister a replacement procedure: after a
+// remove→re-add reload the same route id can have a stale procedure still
+// running while a fresh one is admitted, and a stale finish that deleted by
+// id alone would free the concurrency slot of the live replacement.
+func TestStaleProcedureFinishKeepsReplacementRegistered(t *testing.T) {
+	e := New(nil, discardLogger())
+	spec := manualRoute(t, "m1.test", time.Minute, config.RotateAPI{})
+	id := routeID(spec.RouteSpec)
+	stale := testPool(t, &config.RuntimeConfig{ManualRoutes: []config.ManualRouteSpec{spec}}).Lookup(id)
+	replacement := testPool(t, &config.RuntimeConfig{ManualRoutes: []config.ManualRouteSpec{spec}}).Lookup(id)
+	if stale == nil || replacement == nil || stale == replacement {
+		t.Fatal("need two distinct proxy instances sharing one route id")
+	}
+
+	e.mu.Lock()
+	e.active[id] = stale
+	e.mu.Unlock()
+	// The reload swap: the replacement is admitted under the same id before
+	// the stale procedure reaches its finish.
+	e.mu.Lock()
+	e.active[id] = replacement
+	e.mu.Unlock()
+
+	e.finishProcedure(id, stale)
+	e.mu.Lock()
+	got := e.active[id]
+	e.mu.Unlock()
+	if got != replacement {
+		t.Fatalf("active slot = %v, want the replacement to stay registered", got)
+	}
+
+	// The replacement's own finish does release the slot.
+	e.finishProcedure(id, replacement)
+	e.mu.Lock()
+	_, ok := e.active[id]
+	e.mu.Unlock()
+	if ok {
+		t.Fatal("replacement finish left the slot occupied")
+	}
+}
+
+// A stale procedure finishing during a remove→re-add overlap must leave the
+// replacement's active slot alone, so the scheduler cannot admit a duplicate
+// procedure for the same route while the replacement still runs.
+func TestReloadRemoveReaddOverlapKeepsCapHonest(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	api := newAPIServer(t)
+	spec := manualRoute(t, "m1.test", time.Minute, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+
+	// Park every rotate call on a channel; each token releases exactly one
+	// parked call in the order it arrived. Cleanup drains tokens so no parked
+	// procedure outlives the test.
+	release := make(chan struct{}, 8)
+	t.Cleanup(func() {
+		for range 8 {
+			select {
+			case release <- struct{}{}:
+			default:
+			}
+		}
+	})
+	var entries, inFlight, peak atomic.Int64
+	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		entries.Add(1)
+		cur := inFlight.Add(1)
+		for {
+			old := peak.Load()
+			if cur <= old || peak.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		<-release
+		inFlight.Add(-1)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Procedure #1 parks inside its rotate call.
+	id := routeID(spec.RouteSpec)
+	done1 := make(chan struct{})
+	go func() {
+		defer close(done1)
+		s.e.runProcedure(context.Background(), s.gen, spec,
+			s.pl.Lookup(id), id)
+	}()
+	waitUntil(t, "procedure #1 parked in the rotate call", func() bool { return inFlight.Load() == 1 })
+
+	// Reload: remove the route. The scheduler sweep stops counting the
+	// still-running procedure (by design, so its slot is reused), then the
+	// same route identity is re-added as fresh state and admitted again.
+	s.e.store.Publish(&config.RuntimeConfig{Rotation: fastSettings()})
+	s.e.evaluate(context.Background())
+	s.e.store.Publish(cfg)
+	s.e.evaluate(context.Background())
+	s.e.mu.Lock()
+	replacement := s.e.active[id]
+	s.e.mu.Unlock()
+	if replacement == nil {
+		t.Fatal("evaluate did not admit a replacement after the re-add")
+	}
+	waitUntil(t, "procedure #2 parked in the rotate call", func() bool { return inFlight.Load() == 2 })
+
+	// The provider moves the IP, so the released stale procedure's verify
+	// succeeds immediately and it reaches the gone() checkpoint without
+	// waiting out the IP-check window.
+	ips.set("198.51.100.9")
+	release <- struct{}{}
+	<-done1
+
+	// The stale procedure is gone; the replacement is still parked in its
+	// own rotate call. A scheduler pass must still see the slot occupied —
+	// exactly two admissions, never a third.
+	s.e.evaluate(context.Background())
+	s.e.mu.Lock()
+	still := s.e.active[id]
+	s.e.mu.Unlock()
+	if still != replacement {
+		t.Fatalf("active slot = %v, want the replacement held across the stale finish", still)
+	}
+	if got := entries.Load(); got != 2 {
+		t.Fatalf("rotate API admissions = %d, want exactly 2", got)
+	}
+
+	// Let the replacement finish its rotation for real.
+	release <- struct{}{}
+	waitUntil(t, "replacement procedure to finish", func() bool {
+		s.e.mu.Lock()
+		defer s.e.mu.Unlock()
+		return s.e.active[id] == nil
+	})
+	if got := entries.Load(); got != 2 {
+		t.Fatalf("rotate API admissions after completion = %d, want exactly 2", got)
+	}
+	if got := peak.Load(); got != 2 {
+		t.Fatalf("peak in-flight rotate calls = %d, want 2 (stale sweep + replacement)", got)
+	}
+	if got := s.e.Rotations(); got != 1 {
+		t.Fatalf("Rotations = %d, want 1 from the replacement", got)
+	}
+}
+
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // TestBootPrecheckRecordsBaselines drives the boot-time double probe: it must
 // learn each manual route's starting egress IP, keep the second observation
 // when the provider moves the IP between probes, and leave routes it could
