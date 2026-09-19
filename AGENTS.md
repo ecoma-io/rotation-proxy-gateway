@@ -41,14 +41,14 @@ V6_LISTEN_ADDR=:30123 \
 
 Environment variables are bootstrap-only and require restart:
 
-| Env | Default | Meaning |
-|---|---:|---|
-| `CONFIG_FILE` | `config.yaml` | Runtime YAML path |
-| `ADMIN_ADDR` | `0.0.0.0:30120` | Admin listener; network policy controls exposure |
-| `MIXED_LISTEN_ADDR` | `:30121` | Mixed v4/v6 egress listener |
-| `V4_LISTEN_ADDR` | `:30122` | IPv4-egress-only listener |
-| `V6_LISTEN_ADDR` | `:30123` | IPv6-egress-only listener |
-| `SHUTDOWN_GRACE` | `55s` | Total shared drain budget for graceful shutdown |
+| Env                 |         Default | Meaning                                          |
+| ------------------- | --------------: | ------------------------------------------------ |
+| `CONFIG_FILE`       |   `config.yaml` | Runtime YAML path                                |
+| `ADMIN_ADDR`        | `0.0.0.0:30120` | Admin listener; network policy controls exposure |
+| `MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress listener                      |
+| `V4_LISTEN_ADDR`    |        `:30122` | IPv4-egress-only listener                        |
+| `V6_LISTEN_ADDR`    |        `:30123` | IPv6-egress-only listener                        |
+| `SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown  |
 
 Empty proxy listener addresses disable their listener, but at least one proxy
 listener must remain enabled. All enabled addresses must be valid host:port
