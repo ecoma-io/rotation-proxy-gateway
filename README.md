@@ -18,12 +18,12 @@ requests and inbound `CONNECT` tunnels.
 
 The process starts one admin listener and up to three proxy listeners:
 
-| Endpoint | Default | Purpose |
-|---|---:|---|
-| Admin | `0.0.0.0:30120` | `/healthz` and `/status`; operator controls network exposure |
-| Mixed proxy | `:30121` | Selects both v4- and v6-egress routes |
-| IPv4 proxy | `:30122` | Selects only `kind: v4` routes |
-| IPv6 proxy | `:30123` | Selects only `kind: v6` routes |
+| Endpoint    |         Default | Purpose                                                      |
+| ----------- | --------------: | ------------------------------------------------------------ |
+| Admin       | `0.0.0.0:30120` | `/healthz` and `/status`; operator controls network exposure |
+| Mixed proxy |        `:30121` | Selects both v4- and v6-egress routes                        |
+| IPv4 proxy  |        `:30122` | Selects only `kind: v4` routes                               |
+| IPv6 proxy  |        `:30123` | Selects only `kind: v6` routes                               |
 
 `kind` is the public egress IP family supplied by a proxy provider. It is not
 the SOCKS endpoint address family and it does not impose an IPv4/IPv6 policy on
@@ -61,14 +61,14 @@ These values create sockets or choose the polled file and are read only when
 the process starts. Empty proxy listener addresses disable their listener, but
 at least one proxy listener must remain enabled.
 
-| Variable | Default | Meaning |
-|---|---:|---|
-| `CONFIG_FILE` | `config.yaml` | Runtime YAML file path |
-| `ADMIN_ADDR` | `0.0.0.0:30120` | Always-on admin listener; network policy controls exposure |
-| `MIXED_LISTEN_ADDR` | `:30121` | Mixed v4/v6 egress listener |
-| `V4_LISTEN_ADDR` | `:30122` | v4-egress-only listener |
-| `V6_LISTEN_ADDR` | `:30123` | v6-egress-only listener |
-| `SHUTDOWN_GRACE` | `55s` | Total shared drain budget for graceful shutdown |
+| Variable            |         Default | Meaning                                                    |
+| ------------------- | --------------: | ---------------------------------------------------------- |
+| `CONFIG_FILE`       |   `config.yaml` | Runtime YAML file path                                     |
+| `ADMIN_ADDR`        | `0.0.0.0:30120` | Always-on admin listener; network policy controls exposure |
+| `MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress listener                                |
+| `V4_LISTEN_ADDR`    |        `:30122` | v4-egress-only listener                                    |
+| `V6_LISTEN_ADDR`    |        `:30123` | v6-egress-only listener                                    |
+| `SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown            |
 
 All enabled addresses must be valid, use a numeric port, and not overlap --
 including wildcard binds on the same port. Docker Healthcheck uses only
@@ -205,15 +205,15 @@ rotation:
   retry-backoff-max: 15m
 ```
 
-| Setting | Default | Meaning |
-|---|---:|---|
-| `max-concurrent` | `1` | Rotation procedures running at once: a fixed count, or `"NN%"` of the manual routes (rounded up, at least 1, never more than the route count). Resolved fresh every scheduling cycle. |
-| `drain-timeout` | `55s` | How long a procedure waits for the route's in-flight requests to finish before force-rotating. Expiry does not wait longer; requests already in flight may continue on the old egress IP. |
-| `rotate-on-start` | `false` | Rotate every manual route at process start, under the same cap and staggering, instead of waiting one interval. |
-| `ip-check-url` | Cloudflare trace | HTTPS URL whose response body contains an `ip=` line. **Must be `https`.** The probe always verifies TLS regardless of `target-tls-insecure`. |
-| `ip-check-timeout` | `20s` | Total window for one verification: how long a procedure watches for a changed IP before giving up on that attempt. |
-| `ip-check-interval` | `2s` | Pause between verification probes inside that window. |
-| `retry-backoff-max` | `15m` | Ceiling of the same-IP retry backoff. |
+| Setting             |          Default | Meaning                                                                                                                                                                                   |
+| ------------------- | ---------------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `max-concurrent`    |              `1` | Rotation procedures running at once: a fixed count, or `"NN%"` of the manual routes (rounded up, at least 1, never more than the route count). Resolved fresh every scheduling cycle.     |
+| `drain-timeout`     |            `55s` | How long a procedure waits for the route's in-flight requests to finish before force-rotating. Expiry does not wait longer; requests already in flight may continue on the old egress IP. |
+| `rotate-on-start`   |          `false` | Rotate every manual route at process start, under the same cap and staggering, instead of waiting one interval.                                                                           |
+| `ip-check-url`      | Cloudflare trace | HTTPS URL whose response body contains an `ip=` line. **Must be `https`.** The probe always verifies TLS regardless of `target-tls-insecure`.                                             |
+| `ip-check-timeout`  |            `20s` | Total window for one verification: how long a procedure watches for a changed IP before giving up on that attempt.                                                                        |
+| `ip-check-interval` |             `2s` | Pause between verification probes inside that window.                                                                                                                                     |
+| `retry-backoff-max` |            `15m` | Ceiling of the same-IP retry backoff.                                                                                                                                                     |
 
 `rotation.drain-timeout` and `SHUTDOWN_GRACE` are unrelated budgets. The drain
 timeout bounds one route's pre-rotation quiesce; the shutdown grace bounds the
@@ -261,13 +261,13 @@ when the two probes differ.
 
 `/status` reports each manual route's rotation view:
 
-| State | Meaning |
-|---|---|
-| `idle` | Serving; last verified rotation observed a changed IP (or none has run yet). |
-| `draining` | Mid-procedure: ineligible for picks, waiting for in-flight work. |
-| `rotating` | Mid-procedure: baseline learned, rotate API call in progress. |
-| `verifying` | Mid-procedure: watching for a changed egress IP. |
-| `stale` | Serving; the last attempt(s) did not change the IP; next retry is scheduled. |
+| State       | Meaning                                                                      |
+| ----------- | ---------------------------------------------------------------------------- |
+| `idle`      | Serving; last verified rotation observed a changed IP (or none has run yet). |
+| `draining`  | Mid-procedure: ineligible for picks, waiting for in-flight work.             |
+| `rotating`  | Mid-procedure: baseline learned, rotate API call in progress.                |
+| `verifying` | Mid-procedure: watching for a changed egress IP.                             |
+| `stale`     | Serving; the last attempt(s) did not change the IP; next retry is scheduled. |
 
 Each view additionally shows `lastIP` (the last verified egress IP — this is
 operational data, not a credential), `lastRotationAt` (RFC 3339), `nextRetryIn`
@@ -329,10 +329,10 @@ once, while in-flight operations finish on their original snapshot.
 Measured on Linux (2026-09), first against event-based watching (Viper 1.21 +
 fsnotify), then against the current content-hash poller:
 
-| Host update | Directory bind mount | Single-file bind mount |
-|---|---|---|
-| In-place write (`echo > file`) | reload fires | reload fires (poller only — inotify never sees it) |
-| Atomic rename-over (editor save, `mv`) | reload fires | invisible (mount pins the old inode) |
+| Host update                            | Directory bind mount | Single-file bind mount                             |
+| -------------------------------------- | -------------------- | -------------------------------------------------- |
+| In-place write (`echo > file`)         | reload fires         | reload fires (poller only — inotify never sees it) |
+| Atomic rename-over (editor save, `mv`) | reload fires         | invisible (mount pins the old inode)               |
 
 The rename-over single-file blind spot is inherent to bind-mount semantics, not
 to any watcher implementation: nothing inside the container can observe a new
@@ -380,16 +380,16 @@ and `proxies.manual` creates a fresh route state.
   reads, malformed responses, cancellation, and established-tunnel failures.
 - **`no_route`**: no eligible untried route remains.
 
-| Outcome | Pool handling | Request handling |
-|---|---|---|
-| SOCKS endpoint DNS/TCP dial fails | Record `proxy_connect`, exponential cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
-| SOCKS endpoint cannot authenticate | Auth-block the route; no dial cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
-| SOCKS handshake fails before the tunnel is established | Record `socks_connect`, exponential cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
-| Local request error (scheme, credentials, invalid target) or any error after the tunnel is established | No health mutation and no retry | Sanitized `502` |
-| Target TLS, HTTP write/read, malformed response | No health mutation and no retry | `502` unless client cancelled |
-| Valid target HTTP response, including `407`, `408`, `429`, `5xx` | Record success; no rotation/cooldown | Forward once |
-| Client cancellation/disconnect | No health mutation and no retry | End operation |
-| Established tunnel breaks | No health mutation | Close tunnel |
+| Outcome                                                                                                | Pool handling                                | Request handling                                                        |
+| ------------------------------------------------------------------------------------------------------ | -------------------------------------------- | ----------------------------------------------------------------------- |
+| SOCKS endpoint DNS/TCP dial fails                                                                      | Record `proxy_connect`, exponential cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
+| SOCKS endpoint cannot authenticate                                                                     | Auth-block the route; no dial cooldown       | Retry a distinct eligible route; synthetic `502` only when none remains |
+| SOCKS handshake fails before the tunnel is established                                                 | Record `socks_connect`, exponential cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
+| Local request error (scheme, credentials, invalid target) or any error after the tunnel is established | No health mutation and no retry              | Sanitized `502`                                                         |
+| Target TLS, HTTP write/read, malformed response                                                        | No health mutation and no retry              | `502` unless client cancelled                                           |
+| Valid target HTTP response, including `407`, `408`, `429`, `5xx`                                       | Record success; no rotation/cooldown         | Forward once                                                            |
+| Client cancellation/disconnect                                                                         | No health mutation and no retry              | End operation                                                           |
+| Established tunnel breaks                                                                              | No health mutation                           | Close tunnel                                                            |
 
 The pool serves the eligible route with the smallest weighted recency pass:
 every pick, completed request, and stale return advances the route's pass by

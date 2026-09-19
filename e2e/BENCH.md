@@ -29,14 +29,14 @@ Before optimizing:
 
 ## What each benchmark measures
 
-| Benchmark | Path exercised |
-|---|---|
-| `BenchmarkDirect_SmallGET` | client → target with no proxy: the floor |
-| `BenchmarkProxied_SmallGET` | client → gateway → SOCKS5 → target, small GET |
-| `BenchmarkProxied_SmallGETParallel` | same, shared client across `GOMAXPROCS` workers |
+| Benchmark                               | Path exercised                                        |
+| --------------------------------------- | ----------------------------------------------------- |
+| `BenchmarkDirect_SmallGET`              | client → target with no proxy: the floor              |
+| `BenchmarkProxied_SmallGET`             | client → gateway → SOCKS5 → target, small GET         |
+| `BenchmarkProxied_SmallGETParallel`     | same, shared client across `GOMAXPROCS` workers       |
 | `BenchmarkProxied_ReplayablePOST_64KiB` | body at/under `max-body-buffer`: buffered replay path |
-| `BenchmarkProxied_StreamingPOST_2MiB` | body far above a 64KiB cap: streaming path |
-| `BenchmarkProxied_BulkGET_1MiB` | download throughput (`SetBytes` reports MB/s) |
+| `BenchmarkProxied_StreamingPOST_2MiB`   | body far above a 64KiB cap: streaming path            |
+| `BenchmarkProxied_BulkGET_1MiB`         | download throughput (`SetBytes` reports MB/s)         |
 
 The gap between `Direct` and `Proxied` small GET is the full per-request cost
 of one gateway hop plus one SOCKS5 hop.
@@ -44,7 +44,7 @@ of one gateway hop plus one SOCKS5 hop.
 ## Interpretation caveats — read before drawing conclusions
 
 - The small-GET gap is dominated by **connection setup, not copying**: the
-  gateway opens a fresh SOCKS5 tunnel for every request *by design* (client
+  gateway opens a fresh SOCKS5 tunnel for every request _by design_ (client
   TCP → gateway, gateway TCP → SOCKS endpoint, SOCKS CONNECT handshake), and
   each test request closes its connection. Copy-path optimizations cannot move
   this number; connection reuse would be a behavior change, not a tuning knob.

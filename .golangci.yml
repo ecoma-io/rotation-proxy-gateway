@@ -1,19 +1,12 @@
-# golangci-lint configuration.
-#
-# `govet` is deliberately the first CI baseline. The current tree has 55
-# existing findings from `errcheck`, `ineffassign`, and `staticcheck`; turning
-# on their default v2 roster would make the newly introduced CI check red for
-# debt this change did not create. Issue #2 tracks reducing that debt before
-# widening this roster — a green check must describe what it actually
-# enforces, not silently exclude findings through a blanket `nolint` sweep.
-#
-# Formatting is deliberately NOT delegated here — `gofmt` is its own gate in
+# Formatting is deliberately not delegated here — `gofmt` is its own gate in
 # ci.yml, because `gofmt -l` exits 0 over findings and only emptiness means
 # clean. `go vet ./...` remains a separate explicit CI command too: keeping
 # it visible makes the Go baseline readable without knowing golangci-lint's
 # config syntax.
+#
+# The standard v2 baseline catches unchecked errors and static-analysis
+# regressions across production code and tests. It is enabled without blanket
+# exclusions: Issue #2 was closed only after every existing finding was fixed.
 version: "2"
 linters:
-  default: none
-  enable:
-    - govet
+  default: standard

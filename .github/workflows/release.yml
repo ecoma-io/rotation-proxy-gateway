@@ -20,6 +20,13 @@ jobs:
     name: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # release-please creates or updates the generated release pull request and
+    # later creates its GitHub release. Keep these writes confined to prepare;
+    # Docker publishing retains its separate packages-only permission below.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
@@ -31,6 +38,7 @@ jobs:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
