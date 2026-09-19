@@ -1,10 +1,8 @@
 package proxyserver
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -65,12 +64,10 @@ func waitForLog(t *testing.T, logs *safeLogBuffer, want string) string {
 
 func defaultRuntime() *config.RuntimeConfig {
 	return &config.RuntimeConfig{
-		MaxRetries:        3,
-		DialTimeout:       2 * time.Second,
-		MaxBodyBuffer:     64 << 20,
-		CooldownBase:      30 * time.Second,
-		CooldownMax:       time.Minute,
-		TargetTLSInsecure: false,
+		MaxRetries:   3,
+		DialTimeout:  2 * time.Second,
+		CooldownBase: 30 * time.Second,
+		CooldownMax:  time.Minute,
 	}
 }
 
@@ -82,262 +79,653 @@ func mixedRoutes(urls ...*url.URL) []config.RouteSpec {
 	return routes
 }
 
-func newRuntimeServer(pl *pool.Pool, runtime *config.RuntimeConfig, log *slog.Logger) *Server {
-	// The store shares the test pool pointer so existing health assertions on
-	// pl keep observing the serving pool until a test publishes a new
-	// generation (which installs a reconfigured pool snapshot).
-	return NewRuntime(pool.NewStore(runtime, pl), log, "test", "mixed", config.EgressV4, config.EgressV6)
+func newRuntimeServer(pl *pool.Pool, runtime *config.RuntimeConfig, log *slog.Logger, allowed ...config.EgressKind) *Server {
+	// The store shares the test pool pointer so health assertions on pl keep
+	// observing the serving pool until a test publishes a new generation.
+	return NewRuntime(pool.NewStore(runtime, pl), log, "test", "mixed", allowed...)
 }
 
-func newForwarderCfg(t *testing.T, pl *pool.Pool, runtime *config.RuntimeConfig) *httptest.Server {
-	return newForwarderCfgLogger(t, pl, runtime, testLogger())
-}
-
-func newForwarderCfgLogger(t *testing.T, pl *pool.Pool, runtime *config.RuntimeConfig, log *slog.Logger) *httptest.Server {
+// startServer runs srv on a live loopback listener and returns its address.
+// Cleanup closes the listener, force-closes any session a test left parked,
+// and waits for the accept loop to return.
+func startServer(t *testing.T, srv *Server) string {
 	t.Helper()
-	ts := httptest.NewServer(newRuntimeServer(pl, runtime, log))
-	t.Cleanup(ts.Close)
-	return ts
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = srv.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		srv.CloseConns()
+		select {
+		case <-served:
+		case <-time.After(time.Second):
+			t.Errorf("Serve did not return after the listener closed")
+		}
+	})
+	return ln.Addr().String()
 }
 
-func newForwarder(t *testing.T, socks ...*fakeSocks) (*httptest.Server, *pool.Pool) {
+func newSocksServer(t *testing.T, pl *pool.Pool, runtime *config.RuntimeConfig, log *slog.Logger, allowed ...config.EgressKind) (*Server, string) {
+	t.Helper()
+	srv := newRuntimeServer(pl, runtime, log, allowed...)
+	return srv, startServer(t, srv)
+}
+
+// newRunningServer builds the common fixture: one SOCKS server over a pool
+// holding the given upstream routes, already listening.
+func newRunningServer(t *testing.T, log *slog.Logger, socks ...*fakeSocks) (*Server, string, *pool.Pool) {
 	t.Helper()
 	urls := make([]*url.URL, 0, len(socks))
 	for _, fs := range socks {
 		urls = append(urls, fs.URL)
 	}
 	pl := pool.NewRoutes(mixedRoutes(urls...), 30*time.Second, time.Minute, config.KindBalance{})
-	return newForwarderCfg(t, pl, defaultRuntime()), pl
+	s, addr := newSocksServer(t, pl, defaultRuntime(), log)
+	return s, addr, pl
 }
 
-func proxiedClient(t *testing.T, proxyURL string) *http.Client {
-	t.Helper()
-	pu, err := url.Parse(proxyURL)
+// --- SOCKS5 client helpers -------------------------------------------------
+
+// socksGreetingFrame encodes VER NMETHODS METHODS...
+func socksGreetingFrame(methods ...byte) []byte {
+	return append([]byte{socksVersion, byte(len(methods))}, methods...)
+}
+
+// socksRequestFrame encodes one request for host:port. IPv4 and IPv6 literals
+// are binary encoded; anything else becomes a domain name, so a test can send
+// a textual name without resolving it.
+func socksRequestFrame(cmd byte, target string) ([]byte, error) {
+	host, portText, err := net.SplitHostPort(target)
 	if err != nil {
-		t.Fatal(err)
+		return nil, fmt.Errorf("split target %q: %w", target, err)
 	}
-	return &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(pu)},
-		Timeout:   10 * time.Second,
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("target %q has no usable port", target)
 	}
-}
-
-func startStatusTarget(t *testing.T, status int, body string) string {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Proxy-Authorization", "must-not-reach-client")
-		w.WriteHeader(status)
-		_, _ = io.WriteString(w, body)
-	}))
-	t.Cleanup(srv.Close)
-	u, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return u.Host
-}
-
-func startEchoBodyTarget(t *testing.T) string {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		_, _ = w.Write(b)
-	}))
-	t.Cleanup(srv.Close)
-	u, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return u.Host
-}
-
-func TestStripHopByHop(t *testing.T) {
-	h := http.Header{}
-	h.Add("Connection", "X-Drop, Keep-Alive")
-	h.Add("Connection", " x-second-drop ")
-	h.Set("X-Drop", "yes")
-	h.Set("X-Second-Drop", "yes")
-	h.Set("X-Keep", "1")
-	h.Set("Proxy-Authorization", "secret")
-	stripHopByHop(h)
-	for _, name := range []string{"X-Drop", "X-Second-Drop", "Keep-Alive", "Proxy-Authorization", "Connection"} {
-		if h.Get(name) != "" {
-			t.Errorf("%s survived strip", name)
+	var atyp byte
+	var addr []byte
+	switch {
+	case len(host) > 255:
+		return nil, fmt.Errorf("target host %q is too long for a domain name", host)
+	default:
+		if ip := net.ParseIP(host); ip != nil {
+			if v4 := ip.To4(); v4 != nil {
+				atyp, addr = socksAtypIPv4, v4
+			} else {
+				atyp, addr = socksAtypIPv6, ip.To16()
+			}
+		} else {
+			atyp = socksAtypDomain
+			addr = append([]byte{byte(len(host))}, host...)
 		}
 	}
-	if h.Get("X-Keep") != "1" {
-		t.Error("X-Keep should have been kept")
+	frame := make([]byte, 0, len(addr)+6)
+	frame = append(frame, socksVersion, cmd, 0x00, atyp)
+	frame = append(frame, addr...)
+	return append(frame, byte(port>>8), byte(port)), nil
+}
+
+// socksConnectReply performs the RFC 1928 greeting plus one request against
+// the gateway and returns the connection with its reply code. It never judges
+// the code: callers decide what a test expects.
+func socksConnectReply(t *testing.T, gatewayAddr, target string, cmd byte) (net.Conn, byte) {
+	t.Helper()
+	conn, err := net.Dial("tcp", gatewayAddr)
+	if err != nil {
+		t.Fatalf("dial gateway %s: %v", gatewayAddr, err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write(socksGreetingFrame(socksAuthNone)); err != nil {
+		t.Fatalf("write greeting: %v", err)
+	}
+	method := make([]byte, 2)
+	if _, err := io.ReadFull(conn, method); err != nil {
+		t.Fatalf("read method selection: %v", err)
+	}
+	if method[0] != socksVersion || method[1] != socksAuthNone {
+		t.Fatalf("method selection = %#02x %#02x, want 05 00", method[0], method[1])
+	}
+	frame, err := socksRequestFrame(cmd, target)
+	if err != nil {
+		t.Fatalf("encode request for %s: %v", target, err)
+	}
+	if _, err := conn.Write(frame); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatalf("read SOCKS reply: %v", err)
+	}
+	if reply[0] != socksVersion {
+		t.Fatalf("reply version = %#02x, want 05", reply[0])
+	}
+	// Established tunnels carry no timeouts.
+	_ = conn.SetDeadline(time.Time{})
+	return conn, reply[1]
+}
+
+// socksDialVia connects through the gateway to target and returns the tunnel
+// after checking the success reply.
+func socksDialVia(t *testing.T, gatewayAddr, target string) net.Conn {
+	t.Helper()
+	conn, code := socksConnectReply(t, gatewayAddr, target, socksCmdConnect)
+	if code != socksReplySuccess {
+		t.Fatalf("CONNECT reply = 0x%02x, want success 0x00", code)
+	}
+	return conn
+}
+
+// readBanner consumes the echo target's greeting bytes, proving the tunnel
+// carries data from the upstream to the client before the client writes.
+func readBanner(t *testing.T, conn net.Conn) string {
+	t.Helper()
+	banner := make([]byte, len("banner\n"))
+	if _, err := io.ReadFull(conn, banner); err != nil {
+		t.Fatalf("read banner: %v", err)
+	}
+	return string(banner)
+}
+
+// --- raw protocol helpers --------------------------------------------------
+
+// socksRejectCase is one inbound conversation the server must reject.
+type socksRejectCase struct {
+	name        string
+	greeting    []byte
+	methodReply bool   // consume the 2-byte method selection reply first
+	request     []byte // sent after the method selection reply
+	wantReply   []byte // bytes the server writes before closing; nil = silent close
+	// truncated marks an incomplete frame: the server cannot know its length,
+	// so the only correct behavior is to keep waiting (its handshake deadline
+	// closes the session later) rather than to reply.
+	truncated bool
+}
+
+// socksRejectExchange runs one reject conversation and returns the reply bytes
+// the server wrote before closing (nothing for a silent parse rejection).
+func socksRejectExchange(t *testing.T, addr string, tc socksRejectCase) []byte {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial gateway: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(tc.greeting); err != nil {
+		t.Fatalf("write greeting: %v", err)
+	}
+	if tc.methodReply {
+		method := make([]byte, 2)
+		if _, err := io.ReadFull(conn, method); err != nil {
+			t.Fatalf("read method selection: %v", err)
+		}
+		if method[0] != socksVersion || method[1] != socksAuthNone {
+			t.Fatalf("method selection = %#02x %#02x, want 05 00", method[0], method[1])
+		}
+	}
+	if len(tc.request) > 0 {
+		if _, err := conn.Write(tc.request); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+	}
+	if len(tc.wantReply) > 0 {
+		got := make([]byte, len(tc.wantReply))
+		if _, err := io.ReadFull(conn, got); err != nil {
+			t.Fatalf("read reject reply: %v", err)
+		}
+		return got
+	}
+	// A rejected conversation must never write a reply: a complete but invalid
+	// frame closes silently, an incomplete frame keeps waiting for the rest.
+	// The exact read error is OS dependent (EOF, reset, or the test's own
+	// deadline), so only silence is pinned here.
+	window := 2 * time.Second
+	if tc.truncated {
+		window = 200 * time.Millisecond
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(window))
+	var one [1]byte
+	if n, _ := conn.Read(one[:]); n != 0 {
+		t.Fatalf("silent reject wrote % x", one[:n])
+	}
+	return nil
+}
+
+// --- test targets ----------------------------------------------------------
+
+func startRawEchoTarget(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return serveEchoTarget(t, ln)
+}
+
+// serveEchoTarget turns ln into an echo target: every accepted connection gets
+// a short banner and then each byte back, until the peer closes. The banner
+// proves the upstream-to-client direction independent of client traffic.
+func serveEchoTarget(t *testing.T, ln net.Listener) string {
+	t.Helper()
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go echoConn(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func echoConn(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.Write([]byte("banner\n")); err != nil {
+		return
+	}
+	_, _ = io.Copy(conn, conn)
+}
+
+// startParkedTarget accepts connections and never writes or closes them,
+// modeling a target that holds its tunnel open.
+func startParkedTarget(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var held []net.Conn
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, conn)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range held {
+			_ = conn.Close()
+		}
+	})
+	return ln.Addr().String()
+}
+
+// startAbortTarget answers each tunnel with a few bytes and then resets the
+// connection, modeling a target that drops a live stream mid-flight.
+func startAbortTarget(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				_, _ = conn.Write([]byte("partial"))
+				// Let the SOCKS success reply reach the gateway before the
+				// reset: a too-early RST can destroy the unread reply in
+				// flight, which would be a handshake failure instead.
+				time.Sleep(100 * time.Millisecond)
+				if tc, ok := conn.(*net.TCPConn); ok {
+					_ = tc.SetLinger(0) // reset instead of a clean close
+				}
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// --- protocol surface ------------------------------------------------------
+
+func TestReadSocksRequestAcceptsConnectTargets(t *testing.T) {
+	for _, tc := range []struct{ name, target string }{
+		{"ipv4", "127.0.0.1:8080"},
+		{"domain", "example.test:443"},
+		{"ipv6", "[2001:db8::1]:443"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			serverSide, clientSide := net.Pipe()
+			defer func() { _ = serverSide.Close(); _ = clientSide.Close() }()
+			type outcome struct {
+				req socksRequest
+				err error
+			}
+			results := make(chan outcome, 1)
+			go func() {
+				req, err := readSocksRequest(serverSide)
+				results <- outcome{req: req, err: err}
+			}()
+			if _, err := clientSide.Write(socksGreetingFrame(socksAuthNone)); err != nil {
+				t.Fatal(err)
+			}
+			method := make([]byte, 2)
+			if _, err := io.ReadFull(clientSide, method); err != nil {
+				t.Fatalf("read method selection: %v", err)
+			}
+			if method[0] != socksVersion || method[1] != socksAuthNone {
+				t.Fatalf("method selection = %#02x %#02x, want 05 00", method[0], method[1])
+			}
+			frame, err := socksRequestFrame(socksCmdConnect, tc.target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := clientSide.Write(frame); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case got := <-results:
+				if got.err != nil {
+					t.Fatalf("readSocksRequest: %v", got.err)
+				}
+				if got.req.target != tc.target || got.req.cmd != socksCmdConnect {
+					t.Fatalf("request = %+v, want target %q cmd CONNECT", got.req, tc.target)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("readSocksRequest did not finish")
+			}
+		})
 	}
 }
 
-func TestPlainHTTPForwardThroughSOCKS(t *testing.T) {
+func TestJoinSocksTarget(t *testing.T) {
+	got, err := joinSocksTarget("example.test", []byte{0x01, 0xbb})
+	if err != nil || got != "example.test:443" {
+		t.Fatalf("joinSocksTarget = %q, %v; want example.test:443", got, err)
+	}
+	if _, err := joinSocksTarget("example.test", []byte{0x00, 0x00}); err == nil || !strings.Contains(err.Error(), "zero target port") {
+		t.Fatalf("zero port error = %v, want a zero-target-port failure", err)
+	}
+}
+
+func TestWriteSocksReplyShape(t *testing.T) {
+	var wire bytes.Buffer
+	if err := writeSocksReply(&wire, socksReplyCmdUnsupported); err != nil {
+		t.Fatalf("writeSocksReply: %v", err)
+	}
+	want := []byte{socksVersion, socksReplyCmdUnsupported, 0x00, socksAtypIPv4, 0, 0, 0, 0, 0, 0}
+	if !bytes.Equal(wire.Bytes(), want) {
+		t.Fatalf("reply = % x, want % x", wire.Bytes(), want)
+	}
+}
+
+// --- relaying --------------------------------------------------------------
+
+// A CONNECT tunnel must carry bytes both ways for every address type the
+// client may name: IPv4, a domain name, and IPv6.
+func TestSocksConnectRelaysBothDirections(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute, config.KindBalance{})
+	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
+
+	t.Run("ipv4", func(t *testing.T) {
+		testRelayRoundTrip(t, addr, startRawEchoTarget(t))
+	})
+	t.Run("domain", func(t *testing.T) {
+		target := startRawEchoTarget(t)
+		_, port, err := net.SplitHostPort(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The upstream dials the target text as given, so a dotted quad sent
+		// as a domain name exercises the domain framing without DNS.
+		testRelayRoundTrip(t, addr, net.JoinHostPort("127.0.0.1", port))
+	})
+	t.Run("ipv6", func(t *testing.T) {
+		ln, err := net.Listen("tcp6", "[::1]:0")
+		if err != nil {
+			t.Skipf("loopback IPv6 unavailable: %v", err)
+		}
+		testRelayRoundTrip(t, addr, serveEchoTarget(t, ln))
+	})
+
+	snap := pl.Snapshot()[0]
+	if snap.Successes != 3 || snap.Failures != 0 || snap.AuthFailures != 0 {
+		t.Fatalf("pool state = %+v, want three successes", snap)
+	}
+	if status := s.ListenerStatus(); status.Requests != 3 || status.Failovers != 0 {
+		t.Fatalf("listener status = %+v", status)
+	}
+}
+
+func testRelayRoundTrip(t *testing.T, gatewayAddr, target string) {
+	t.Helper()
+	conn := socksDialVia(t, gatewayAddr, target)
+	if got := readBanner(t, conn); got != "banner\n" {
+		t.Fatalf("banner = %q", got)
+	}
+	payload := []byte("ping-through-tunnel")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	echo := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, echo); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if !bytes.Equal(echo, payload) {
+		t.Fatalf("echo = %q, want %q", echo, payload)
+	}
+	_ = conn.Close()
+}
+
+// The tunnel is a raw byte stream: a plain HTTP round trip over it must work
+// exactly as it would over a direct connection.
+func TestTunnelCarriesHTTPTraffic(t *testing.T) {
 	target := startEchoTarget(t)
 	fs := startSocks5Proxy(t, socksOptions{})
-	ts, pl := newForwarder(t, fs)
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute, config.KindBalance{})
+	_, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
 
-	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
+	conn := socksDialVia(t, addr, target)
+	if _, err := fmt.Fprintf(conn, "GET / HTTP/1.0\r\nHost: %s\r\n\r\n", target); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	body, err := io.ReadAll(conn)
 	if err != nil {
-		t.Fatalf("GET: %v", err)
+		t.Fatalf("read response: %v", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK || string(body) != "dial-via-ok" {
-		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+	if !strings.Contains(string(body), "dial-via-ok") {
+		t.Fatalf("response = %q, want the target body", body)
 	}
-	if snap := pl.Snapshot(); snap[0].Successes != 1 || snap[0].Failures != 0 || snap[0].AuthFailures != 0 {
-		t.Fatalf("pool snapshot = %+v", snap[0])
+	if snap := pl.Snapshot()[0]; snap.Successes != 1 || snap.Failures != 0 || snap.AuthFailures != 0 {
+		t.Fatalf("HTTP round trip changed route health: %+v", snap)
 	}
 }
 
-// Only absolute-form http/https requests are forwardable. Anything else is
-// rejected before a route is considered: 400, a bad_request log line, and an
-// untouched pool.
-func TestInvalidInboundRequestsAreRejectedBeforeDialing(t *testing.T) {
+// The server reads exact frame lengths: payload bytes a client pipelines in
+// the same write as its CONNECT must reach the target untouched.
+func TestPipelinedClientBytesReachTarget(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
+	target := startRawEchoTarget(t)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	frame, err := socksRequestFrame(socksCmdConnect, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("TEST-prefix")
+	blob := append(socksGreetingFrame(socksAuthNone), frame...)
+	blob = append(blob, payload...)
+	if _, err := conn.Write(blob); err != nil {
+		t.Fatal(err)
+	}
+
+	method := make([]byte, 2)
+	if _, err := io.ReadFull(conn, method); err != nil {
+		t.Fatalf("read method selection: %v", err)
+	}
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if reply[1] != socksReplySuccess {
+		t.Fatalf("reply code = %#02x, want success", reply[1])
+	}
+	if got := readBanner(t, conn); got != "banner\n" {
+		t.Fatalf("banner = %q", got)
+	}
+	echo := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, echo); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if !bytes.Equal(echo, payload) {
+		t.Fatalf("pipelined bytes arrived as %q, want %q", echo, payload)
+	}
+	if status := s.ListenerStatus(); status.Requests != 1 {
+		t.Fatalf("requests = %d, want 1", status.Requests)
+	}
+}
+
+// --- protocol rejects ------------------------------------------------------
+
+// Every malformed or unsupported inbound conversation must close without
+// dialing anything: pool health and the request counter stay untouched, and
+// the server logs exactly one bad_request line per reject.
+func TestProtocolRejectsNeverTouchPoolOrCounters(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
-	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
-	for _, tc := range []struct{ name, target string }{
-		{"origin-form path", "/only-a-path"},
-		{"unsupported scheme", "ftp://example.test/file"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
-			rec := httptest.NewRecorder()
-			s.ServeHTTP(rec, req)
-			if rec.Code != http.StatusBadRequest {
-				t.Fatalf("status=%d, want 400", rec.Code)
-			}
-			if body := rec.Body.String(); !strings.Contains(body, "proxy request requires") {
-				t.Fatalf("body=%q, want a rejection message", body)
-			}
+	greeting := socksGreetingFrame(socksAuthNone)
+	cases := []socksRejectCase{
+		{name: "bad greeting version", greeting: []byte{0x04, 0x01, 0x00}},
+		{name: "empty method list", greeting: []byte{0x05, 0x00}},
+		{name: "no acceptable method", greeting: []byte{0x05, 0x02, 0x01, 0x02},
+			wantReply: []byte{socksVersion, socksAuthUnaccepted}},
+		{name: "truncated method list", greeting: []byte{0x05, 0x02, 0x00}, truncated: true},
+		{name: "bad request version", greeting: greeting, methodReply: true,
+			request: []byte{0x04, socksCmdConnect, 0x00, socksAtypIPv4, 127, 0, 0, 1, 0, 80}},
+		{name: "non-zero reserved byte", greeting: greeting, methodReply: true,
+			request: []byte{socksVersion, socksCmdConnect, 0x01, socksAtypIPv4, 127, 0, 0, 1, 0, 80}},
+		{name: "unknown address type", greeting: greeting, methodReply: true,
+			request: []byte{socksVersion, socksCmdConnect, 0x00, 0x80, 1, 2, 3, 4}},
+		{name: "truncated ipv4 target", greeting: greeting, methodReply: true, truncated: true,
+			request: []byte{socksVersion, socksCmdConnect, 0x00, socksAtypIPv4, 127, 0}},
+		{name: "zero target port", greeting: greeting, methodReply: true,
+			request: []byte{socksVersion, socksCmdConnect, 0x00, socksAtypIPv4, 127, 0, 0, 1, 0, 0}},
+		{name: "empty domain name", greeting: greeting, methodReply: true,
+			request: []byte{socksVersion, socksCmdConnect, 0x00, socksAtypDomain, 0x00, 0, 0}},
+		{name: "truncated domain name", greeting: greeting, methodReply: true, truncated: true,
+			request: []byte{socksVersion, socksCmdConnect, 0x00, socksAtypDomain, 0x05, 'a'}},
+		{name: "truncated domain port", greeting: greeting, methodReply: true, truncated: true,
+			request: []byte{socksVersion, socksCmdConnect, 0x00, socksAtypDomain, 0x03, 'a', 'b', 'c', 0x01}},
+	}
+	cmdUnsupportedReply := []byte{socksVersion, socksReplyCmdUnsupported, 0x00, socksAtypIPv4, 0, 0, 0, 0, 0, 0}
+	for _, command := range []struct {
+		name string
+		cmd  byte
+	}{{"bind command", socksCmdBind}, {"udp associate command", socksCmdUDPAssociate}} {
+		frame, err := socksRequestFrame(command.cmd, "example.test:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cases = append(cases, socksRejectCase{
+			name: command.name, greeting: greeting, methodReply: true,
+			request: frame, wantReply: cmdUnsupportedReply,
 		})
 	}
-	if got := len(fs.hits); got != 0 {
-		t.Fatalf("SOCKS dialed %d times for rejected requests, want 0", got)
-	}
-	if snap := pl.Snapshot()[0]; snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 {
-		t.Fatalf("rejected requests changed pool state: %+v", snap)
-	}
-	if out := logs.String(); strings.Count(out, "error_kind=bad_request") != 2 {
-		t.Fatalf("logs = %s, want one bad_request line per rejected request", out)
-	}
-}
 
-func TestHTTPSRoundTripThroughSOCKS(t *testing.T) {
-	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "https-via-socks")
-	}))
-	defer target.Close()
-	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute, config.KindBalance{})
-	cfg := defaultRuntime()
-	cfg.TargetTLSInsecure = true
-	s := newRuntimeServer(pl, cfg, testLogger())
-
-	out, err := http.NewRequest(http.MethodGet, target.URL, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp, err := s.roundTripWithSettings(context.Background(), pl.PickFor(nil, nil), out, s.settings())
-	if err != nil {
-		t.Fatalf("roundTripWithSettings: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK || string(body) != "https-via-socks" {
-		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
-	}
-}
-
-func TestTargetStatusesPassThroughWithoutRotation(t *testing.T) {
-	for _, status := range []int{http.StatusProxyAuthRequired, http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
-			target := startStatusTarget(t, status, "target-status")
-			fs := startSocks5Proxy(t, socksOptions{})
-			ts, pl := newForwarder(t, fs)
-
-			resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
-			if err != nil {
-				t.Fatalf("GET: %v", err)
-			}
-			body, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			if resp.StatusCode != status || string(body) != "target-status" {
-				t.Fatalf("status=%d body=%q", resp.StatusCode, body)
-			}
-			if resp.Header.Get("Proxy-Authorization") != "" {
-				t.Fatal("Proxy-Authorization response header was forwarded")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := socksRejectExchange(t, addr, tc)
+			if !bytes.Equal(got, tc.wantReply) {
+				t.Fatalf("reject reply = % x, want % x", got, tc.wantReply)
 			}
 			snap := pl.Snapshot()[0]
-			if snap.Successes != 1 || snap.Failures != 0 || snap.AuthFailures != 0 {
-				t.Fatalf("status %d changed route health: %+v", status, snap)
+			if snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 || !snap.Available {
+				t.Fatalf("reject changed route health: %+v", snap)
 			}
-			if got := len(fs.hits); got != 1 {
-				t.Fatalf("SOCKS attempts = %d, want 1", got)
+			if got := len(fs.hits); got != 0 {
+				t.Fatalf("reject dialed the upstream %d times", got)
+			}
+			if status := s.ListenerStatus(); status.Requests != 0 || status.Failovers != 0 {
+				t.Fatalf("reject advanced listener counters: %+v", status)
 			}
 		})
 	}
-}
 
-func TestRotatesOnEndpointDialFailure(t *testing.T) {
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	output := logs.String()
+	if got := strings.Count(output, "error_kind=bad_request"); got != len(cases) {
+		t.Fatalf("bad_request log lines = %d, want %d:\n%s", got, len(cases), output)
 	}
-	deadURL := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
-	_ = closed.Close()
-	good := startSocks5Proxy(t, socksOptions{})
-	target := startEchoTarget(t)
-	pl := pool.NewRoutes(mixedRoutes(deadURL, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
-	ts := newForwarderCfg(t, pl, defaultRuntime())
-
-	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
+	if !strings.Contains(output, "socks request rejected") {
+		t.Fatalf("parse rejects were not logged as rejections:\n%s", output)
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status=%d, want 200", resp.StatusCode)
-	}
-	snap := pl.Snapshot()
-	if snap[0].Failures != 1 || snap[0].Available || snap[1].Successes != 1 {
-		t.Fatalf("snapshot = %+v", snap)
+	if !strings.Contains(output, "socks command not supported") {
+		t.Fatalf("BIND/UDP rejects were not logged as unsupported commands:\n%s", output)
 	}
 }
 
-func TestLogsCorrelateDialFallbackAndRedactCredentials(t *testing.T) {
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadURL := &url.URL{Scheme: "socks5", User: url.UserPassword("route-user", "route-password"), Host: closed.Addr().String()}
-	_ = closed.Close()
+// --- retry and health semantics -------------------------------------------
+
+// An endpoint dial failure cools the route down, excludes it, and falls back
+// to the next eligible route; the client sees only the successful tunnel.
+func TestDialFailureCooldownsRouteExcludedAndFallsBack(t *testing.T) {
+	dead := &url.URL{Scheme: "socks5", User: url.UserPassword("route-user", "route-password"), Host: "dead.test:1080"}
 	good := startSocks5Proxy(t, socksOptions{})
-	target := startEchoTarget(t)
-	pl := pool.NewRoutes(mixedRoutes(deadURL, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
-	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
-
-	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
+	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	s.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+		if pu.Host == dead.Host {
+			return nil, &ProxyDialError{Err: errors.New("connect refused")}
+		}
+		return dialVia(ctx, pu, target, timeout)
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status=%d, want 200", resp.StatusCode)
-	}
+	addr := startServer(t, s)
 
-	// Responses flush before the completion record is written, so wait for
-	// the final line instead of snapshotting at client completion.
-	output := waitForLog(t, &logs, "msg=request")
+	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	readBanner(t, conn)
+	_ = conn.Close()
+
+	snap := pl.Snapshot()
+	if snap[0].Failures != 1 || snap[0].Successes != 0 || snap[0].Available {
+		t.Fatalf("failed route state = %+v", snap[0])
+	}
+	if snap[1].Successes != 1 || snap[1].Failures != 0 {
+		t.Fatalf("fallback route state = %+v", snap[1])
+	}
+	if status := s.ListenerStatus(); status.Requests != 1 || status.Failovers != 1 {
+		t.Fatalf("listener status = %+v, want one request and one fallback", status)
+	}
+	output := waitForLog(t, &logs, "msg=tunnel")
 	for _, want := range []string{
 		"request_id=1",
 		"msg=\"upstream dial failed\"",
 		"error_kind=proxy_connect",
 		"cooldown=30s",
-		"msg=request",
+		"msg=tunnel",
 		"attempts=2",
 	} {
 		if !strings.Contains(output, want) {
@@ -351,706 +739,22 @@ func TestLogsCorrelateDialFallbackAndRedactCredentials(t *testing.T) {
 	}
 }
 
-func TestAuthFailureFallsBackWithoutDialCooldown(t *testing.T) {
-	bad := startSocks5Proxy(t, socksOptions{user: "u", pass: "p"})
-	good := startSocks5Proxy(t, socksOptions{})
-	target := startEchoTarget(t)
-	ts, pl := newForwarder(t, bad, good)
-
-	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status=%d, want 200", resp.StatusCode)
-	}
-	snap := pl.Snapshot()
-	if !snap[0].AuthBlocked || snap[0].AuthFailures != 1 || snap[0].Failures != 0 || snap[0].CooldownFor != "0s" {
-		t.Fatalf("bad auth state = %+v", snap[0])
-	}
-	if snap[1].Successes != 1 {
-		t.Fatalf("good route state = %+v", snap[1])
-	}
-}
-
-func TestRotatesOnHandshakeFailure(t *testing.T) {
-	reject := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
-	good := startSocks5Proxy(t, socksOptions{})
-	target := startEchoTarget(t)
-	pl := pool.NewRoutes(mixedRoutes(reject.URL, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
-	ts := newForwarderCfg(t, pl, defaultRuntime())
-
-	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status=%d, want 200", resp.StatusCode)
-	}
-	snap := pl.Snapshot()
-	if snap[0].Failures != 1 || snap[0].Available || snap[1].Successes != 1 {
-		t.Fatalf("snapshot = %+v", snap)
-	}
-}
-
-func TestSOCKSHandshakeFailureExhaustsToNoRoute(t *testing.T) {
-	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
-	ts, pl := newForwarder(t, fs)
-
-	resp, err := proxiedClient(t, ts.URL).Get("http://example.com/")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway || string(body) != "no usable upstream SOCKS routes\n" {
-		t.Fatalf("status=%d body=%q, want sanitized no-route 502", resp.StatusCode, body)
-	}
-	snap := pl.Snapshot()[0]
-	if snap.Successes != 0 || snap.AuthFailures != 0 || snap.Failures != 1 || snap.Available {
-		t.Fatalf("handshake failure did not record route health: %+v", snap)
-	}
-	if got := len(fs.hits); got != 1 {
-		t.Fatalf("SOCKS attempts = %d, want 1", got)
-	}
-}
-
-func TestPOSTReplaysOnlyAfterDialFailure(t *testing.T) {
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	deadURL := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
-	_ = closed.Close()
-	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(deadURL, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
-	ts := newForwarderCfg(t, pl, defaultRuntime())
-
-	resp, err := proxiedClient(t, ts.URL).Post("http://"+startEchoBodyTarget(t)+"/", "text/plain", strings.NewReader("payload-123"))
-	if err != nil {
-		t.Fatalf("POST: %v", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || string(body) != "payload-123" {
-		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
-	}
-}
-
-type stagedBody struct {
-	first   []byte
-	release <-chan struct{}
-	rest    []byte
-
-	mu       sync.Mutex
-	read     bool
-	released bool
-}
-
-func (b *stagedBody) Read(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if !b.read {
-		b.read = true
-		n := copy(p, b.first)
-		b.first = b.first[n:]
-		return n, nil
-	}
-	if !b.released {
-		b.mu.Unlock()
-		<-b.release
-		b.mu.Lock()
-		b.released = true
-	}
-	if len(b.rest) == 0 {
-		return 0, io.EOF
-	}
-	n := copy(p, b.rest)
-	b.rest = b.rest[n:]
-	return n, nil
-}
-
-func (b *stagedBody) Close() error { return nil }
-
-func TestKnownLargePOSTStreamsBeforeFullBodyIsAvailable(t *testing.T) {
-	allowRest := make(chan struct{})
-	payload := "streamed-payload"
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		_, _ = w.Write(b)
-	}))
-	defer target.Close()
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dead := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
-	_ = closed.Close()
-	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute, config.KindBalance{})
-	cfg := defaultRuntime()
-	cfg.MaxBodyBuffer = 4
-	forwarder := newRuntimeServer(pl, cfg, testLogger())
-
-	body := &stagedBody{first: []byte(payload[:4]), rest: []byte(payload[4:]), release: allowRest}
-	req := httptest.NewRequest(http.MethodPost, target.URL+"/", body)
-	req.ContentLength = int64(len(payload))
-	rw := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() {
-		forwarder.ServeHTTP(rw, req)
-		close(done)
-	}()
-
-	select {
-	case <-good.hits:
-	case <-time.After(time.Second):
-		t.Fatal("SOCKS setup did not begin before the full body was available")
-	}
-	close(allowRest)
-	<-done
-
-	resp := rw.Result()
-	defer func() { _ = resp.Body.Close() }()
-	got, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK || string(got) != payload {
-		t.Fatalf("status=%d body=%q", resp.StatusCode, got)
-	}
-	snap := pl.Snapshot()
-	if snap[0].Failures != 1 || snap[1].Successes != 1 {
-		t.Fatalf("pool state=%+v", snap)
-	}
-}
-
-func TestRequestBodyBufferBoundaries(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		cap  int64
-		body string
-	}{
-		{"zero streams nonempty body", 0, "x"},
-		{"exact cap is replayable", 3, "abc"},
-		{"above cap streams", 3, "abcd"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			fs := startSocks5Proxy(t, socksOptions{})
-			pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
-			cfg := defaultRuntime()
-			cfg.MaxBodyBuffer = tc.cap
-			ts := newForwarderCfg(t, pl, cfg)
-
-			resp, err := proxiedClient(t, ts.URL).Post("http://"+startEchoBodyTarget(t)+"/", "text/plain", strings.NewReader(tc.body))
-			if err != nil {
-				t.Fatalf("POST: %v", err)
-			}
-			got, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			if resp.StatusCode != http.StatusOK || string(got) != tc.body {
-				t.Fatalf("status=%d body=%q, want %q", resp.StatusCode, got, tc.body)
-			}
-		})
-	}
-}
-
-func TestBufferedRequestFraming(t *testing.T) {
-	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch} {
-		t.Run(method+" empty", func(t *testing.T) {
-			r := httptest.NewRequest(method, "http://example.test/", nil)
-			out := buildOutbound(r, []byte{})
-			var wire bytes.Buffer
-			if err := out.Write(&wire); err != nil {
-				t.Fatalf("write outbound request: %v", err)
-			}
-			got := wire.String()
-			if !strings.Contains(got, "Content-Length: 0\r\n") {
-				t.Fatalf("missing zero content length:\n%s", got)
-			}
-			if strings.Contains(got, "Transfer-Encoding: chunked") {
-				t.Fatalf("empty request was chunked:\n%s", got)
-			}
-		})
-	}
-	t.Run("GET no body", func(t *testing.T) {
-		r := httptest.NewRequest(http.MethodGet, "http://example.test/", nil)
-		out := buildOutbound(r, nil)
-		var wire bytes.Buffer
-		if err := out.Write(&wire); err != nil {
-			t.Fatalf("write outbound request: %v", err)
-		}
-		got := wire.String()
-		for _, unexpected := range []string{"Content-Length:", "Transfer-Encoding:"} {
-			if strings.Contains(got, unexpected) {
-				t.Fatalf("bodyless GET contained %q:\n%s", unexpected, got)
-			}
-		}
-	})
-	t.Run("chunked body without trailers", func(t *testing.T) {
-		r := httptest.NewRequest(http.MethodPost, "http://example.test/", nil)
-		r.TransferEncoding = []string{"chunked"}
-		out := buildOutbound(r, []byte("abc"))
-		var wire bytes.Buffer
-		if err := out.Write(&wire); err != nil {
-			t.Fatalf("write outbound request: %v", err)
-		}
-		got := wire.String()
-		if !strings.Contains(got, "Content-Length: 3\r\n") || strings.Contains(got, "Transfer-Encoding:") {
-			t.Fatalf("chunked buffered request was not normalized:\n%s", got)
-		}
-	})
-	t.Run("empty body with trailer", func(t *testing.T) {
-		r := httptest.NewRequest(http.MethodPost, "http://example.test/", nil)
-		r.TransferEncoding = []string{"chunked"}
-		r.Trailer = http.Header{"X-Checksum": {"done"}}
-		out := buildOutbound(r, []byte{})
-		var wire bytes.Buffer
-		if err := out.Write(&wire); err != nil {
-			t.Fatalf("write outbound request: %v", err)
-		}
-		got := wire.String()
-		for _, want := range []string{"Transfer-Encoding: chunked\r\n", "Trailer: X-Checksum\r\n", "0\r\nX-Checksum: done\r\n\r\n"} {
-			if !strings.Contains(got, want) {
-				t.Fatalf("trailer request missing %q:\n%s", want, got)
-			}
-		}
-	})
-}
-
-type trailerReadCloser struct {
-	body    []byte
-	trailer http.Header
-	done    bool
-}
-
-func (b *trailerReadCloser) Read(p []byte) (int, error) {
-	if len(b.body) > 0 {
-		n := copy(p, b.body)
-		b.body = b.body[n:]
-		return n, nil
-	}
-	if !b.done {
-		b.done = true
-		b.trailer.Set("X-Checksum", "streamed")
-	}
-	return 0, io.EOF
-}
-
-func (b *trailerReadCloser) Close() error { return nil }
-
-func TestStreamedChunkedBodyForwardsTrailers(t *testing.T) {
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		_, _ = fmt.Fprintf(w, "%s:%s", body, r.Trailer.Get("X-Checksum"))
-	}))
-	defer target.Close()
-	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
-	cfg := defaultRuntime()
-	cfg.MaxBodyBuffer = 3
-	s := newRuntimeServer(pl, cfg, testLogger())
-
-	trailer := http.Header{"X-Checksum": nil}
-	body := &trailerReadCloser{body: []byte("abcd"), trailer: trailer}
-	req := httptest.NewRequest(http.MethodPost, target.URL+"/", body)
-	req.ContentLength = -1
-	req.TransferEncoding = []string{"chunked"}
-	req.Trailer = trailer
-	rec := httptest.NewRecorder()
-
-	s.ServeHTTP(rec, req)
-	resp := rec.Result()
-	defer func() { _ = resp.Body.Close() }()
-	got, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK || string(got) != "abcd:streamed" {
-		t.Fatalf("status=%d body=%q", resp.StatusCode, got)
-	}
-}
-
-func TestStreamedPOSTReplaysAfterDialFallback(t *testing.T) {
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dead := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
-	_ = closed.Close()
-	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute, config.KindBalance{})
-	cfg := defaultRuntime()
-	cfg.MaxBodyBuffer = 3
-	ts := newForwarderCfg(t, pl, cfg)
-
-	resp, err := proxiedClient(t, ts.URL).Post("http://"+startEchoBodyTarget(t)+"/", "text/plain", strings.NewReader("abcd"))
-	if err != nil {
-		t.Fatalf("POST: %v", err)
-	}
-	got, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || string(got) != "abcd" {
-		t.Fatalf("status=%d body=%q", resp.StatusCode, got)
-	}
-	snap := pl.Snapshot()
-	if snap[0].Failures != 1 || snap[1].Successes != 1 {
-		t.Fatalf("pool state = %+v", snap)
-	}
-}
-
-func TestPOSTReplaysAfterAuthFallback(t *testing.T) {
-	bad := startSocks5Proxy(t, socksOptions{user: "TEST-user", pass: "TEST-pass"})
-	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(bad.URL, good.URL), time.Second, time.Minute, config.KindBalance{})
-	cfg := defaultRuntime()
-	cfg.MaxBodyBuffer = 3
-	ts := newForwarderCfg(t, pl, cfg)
-
-	resp, err := proxiedClient(t, ts.URL).Post("http://"+startEchoBodyTarget(t)+"/", "text/plain", strings.NewReader("abc"))
-	if err != nil {
-		t.Fatalf("POST: %v", err)
-	}
-	got, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || string(got) != "abc" {
-		t.Fatalf("status=%d body=%q", resp.StatusCode, got)
-	}
-	snap := pl.Snapshot()
-	if snap[0].AuthFailures != 1 || snap[0].Failures != 0 || snap[1].Successes != 1 {
-		t.Fatalf("pool state = %+v", snap)
-	}
-}
-
-type errorReadCloser struct {
-	err    error
-	closed bool
-}
-
-func (b *errorReadCloser) Read([]byte) (int, error) { return 0, b.err }
-func (b *errorReadCloser) Close() error {
-	b.closed = true
-	return nil
-}
-
-func TestBodyReadErrorIsLoggedAndDoesNotChangePool(t *testing.T) {
-	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
-	var logs safeLogBuffer
-	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
-	body := &errorReadCloser{err: errors.New("TEST body read failure")}
-	req := httptest.NewRequest(http.MethodPost, "http://TEST-target.invalid/", body)
-	req.Host = "TEST-target.invalid"
-	rec := httptest.NewRecorder()
-
-	s.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status=%d, want 400", rec.Code)
-	}
-	if !body.closed {
-		t.Fatal("request body was not closed")
-	}
-	if snap := pl.Snapshot()[0]; snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 {
-		t.Fatalf("body read failure changed pool state: %+v", snap)
-	}
-	output := logs.String()
-	for _, want := range []string{"request_id=1", "msg=\"request rejected\"", "error_kind=body_read"} {
-		if !strings.Contains(output, want) {
-			t.Errorf("logs missing %q:\n%s", want, output)
-		}
-	}
-}
-
-type blockingCloseBody struct {
-	closed chan struct{}
-	once   sync.Once
-	sent   bool
-}
-
-func (b *blockingCloseBody) Read(p []byte) (int, error) {
-	if b.sent {
-		return 0, io.EOF
-	}
-	b.sent = true
-	p[0] = 'x'
-	return 1, nil
-}
-func (b *blockingCloseBody) Close() error {
-	b.once.Do(func() { close(b.closed) })
-	return nil
-}
-
-func TestCanceledStreamedRequestDoesNotMutatePoolOrRetry(t *testing.T) {
-	first, err := url.Parse("socks5://TEST-first.invalid:1080")
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := url.Parse("socks5://TEST-second.invalid:1080")
-	if err != nil {
-		t.Fatal(err)
-	}
-	pl := pool.NewRoutes(mixedRoutes(first, second), time.Second, time.Minute, config.KindBalance{})
-	cfg := defaultRuntime()
-	cfg.MaxBodyBuffer = 0
-	s := newRuntimeServer(pl, cfg, testLogger())
-	ctx, cancel := context.WithCancel(context.Background())
-	body := &blockingCloseBody{closed: make(chan struct{})}
-	req := httptest.NewRequest(http.MethodPost, "http://TEST-target.invalid/", body).WithContext(ctx)
-	req.Host = "TEST-target.invalid"
-	s.dial = func(context.Context, *url.URL, string, time.Duration) (net.Conn, error) {
-		cancel()
-		return nil, &ProxyDialError{Err: context.Canceled}
-	}
-	rec := httptest.NewRecorder()
-
-	s.ServeHTTP(rec, req)
-	select {
-	case <-body.closed:
-	case <-time.After(time.Second):
-		t.Fatal("streamed request body was not closed")
-	}
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d, want unwritten recorder", rec.Code)
-	}
-	if s.failovers.Load() != 0 {
-		t.Fatalf("failovers=%d, want 0", s.failovers.Load())
-	}
-	for _, snap := range pl.Snapshot() {
-		if snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 || !snap.Available {
-			t.Fatalf("cancellation changed pool state: %+v", snap)
-		}
-	}
-}
-
-func TestDialTCPCancellationIsNotEndpointFailure(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := dialTCP(ctx, "127.0.0.1:1", time.Second)
-	if !errors.Is(err, context.Canceled) || isProxyDialError(err) {
-		t.Fatalf("dialTCP cancellation = %T %v, want plain context cancellation", err, err)
-	}
-}
-
-type hijackerResponseWriter struct {
-	conn net.Conn
-}
-
-func (w *hijackerResponseWriter) Header() http.Header         { return http.Header{} }
-func (w *hijackerResponseWriter) Write(p []byte) (int, error) { return len(p), nil }
-func (w *hijackerResponseWriter) WriteHeader(int)             {}
-func (w *hijackerResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	return w.conn, bufio.NewReadWriter(bufio.NewReader(w.conn), bufio.NewWriter(w.conn)), nil
-}
-
-func TestCanceledTunnelDoesNotMutatePoolOrSend502(t *testing.T) {
-	first, err := url.Parse("socks5://TEST-first.invalid:1080")
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := url.Parse("socks5://TEST-second.invalid:1080")
-	if err != nil {
-		t.Fatal(err)
-	}
-	pl := pool.NewRoutes(mixedRoutes(first, second), time.Second, time.Minute, config.KindBalance{})
-	s := newRuntimeServer(pl, defaultRuntime(), testLogger())
-	ctx, cancel := context.WithCancel(context.Background())
-	s.dial = func(context.Context, *url.URL, string, time.Duration) (net.Conn, error) {
-		cancel()
-		return nil, &ProxyDialError{Err: context.Canceled}
-	}
-	serverConn, clientConn := net.Pipe()
-	defer func() { _ = clientConn.Close() }()
-	req := httptest.NewRequest(http.MethodConnect, "http://TEST-target.invalid:443", nil).WithContext(ctx)
-	writer := &hijackerResponseWriter{conn: serverConn}
-	done := make(chan struct{})
-	go func() {
-		s.ServeHTTP(writer, req)
-		close(done)
-	}()
-	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
-	var one [1]byte
-	n, readErr := clientConn.Read(one[:])
-	if n != 0 || readErr == nil {
-		t.Fatalf("canceled tunnel response = %q, %v; want closed connection without 502", one[:n], readErr)
-	}
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("canceled tunnel handler did not return")
-	}
-	if s.failovers.Load() != 0 {
-		t.Fatalf("failovers=%d, want 0", s.failovers.Load())
-	}
-	for _, snap := range pl.Snapshot() {
-		if snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 || !snap.Available {
-			t.Fatalf("cancellation changed pool state: %+v", snap)
-		}
-	}
-}
-
-func connectThrough(t *testing.T, proxyAddr, targetHostPort string) (net.Conn, *bufio.Reader, *http.Response) {
-	t.Helper()
-	pu, err := url.Parse(proxyAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn, err := net.Dial("tcp", pu.Host)
-	if err != nil {
-		t.Fatalf("dial proxy: %v", err)
-	}
-	_, _ = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetHostPort, targetHostPort)
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
-	if err != nil {
-		_ = conn.Close()
-		t.Fatalf("read CONNECT response: %v", err)
-	}
-	return conn, br, resp
-}
-
-func TestConnectTunnelThroughSOCKS(t *testing.T) {
-	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "tunnel-ok")
-	}))
-	defer tlsSrv.Close()
-	tu, _ := url.Parse(tlsSrv.URL)
-	fs := startSocks5Proxy(t, socksOptions{})
-	ts, pl := newForwarder(t, fs)
-
-	conn, _, resp := connectThrough(t, ts.URL, tu.Host)
-	defer func() { _ = conn.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("CONNECT status=%d", resp.StatusCode)
-	}
-	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
-	if err := tlsConn.Handshake(); err != nil {
-		t.Fatalf("TLS handshake: %v", err)
-	}
-	client := &http.Client{Transport: &http.Transport{DialTLSContext: func(context.Context, string, string) (net.Conn, error) {
-		return tlsConn, nil
-	}}}
-	get, err := client.Get(tlsSrv.URL)
-	if err != nil {
-		t.Fatalf("GET through tunnel: %v", err)
-	}
-	body, _ := io.ReadAll(get.Body)
-	_ = get.Body.Close()
-	if string(body) != "tunnel-ok" {
-		t.Fatalf("body=%q", body)
-	}
-	if snap := pl.Snapshot()[0]; snap.Successes != 1 || snap.Failures != 0 {
-		t.Fatalf("pool state=%+v", snap)
-	}
-}
-
-func TestTunnelAuthFailureFallsBack(t *testing.T) {
-	bad := startSocks5Proxy(t, socksOptions{user: "u", pass: "p"})
-	good := startSocks5Proxy(t, socksOptions{})
-	target := startEchoTarget(t)
-	ts, pl := newForwarder(t, bad, good)
-
-	conn, _, resp := connectThrough(t, ts.URL, target)
-	_ = conn.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
-	}
-	snap := pl.Snapshot()
-	if !snap[0].AuthBlocked || snap[0].Failures != 0 || snap[1].Successes != 1 {
-		t.Fatalf("pool state=%+v", snap)
-	}
-}
-
-func TestTunnelLogsCorrelateDialFallback(t *testing.T) {
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dead := &url.URL{Scheme: "socks5", User: url.UserPassword("TEST-user", "TEST-pass"), Host: closed.Addr().String()}
-	_ = closed.Close()
-	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute, config.KindBalance{})
-	var logs safeLogBuffer
-	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
-
-	conn, _, resp := connectThrough(t, ts.URL, startEchoTarget(t))
-	_ = conn.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
-	}
-	output := waitForLog(t, &logs, "msg=tunnel")
-	for _, want := range []string{
-		"request_id=1",
-		"msg=\"upstream dial failed\"",
-		"error_kind=proxy_connect",
-		"cooldown=1s",
-		"msg=tunnel",
-		"attempts=2",
-	} {
-		if !strings.Contains(output, want) {
-			t.Errorf("logs missing %q:\n%s", want, output)
-		}
-	}
-	for _, secret := range []string{"TEST-user", "TEST-pass"} {
-		if strings.Contains(output, secret) {
-			t.Errorf("logs leaked %q:\n%s", secret, output)
-		}
-	}
-}
-
-func TestTunnelAuthFallbackLogsWithoutCooldown(t *testing.T) {
-	bad := startSocks5Proxy(t, socksOptions{user: "TEST-user", pass: "TEST-pass"})
-	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(bad.URL, good.URL), time.Second, time.Minute, config.KindBalance{})
-	var logs safeLogBuffer
-	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
-
-	conn, _, resp := connectThrough(t, ts.URL, startEchoTarget(t))
-	_ = conn.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
-	}
-	output := waitForLog(t, &logs, "msg=tunnel")
-	if !strings.Contains(output, "error_kind=auth_route") || !strings.Contains(output, "attempts=2") {
-		t.Fatalf("logs did not record auth fallback and success:\n%s", output)
-	}
-	if strings.Contains(output, "cooldown=") {
-		t.Fatalf("auth fallback logged a cooldown:\n%s", output)
-	}
-}
-
-func TestTunnelHandshakeFailureExhaustsToNoRoute(t *testing.T) {
-	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
-	ts, pl := newForwarder(t, fs)
-
-	conn, _, resp := connectThrough(t, ts.URL, "example.com:443")
-	_ = conn.Close()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("CONNECT status=%d, want 502", resp.StatusCode)
-	}
-	snap := pl.Snapshot()[0]
-	if snap.Successes != 0 || snap.AuthFailures != 0 || snap.Failures != 1 || snap.Available {
-		t.Fatalf("handshake failure did not record route health: %+v", snap)
-	}
-	if got := len(fs.hits); got != 1 {
-		t.Fatalf("SOCKS attempts=%d, want 1", got)
-	}
-}
-
-func TestTunnelLogsCorrelateHandshakeFallback(t *testing.T) {
+// A SOCKS handshake failure before the tunnel exists is socks_connect: the
+// same cooldown-and-fallback treatment as an endpoint dial failure.
+func TestHandshakeFailureFallsBackWithSocksConnectKind(t *testing.T) {
 	reject := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(reject.URL, good.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
-	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
-	conn, _, resp := connectThrough(t, ts.URL, startEchoTarget(t))
+	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	readBanner(t, conn)
 	_ = conn.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
+
+	snap := pl.Snapshot()
+	if snap[0].Failures != 1 || snap[0].Available || snap[1].Successes != 1 {
+		t.Fatalf("pool state = %+v", snap)
 	}
 	output := waitForLog(t, &logs, "msg=tunnel")
 	for _, want := range []string{
@@ -1067,212 +771,174 @@ func TestTunnelLogsCorrelateHandshakeFallback(t *testing.T) {
 	}
 }
 
-func TestTunnelRelaysPipelinedClientBytes(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	received := make(chan string, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer func() { _ = conn.Close() }()
-		buf := make([]byte, len("TEST-prefix"))
-		if _, err := io.ReadFull(conn, buf); err == nil {
-			received <- string(buf)
-		}
-	}()
-	t.Cleanup(func() { _ = ln.Close() })
-	fs := startSocks5Proxy(t, socksOptions{})
-	ts, _ := newForwarder(t, fs)
-	pu, err := url.Parse(ts.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn, err := net.Dial("tcp", pu.Host)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = conn.Close() }()
-	request := "CONNECT " + ln.Addr().String() + " HTTP/1.1\r\nHost: " + ln.Addr().String() + "\r\n\r\nTEST-prefix"
-	if _, err := conn.Write([]byte(request)); err != nil {
-		t.Fatal(err)
-	}
-	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
-	}
-	select {
-	case got := <-received:
-		if got != "TEST-prefix" {
-			t.Fatalf("pipelined bytes=%q", got)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("target did not receive pipelined bytes")
-	}
-}
+// An authentication failure blocks the route for auth and allows a fallback,
+// but never creates dial cooldown.
+func TestAuthFailureFallsBackWithoutDialCooldown(t *testing.T) {
+	bad := startSocks5Proxy(t, socksOptions{user: "TEST-user", pass: "TEST-pass"})
+	good := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(bad.URL, good.URL), time.Second, time.Minute, config.KindBalance{})
+	var logs safeLogBuffer
+	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
-type blockingCloseConn struct {
-	net.Conn
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (c *blockingCloseConn) Close() error {
-	c.once.Do(func() { close(c.started) })
-	<-c.release
-	return c.Conn.Close()
-}
-
-func TestCloseTunnelsDoesNotHoldConnectionMapLockWhileClosing(t *testing.T) {
-	serverSide, clientSide := net.Pipe()
-	defer func() { _ = clientSide.Close() }()
-	conn := &blockingCloseConn{
-		Conn:    serverSide,
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}), defaultRuntime(), testLogger())
-	s.trackConn(conn)
-	closed := make(chan struct{})
-	go func() {
-		s.CloseTunnels()
-		close(closed)
-	}()
-	select {
-	case <-conn.started:
-	case <-time.After(time.Second):
-		t.Fatal("CloseTunnels did not call connection Close")
-	}
-	untracked := make(chan struct{})
-	go func() {
-		s.untrackConn(conn)
-		close(untracked)
-	}()
-	select {
-	case <-untracked:
-	case <-time.After(time.Second):
-		t.Fatal("connection map lock remained held while Close blocked")
-	}
-	close(conn.release)
-	select {
-	case <-closed:
-	case <-time.After(time.Second):
-		t.Fatal("CloseTunnels did not return after Close unblocked")
-	}
-}
-
-func TestCloseTunnelsClosesIdleHijackedTunnel(t *testing.T) {
-	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
-	s := newRuntimeServer(pl, defaultRuntime(), testLogger())
-	ts := httptest.NewServer(s)
-	defer ts.Close()
-
-	conn, _, resp := connectThrough(t, ts.URL, startEchoTarget(t))
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
-	}
-	s.CloseTunnels()
-	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
-	var one [1]byte
-	if _, err := conn.Read(one[:]); err == nil {
-		t.Fatal("idle hijacked tunnel stayed open after CloseTunnels")
-	}
+	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	readBanner(t, conn)
 	_ = conn.Close()
-}
 
-func TestAdminEndpoints(t *testing.T) {
-	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute, config.KindBalance{})
-	s := NewRuntime(pool.NewStore(defaultRuntime(), pl), testLogger(), "9.9.9-test", "mixed", config.EgressV4, config.EgressV6)
-	admin := httptest.NewServer(s.AdminMux())
-	defer admin.Close()
-
-	hresp, err := http.Get(admin.URL + "/healthz")
-	if err != nil {
-		t.Fatalf("healthz: %v", err)
+	snap := pl.Snapshot()
+	if !snap[0].AuthBlocked || snap[0].AuthFailures != 1 || snap[0].Failures != 0 || snap[0].CooldownFor != "0s" {
+		t.Fatalf("auth-blocked route state = %+v", snap[0])
 	}
-	body, _ := io.ReadAll(hresp.Body)
-	_ = hresp.Body.Close()
-	if hresp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) != "ok" {
-		t.Fatalf("healthz status=%d body=%q", hresp.StatusCode, body)
+	if snap[1].Successes != 1 || snap[1].Failures != 0 {
+		t.Fatalf("fallback route state = %+v", snap[1])
 	}
-
-	sresp, err := http.Get(admin.URL + "/status")
-	if err != nil {
-		t.Fatalf("status: %v", err)
-	}
-	defer func() { _ = sresp.Body.Close() }()
-	if sresp.StatusCode != http.StatusOK {
-		t.Fatalf("status code=%d", sresp.StatusCode)
-	}
-	var got map[string]any
-	if err := json.NewDecoder(sresp.Body).Decode(&got); err != nil {
-		t.Fatalf("decode status: %v", err)
-	}
-	if got["version"] != "9.9.9-test" {
-		t.Fatalf("status=%v", got)
-	}
-}
-
-// startAbortTarget answers each request with a partial body under an
-// oversized Content-Length, then resets the connection — modeling a target or
-// provider that drops a live stream mid-flight.
-func startAbortTarget(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go abortTargetConn(conn)
+	output := waitForLog(t, &logs, "msg=tunnel")
+	for _, want := range []string{
+		"request_id=1",
+		"msg=\"upstream auth failed\"",
+		"error_kind=auth_route",
+		"msg=tunnel",
+		"attempts=2",
+		"endpoint accepted no offered authentication method",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("logs missing %q:\n%s", want, output)
 		}
-	}()
-	return ln.Addr().String()
-}
-
-func abortTargetConn(conn net.Conn) {
-	defer func() { _ = conn.Close() }()
-	// No request is read: over CONNECT the client only opens the tunnel and
-	// reads, so the partial response goes out unprompted.
-	fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\npartial") //nolint:errcheck
-	// Let the SOCKS success reply travel to the gateway before the reset: a
-	// too-early RST can destroy the unread reply in flight, and the gateway
-	// then (correctly) counts a handshake failure and retries until 502.
-	time.Sleep(100 * time.Millisecond)
-	if tc, ok := conn.(*net.TCPConn); ok {
-		_ = tc.SetLinger(0) // reset instead of a clean close
+	}
+	if strings.Contains(output, "cooldown=") {
+		t.Errorf("auth fallback logged a cooldown:\n%s", output)
+	}
+	for _, secret := range []string{"TEST-user", "TEST-pass"} {
+		if strings.Contains(output, secret) {
+			t.Errorf("logs leaked %q:\n%s", secret, output)
+		}
 	}
 }
 
-// An upstream that ends the tunnel abnormally produces a broken-tunnel close
-// record at warn without touching route health.
-func TestTunnelUpstreamResetLogsBrokenClose(t *testing.T) {
+// With one route that always rejects, the request exhausts the pool: the
+// client gets the general-failure reply and the log names no_route.
+func TestSingleRejectingRouteExhaustsToGeneralFailure(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	var logs safeLogBuffer
+	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+
+	conn, code := socksConnectReply(t, addr, "example.test:443", socksCmdConnect)
+	_ = conn.Close()
+	if code != socksReplyGeneral {
+		t.Fatalf("reply = 0x%02x, want general failure 0x01", code)
+	}
+
+	snap := pl.Snapshot()[0]
+	if snap.Failures != 1 || snap.Successes != 0 || snap.AuthFailures != 0 || snap.Available {
+		t.Fatalf("handshake failure did not record route health: %+v", snap)
+	}
+	if got := len(fs.hits); got != 1 {
+		t.Fatalf("upstream attempts = %d, want 1", got)
+	}
+	if status := s.ListenerStatus(); status.Requests != 1 || status.Failovers != 1 {
+		t.Fatalf("listener status = %+v", status)
+	}
+	output := waitForLog(t, &logs, `msg="tunnel failed"`)
+	for _, want := range []string{"error_kind=no_route", "attempts=1"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("logs missing %q:\n%s", want, output)
+		}
+	}
+}
+
+// A local setup failure replies once, retries nothing, and mutates no health:
+// every route would fail identically, so cooldown would only poison the pool.
+func TestSetupErrorRepliesFailureWithoutPoolMutation(t *testing.T) {
+	good := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(good.URL), time.Second, time.Minute, config.KindBalance{})
+	var logs safeLogBuffer
+	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	dials := 0
+	s.dial = func(context.Context, *url.URL, string, time.Duration) (net.Conn, error) {
+		dials++
+		return nil, &SocksProtocolError{Op: "encode target", Err: errors.New("TEST oversized configured credentials")}
+	}
+	addr := startServer(t, s)
+
+	conn, code := socksConnectReply(t, addr, "example.test:443", socksCmdConnect)
+	_ = conn.Close()
+	if code != socksReplyGeneral {
+		t.Fatalf("reply = 0x%02x, want general failure 0x01", code)
+	}
+	if dials != 1 {
+		t.Fatalf("dial attempts = %d, want 1 (setup errors never retry)", dials)
+	}
+	snap := pl.Snapshot()[0]
+	if snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 || !snap.Available {
+		t.Fatalf("setup error mutated route health: %+v", snap)
+	}
+	if status := s.ListenerStatus(); status.Requests != 1 || status.Failovers != 0 {
+		t.Fatalf("listener status = %+v", status)
+	}
+	output := waitForLog(t, &logs, `msg="upstream setup failed"`)
+	for _, want := range []string{
+		"request_id=1",
+		"error_kind=setup",
+		"upstream=" + good.URL.Host,
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("logs missing %q:\n%s", want, output)
+		}
+	}
+}
+
+// --- relay teardown and close records --------------------------------------
+
+// A client that ends the stream first produces a routine close record at
+// debug with both byte counts, and never touches route health.
+func TestCloseRecordAfterClientCloses(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
-	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
-	conn, _, resp := connectThrough(t, ts.URL, startAbortTarget(t))
-	defer func() { _ = conn.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
+	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	if got := readBanner(t, conn); got != "banner\n" {
+		t.Fatalf("banner = %q", got)
 	}
+	if _, err := conn.Write([]byte("abcd")); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	echo := make([]byte, 4)
+	if _, err := io.ReadFull(conn, echo); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	_ = conn.Close()
+
+	output := waitForLog(t, &logs, `msg="tunnel closed"`)
+	for _, want := range []string{
+		"close_reason=client_closed",
+		"client_to_upstream_bytes=4",
+		"upstream_to_client_bytes=11", // banner plus echo
+		"duration=",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("close record missing %q:\n%s", want, output)
+		}
+	}
+	snap := pl.Snapshot()[0]
+	if snap.Successes != 1 || snap.Failures != 0 || snap.AuthFailures != 0 {
+		t.Fatalf("closing the tunnel mutated route health: %+v", snap)
+	}
+	if status := s.ListenerStatus(); status.Requests != 1 {
+		t.Fatalf("listener status = %+v", status)
+	}
+}
+
+// An upstream that ends the tunnel abnormally logs a broken-tunnel close at
+// warn and resets the client side, so a truncated stream stays truncated.
+func TestUpstreamBreakLogsBrokenCloseAndResetsClient(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	var logs safeLogBuffer
+	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+
+	conn := socksDialVia(t, addr, startAbortTarget(t))
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := io.Copy(io.Discard, conn); err == nil {
 		t.Fatal("tunnel stayed open after the target aborted the stream")
@@ -1293,5 +959,245 @@ func TestTunnelUpstreamResetLogsBrokenClose(t *testing.T) {
 	snap := pl.Snapshot()[0]
 	if snap.Successes != 1 || snap.Failures != 0 || snap.AuthFailures != 0 {
 		t.Fatalf("broken tunnel mutated route health: %+v", snap)
+	}
+}
+
+// --- connection tracking and shutdown --------------------------------------
+
+// waitTrackedConns waits until the server has accepted and started tracking
+// want client sessions. Only pre-greeting sessions need this: a tunnel is
+// tracked before its success reply reaches the client.
+func waitTrackedConns(t *testing.T, s *Server, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		s.cmu.Lock()
+		got := len(s.conns)
+		s.cmu.Unlock()
+		if got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tracked sessions = %d, want %d", got, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// CloseConns must close both established tunnels and sessions still inside
+// their handshake.
+func TestCloseConnsClosesTunnelsAndHandshakes(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
+
+	tunnel := socksDialVia(t, addr, startParkedTarget(t))
+	parked, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial gateway: %v", err)
+	}
+	defer func() { _ = parked.Close() }()
+	waitTrackedConns(t, s, 2)
+
+	s.CloseConns()
+	for name, conn := range map[string]net.Conn{"tunnel": tunnel, "handshake": parked} {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := conn.Read(make([]byte, 1)); err == nil {
+			t.Errorf("%s connection stayed open after CloseConns", name)
+		}
+	}
+}
+
+// blockingCloseConn delays Close until released, so a test can observe
+// whether the connection map stays locked while a Close blocks.
+type blockingCloseConn struct {
+	net.Conn
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingCloseConn) Close() error {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+	return c.Conn.Close()
+}
+
+func TestCloseConnsDoesNotHoldConnectionMapLockWhileClosing(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	conn := &blockingCloseConn{
+		Conn:    serverSide,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}), defaultRuntime(), testLogger())
+	s.trackConn(conn)
+
+	closed := make(chan struct{})
+	go func() {
+		s.CloseConns()
+		close(closed)
+	}()
+	select {
+	case <-conn.started:
+	case <-time.After(time.Second):
+		t.Fatal("CloseConns did not call connection Close")
+	}
+
+	untracked := make(chan struct{})
+	go func() {
+		s.untrackConn(conn)
+		close(untracked)
+	}()
+	select {
+	case <-untracked:
+	case <-time.After(time.Second):
+		t.Fatal("connection map lock remained held while Close blocked")
+	}
+
+	close(conn.release)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("CloseConns did not return after Close unblocked")
+	}
+}
+
+func TestShutdownWithNoSessionsReturnsNil(t *testing.T) {
+	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}), defaultRuntime(), testLogger())
+	done := make(chan error, 1)
+	go func() { done <- s.Shutdown(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Shutdown = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown blocked with no live sessions")
+	}
+}
+
+// Shutdown waits for a live session instead of tearing it down early.
+func TestShutdownWaitsForActiveSession(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
+
+	tunnel := socksDialVia(t, addr, startParkedTarget(t))
+	done := make(chan error, 1)
+	go func() { done <- s.Shutdown(context.Background()) }()
+	select {
+	case err := <-done:
+		t.Fatalf("Shutdown returned %v while a session was live", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	_ = tunnel.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Shutdown = %v, want nil after the session drained", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown did not return after the session closed")
+	}
+}
+
+// A drain that outlives its budget force-closes the tracked client conns and
+// reports the deadline.
+func TestShutdownDeadlineForceClosesActiveSession(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
+
+	tunnel := socksDialVia(t, addr, startParkedTarget(t))
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := s.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown = %v, want the context deadline", err)
+	}
+	_ = tunnel.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := tunnel.Read(make([]byte, 1)); err == nil {
+		t.Fatal("tunnel stayed open after the shutdown deadline force-closed it")
+	}
+}
+
+// --- admin -----------------------------------------------------------------
+
+// requests counts only valid CONNECTs (protocol rejects never advance it) and
+// failovers counts in-band route fallbacks.
+func TestAdminStatusCountsConnectsAndFallbacks(t *testing.T) {
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
+	_ = closed.Close()
+	good := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
+	s := NewRuntime(pool.NewStore(defaultRuntime(), pl), testLogger(), "9.9.9-test", "mixed", config.EgressV4, config.EgressV6)
+	addr := startServer(t, s)
+	admin := httptest.NewServer(s.AdminMux())
+	defer admin.Close()
+
+	// A protocol reject must not move any counter.
+	if got := socksRejectExchange(t, addr, socksRejectCase{greeting: []byte{0x04, 0x01, 0x00}}); len(got) != 0 {
+		t.Fatalf("reject reply = % x, want silence", got)
+	}
+	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	readBanner(t, conn)
+	_ = conn.Close()
+
+	hresp, err := http.Get(admin.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("healthz: %v", err)
+	}
+	hbody, _ := io.ReadAll(hresp.Body)
+	_ = hresp.Body.Close()
+	if hresp.StatusCode != http.StatusOK || strings.TrimSpace(string(hbody)) != "ok" {
+		t.Fatalf("healthz status=%d body=%q", hresp.StatusCode, hbody)
+	}
+
+	sresp, err := http.Get(admin.URL + "/status")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	defer func() { _ = sresp.Body.Close() }()
+	if sresp.StatusCode != http.StatusOK {
+		t.Fatalf("status code=%d", sresp.StatusCode)
+	}
+	var got struct {
+		Version   string                    `json:"version"`
+		Requests  uint64                    `json:"requests"`
+		Failovers uint64                    `json:"failovers"`
+		Listeners map[string]ListenerStatus `json:"listeners"`
+		Pool      []pool.Status             `json:"pool"`
+	}
+	if err := json.NewDecoder(sresp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if got.Version != "9.9.9-test" {
+		t.Errorf("version = %q", got.Version)
+	}
+	if got.Requests != 1 || got.Failovers != 1 {
+		t.Errorf("totals = %+v, want one request and one fallback", got)
+	}
+	if want := (ListenerStatus{Requests: 1, Failovers: 1}); got.Listeners["mixed"] != want {
+		t.Errorf("listeners = %+v, want %+v", got.Listeners, want)
+	}
+	if len(got.Pool) != 2 {
+		t.Fatalf("pool len = %d, want 2", len(got.Pool))
+	}
+	if got.Pool[0].Failures != 1 || got.Pool[1].Successes != 1 {
+		t.Errorf("pool health = %+v", got.Pool)
+	}
+}
+
+func TestDialTCPCancellationIsNotEndpointFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := dialTCP(ctx, "127.0.0.1:1", time.Second)
+	if !errors.Is(err, context.Canceled) || isProxyDialError(err) {
+		t.Fatalf("dialTCP cancellation = %T %v, want plain context cancellation", err, err)
 	}
 }

@@ -1,15 +1,12 @@
 package e2e_test
 
 import (
-	"bufio"
 	"bytes"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -83,29 +80,25 @@ type BalanceConfig struct {
 
 // GatewayConfig is the full runtime YAML written for one gateway instance.
 type GatewayConfig struct {
-	LogLevel      string
-	MaxRetries    int
-	CooldownBase  string
-	CooldownMax   string
-	DialTimeout   string
-	TLSInsecure   bool
-	MaxBodyBuffer int64
-	Routes        []RouteConfig
-	Manual        []ManualRouteConfig
-	Rotation      *RotationConfig
-	Balance       *BalanceConfig
+	LogLevel     string
+	MaxRetries   int
+	CooldownBase string
+	CooldownMax  string
+	DialTimeout  string
+	Routes       []RouteConfig
+	Manual       []ManualRouteConfig
+	Rotation     *RotationConfig
+	Balance      *BalanceConfig
 }
 
 func defaultGatewayConfig(routes []RouteConfig) GatewayConfig {
 	return GatewayConfig{
-		LogLevel:      "info",
-		MaxRetries:    3,
-		CooldownBase:  "5s",
-		CooldownMax:   "1m",
-		DialTimeout:   "5s",
-		TLSInsecure:   false,
-		MaxBodyBuffer: 64 << 20,
-		Routes:        routes,
+		LogLevel:     "info",
+		MaxRetries:   3,
+		CooldownBase: "5s",
+		CooldownMax:  "1m",
+		DialTimeout:  "5s",
+		Routes:       routes,
 	}
 }
 
@@ -232,7 +225,6 @@ func renderConfig(cfg GatewayConfig) string {
 			fmt.Fprintf(&sb, "  v6: %d\n", cfg.Balance.V6)
 		}
 	}
-	fmt.Fprintf(&sb, "global:\n  target-tls-insecure: %v\n  max-body-buffer: %d\n", cfg.TLSInsecure, cfg.MaxBodyBuffer)
 	sb.WriteString("proxies:\n  auto:\n")
 	for _, r := range cfg.Routes {
 		fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n", yamlQuote(r.Proxy), r.Kind)
@@ -470,69 +462,24 @@ func (g *Gateway) stop() {
 }
 
 // ProxyClient returns an HTTP client routing through one gateway listener.
+// The transport dials every connection as an inbound SOCKS5 tunnel (RFC 1928,
+// no auth), so HTTP and TLS run inside the tunnel and the gateway is a pure
+// TCP relay from the client's point of view. Keep-alives are disabled so one
+// HTTP request is one CONNECT: requests counter, route picks, and health
+// effects keep their historical per-request granularity. Tests that want to
+// exercise client-owned tunnel reuse build their own transport instead.
 func ProxyClient(proxyAddr string) *http.Client {
-	pu, _ := url.Parse("http://" + proxyAddr)
-	return &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(pu)},
-		Timeout:   15 * time.Second,
-	}
+	tr := socksTransport(proxyAddr, false)
+	tr.DisableKeepAlives = true
+	return &http.Client{Transport: tr, Timeout: 15 * time.Second}
 }
 
 // ProxyClientInsecureTLS is ProxyClient with TLS verification disabled for
-// CONNECT-tunnel tests against httptest TLS targets.
+// tunnel tests against httptest TLS targets.
 func ProxyClientInsecureTLS(proxyAddr string) *http.Client {
-	pu, _ := url.Parse("http://" + proxyAddr)
-	return &http.Client{
-		Transport: &http.Transport{
-			Proxy:           http.ProxyURL(pu),
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // test-only target
-		},
-		Timeout: 15 * time.Second,
-	}
-}
-
-// RawProxyRequest sends a manually written absolute-form request to a gateway
-// listener. Go's http client always uses CONNECT for https targets, so the
-// gateway's own absolute-form https path (SOCKS tunnel + in-tunnel target TLS)
-// is only reachable this way.
-func RawProxyRequest(t *testing.T, proxyAddr, method, targetURL string, header http.Header, body []byte) (int, http.Header, []byte) {
-	t.Helper()
-	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
-	if err != nil {
-		t.Fatalf("dial proxy: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-	u, err := url.Parse(targetURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "%s %s HTTP/1.1\r\nHost: %s\r\n", method, targetURL, u.Host)
-	if header.Get("Content-Length") == "" && len(body) > 0 {
-		fmt.Fprintf(&sb, "Content-Length: %d\r\n", len(body))
-	}
-	for k, vv := range header {
-		for _, v := range vv {
-			fmt.Fprintf(&sb, "%s: %s\r\n", k, v)
-		}
-	}
-	sb.WriteString("Connection: close\r\n\r\n")
-	if _, err := io.WriteString(conn, sb.String()); err != nil {
-		t.Fatalf("write proxy request: %v", err)
-	}
-	if len(body) > 0 {
-		if _, err := conn.Write(body); err != nil {
-			t.Fatalf("write proxy body: %v", err)
-		}
-	}
-	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: method})
-	if err != nil {
-		t.Fatalf("read proxy response: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	respBody, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, resp.Header, respBody
+	tr := socksTransport(proxyAddr, true)
+	tr.DisableKeepAlives = true
+	return &http.Client{Transport: tr, Timeout: 15 * time.Second}
 }
 
 // GetVia is a small helper asserting a proxied GET succeeds with wantBody.

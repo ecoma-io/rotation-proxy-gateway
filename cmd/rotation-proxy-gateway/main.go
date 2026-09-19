@@ -1,5 +1,6 @@
-// Command rotation-proxy-gateway runs a SOCKS5-backed HTTP forward proxy
-// with v4, v6, and mixed egress listener views plus an always-on admin listener.
+// Command rotation-proxy-gateway runs a SOCKS5 proxy with v4, v6, and mixed
+// egress listener views plus an always-on admin listener. Every client tunnel
+// is relayed through SOCKS5 routes from a shared health-aware pool.
 package main
 
 import (
@@ -83,7 +84,7 @@ func healthcheckURL(addr string) string {
 type runningListener struct {
 	name   string
 	server *proxyserver.Server
-	http   *http.Server
+	ln     net.Listener
 }
 
 func warnUnavailableKindListeners(log *slog.Logger, cfg *config.RuntimeConfig, bootstrap *config.BootstrapConfig) {
@@ -97,10 +98,10 @@ func warnUnavailableKindListeners(log *slog.Logger, cfg *config.RuntimeConfig, b
 		}
 	}
 	if bootstrap.V4ListenAddr != "" && v4 == 0 {
-		log.Warn("listener has no eligible routes; returning 502", "listener", "v4")
+		log.Warn("listener has no eligible routes; replying a general SOCKS failure", "listener", "v4")
 	}
 	if bootstrap.V6ListenAddr != "" && v6 == 0 {
-		log.Warn("listener has no eligible routes; returning 502", "listener", "v6")
+		log.Warn("listener has no eligible routes; replying a general SOCKS failure", "listener", "v6")
 	}
 }
 
@@ -125,28 +126,34 @@ func run() error {
 
 	listeners := make([]runningListener, 0, 3)
 	listenerViews := make(map[string]*proxyserver.Server, 3)
-	addListener := func(name, addr string, kinds ...config.EgressKind) {
+	addListener := func(name, addr string, kinds ...config.EgressKind) error {
 		if addr == "" {
-			return
+			return nil
 		}
 		srv := proxyserver.NewRuntime(store, log, version, name, kinds...)
-		listeners = append(listeners, runningListener{
-			name:   name,
-			server: srv,
-			http: &http.Server{
-				Addr:              addr,
-				Handler:           srv,
-				ReadHeaderTimeout: 30 * time.Second,
-				IdleTimeout:       2 * time.Minute,
-				// No WriteTimeout: hijacked CONNECT tunnels and streamed bodies
-				// must not be cut off mid-flight.
-			},
-		})
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("%s listener: %w", name, err)
+		}
+		listeners = append(listeners, runningListener{name: name, server: srv, ln: ln})
 		listenerViews[name] = srv
+		return nil
 	}
-	addListener("mixed", bootstrap.MixedListenAddr, config.EgressV4, config.EgressV6)
-	addListener("v4", bootstrap.V4ListenAddr, config.EgressV4)
-	addListener("v6", bootstrap.V6ListenAddr, config.EgressV6)
+	// Bootstrap validation already proved the addresses are well-formed and
+	// non-overlapping; a bind failure here is an occupied port or a missing
+	// interface, both fatal before serving starts.
+	for _, spec := range []struct {
+		name, addr string
+		kinds      []config.EgressKind
+	}{
+		{"mixed", bootstrap.MixedListenAddr, []config.EgressKind{config.EgressV4, config.EgressV6}},
+		{"v4", bootstrap.V4ListenAddr, []config.EgressKind{config.EgressV4}},
+		{"v6", bootstrap.V6ListenAddr, []config.EgressKind{config.EgressV6}},
+	} {
+		if err := addListener(spec.name, spec.addr, spec.kinds...); err != nil {
+			return err
+		}
+	}
 
 	started := time.Now()
 	adminSrv := &http.Server{
@@ -160,8 +167,9 @@ func run() error {
 	for _, listener := range listeners {
 		listener := listener
 		go func() {
-			log.Info("proxy listening", "listener", listener.name, "addr", listener.http.Addr, "version", version)
-			if err := listener.http.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Info("proxy listening", "listener", listener.name, "addr", listener.ln.Addr().String(), "version", version)
+			// Serve returns nil once shutdown closes the listener.
+			if err := listener.server.Serve(listener.ln); err != nil {
 				errCh <- fmt.Errorf("%s listener: %w", listener.name, err)
 			}
 		}()
@@ -223,24 +231,21 @@ func run() error {
 	}
 }
 
-// shutdownAll stops the rotation engine first, then drains every enabled
-// proxy listener and the admin listener against one shared grace budget, then
-// force-closes hijacked CONNECT tunnels that http.Server.Shutdown does not
-// track. Shutdown returns as soon as a server drains, so an idle process
-// exits immediately; once the budget expires, later Shutdown calls still stop
-// their listeners and close their idle connections but no longer wait for
-// active requests.
+// shutdownAll stops the rotation engine first, then closes every proxy
+// listener socket and drains each one's active SOCKS sessions plus the admin
+// listener against one shared grace budget. A drained listener returns
+// immediately, so an idle process exits at once; once the budget expires the
+// remaining sessions' client connections are force-closed and later listeners
+// stop waiting. Established tunnels are never broken before that deadline.
 func shutdownAll(engineCancel context.CancelFunc, listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
 	engineCancel()
 	ctx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
 	for _, listener := range listeners {
-		shutdownServer(listener.http, ctx)
+		listener.ln.Close()           //nolint:errcheck // stop accepting immediately
+		listener.server.Shutdown(ctx) //nolint:errcheck // expiry force-closes inside
 	}
 	shutdownServer(adminSrv, ctx)
-	for _, listener := range listeners {
-		listener.server.CloseTunnels() // Shutdown ignores hijacked CONNECT conns
-	}
 }
 
 func shutdownServer(server *http.Server, ctx context.Context) {

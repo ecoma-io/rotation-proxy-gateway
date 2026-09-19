@@ -1,9 +1,10 @@
 # rotation-proxy-gateway
 
-`rotation-proxy-gateway` is a Go HTTP forward proxy that accepts stable
-inbound HTTP proxy endpoints and routes traffic through a health-aware pool of
-**SOCKS5-only** upstream routes. It supports ordinary absolute-form HTTP
-requests and inbound `CONNECT` tunnels.
+`rotation-proxy-gateway` is a Go SOCKS5 proxy that accepts stable inbound
+SOCKS5 (RFC 1928) endpoints and routes connections through a health-aware pool
+of **SOCKS5-only** upstream routes. It runs three inbound proxy listeners —
+one mixed egress family, one IPv4-only, one IPv6-only — over a single shared
+route-health pool.
 
 <p align="center">
   <a href="https://github.com/ecoma-io/rotation-proxy-gateway/actions/workflows/ci.yml"><img src="https://github.com/ecoma-io/rotation-proxy-gateway/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
@@ -18,12 +19,12 @@ requests and inbound `CONNECT` tunnels.
 
 The process starts one admin listener and up to three proxy listeners:
 
-| Endpoint    |         Default | Purpose                                                      |
-| ----------- | --------------: | ------------------------------------------------------------ |
-| Admin       | `0.0.0.0:30120` | `/healthz` and `/status`; operator controls network exposure |
-| Mixed proxy |        `:30121` | Selects both v4- and v6-egress routes                        |
-| IPv4 proxy  |        `:30122` | Selects only `kind: v4` routes                               |
-| IPv6 proxy  |        `:30123` | Selects only `kind: v6` routes                               |
+| Endpoint     |         Default | Protocol | Purpose                                                      |
+| ------------ | --------------: | -------- | ------------------------------------------------------------ |
+| Admin        | `0.0.0.0:30120` | HTTP     | `/healthz` and `/status`; operator controls network exposure |
+| Mixed SOCKS5 |        `:30121` | SOCKS5   | Selects both v4- and v6-egress routes                        |
+| IPv4 SOCKS5  |        `:30122` | SOCKS5   | Selects only `kind: v4` routes                               |
+| IPv6 SOCKS5  |        `:30123` | SOCKS5   | Selects only `kind: v6` routes                               |
 
 `kind` is the public egress IP family supplied by a proxy provider. It is not
 the SOCKS endpoint address family and it does not impose an IPv4/IPv6 policy on
@@ -34,7 +35,8 @@ authentication block observed through the v4 listener is also observed by the
 mixed listener when it considers that route. A listener never falls through to
 a route of another kind. A v4-only or v6-only route pool is valid: mixed selects
 the available family, and the enabled dedicated listener without matching routes
-remains live but returns the ordinary no-route `502` until that family is added.
+remains live but replies with the ordinary no-route SOCKS general-failure
+(`05 01`) until that family is added.
 
 ## Quick start
 
@@ -46,7 +48,7 @@ V6_LISTEN_ADDR=:30123 \
 ADMIN_ADDR=0.0.0.0:30120 \
 go run ./cmd/rotation-proxy-gateway
 
-curl -x http://127.0.0.1:30121 https://example.com/
+curl --socks5-hostname 127.0.0.1:30121 https://example.com/
 curl http://127.0.0.1:30120/status
 ```
 
@@ -90,9 +92,6 @@ dial-timeout: 10s
 balance:
   v4: 7
   v6: 3
-global:
-  target-tls-insecure: false
-  max-body-buffer: 67108864
 proxies:
   auto:
     - proxy: socks5://username:password@provider.example:1080
@@ -102,6 +101,11 @@ proxies:
       kind: v6
   manual: []
 ```
+
+There is no `global:` block: the removed HTTP era's `target-tls-insecure` and
+`max-body-buffer` settings no longer exist, and a config containing them fails
+validation — the last-known-good config keeps serving (on first boot the process
+refuses to start).
 
 `proxies.auto` is the source of static routes; `proxies.manual` routes
 additionally carry a rotate schedule and provider API (see
@@ -140,10 +144,6 @@ dedicated v4/v6 listeners ignore the block. Without it, each family's share
 follows its routes' own weights, exactly as if the pool were flat. A reload
 that changes the ratio applies to the retained routes and carries the split's
 phase over.
-
-`global.target-tls-insecure` and `global.max-body-buffer` are global settings;
-per-route overrides are rejected. `target-tls-insecure` defaults to `false` and
-should not be enabled for untrusted targets.
 
 `proxies.auto` routes and `proxies.manual` routes share one pool and one
 identity space; a duplicate across the two lists is rejected like any other.
@@ -210,7 +210,7 @@ rotation:
 | `max-concurrent`    |              `1` | Rotation procedures running at once: a fixed count, or `"NN%"` of the manual routes (rounded up, at least 1, never more than the route count). Resolved fresh every scheduling cycle.     |
 | `drain-timeout`     |            `55s` | How long a procedure waits for the route's in-flight requests to finish before force-rotating. Expiry does not wait longer; requests already in flight may continue on the old egress IP. |
 | `rotate-on-start`   |          `false` | Rotate every manual route at process start, under the same cap and staggering, instead of waiting one interval.                                                                           |
-| `ip-check-url`      | Cloudflare trace | HTTPS URL whose response body contains an `ip=` line. **Must be `https`.** The probe always verifies TLS regardless of `target-tls-insecure`.                                             |
+| `ip-check-url`      | Cloudflare trace | HTTPS URL whose response body contains an `ip=` line. **Must be `https`.** The probe always verifies TLS independently of any route setting.                                              |
 | `ip-check-timeout`  |            `20s` | Total window for one verification: how long a procedure watches for a changed IP before giving up on that attempt.                                                                        |
 | `ip-check-interval` |             `2s` | Pause between verification probes inside that window.                                                                                                                                     |
 | `retry-backoff-max` |            `15m` | Ceiling of the same-IP retry backoff.                                                                                                                                                     |
@@ -226,9 +226,10 @@ Each attempt runs: **drain → baseline probe → rotate call → verify**.
 
 1. **Drain.** The route stops receiving new picks immediately and stays
    ineligible for the whole procedure. The procedure waits for the route's
-   in-flight requests to finish, bounded by `drain-timeout`; expiry proceeds
+   in-flight connections to finish, bounded by `drain-timeout`; expiry proceeds
    anyway. Draining a route that serves no other purpose can make requests fail
-   with the ordinary `no_route` `502` until the window ends.
+   with the ordinary `no_route` general-failure reply (`05 01`) until the window
+   ends.
 2. **Baseline probe.** The gateway dials through the route (SOCKS, then TLS)
    to `ip-check-url` and reads the `ip=` line. Three attempts; if all fail the
    procedure continues with no known baseline (**unverified mode**), and later
@@ -292,7 +293,8 @@ Rotation procedures run outside the request path: probe traffic bypasses pool
 health entirely and never creates cooldowns or failures. Requests picked before
 a rotation began keep running (unless the drain timeout expired and the operator
 accepts the old egress); requests arriving during a procedure select other
-routes, or `502` with `no_route` when none exist.
+routes, or receive the ordinary `no_route` general-failure reply (`05 01`) when
+none exist.
 
 ### Reload behavior
 
@@ -349,8 +351,6 @@ The following settings apply to new client operations without restart:
 - `max-retries`
 - `cooldown.base` and `cooldown.max` (new dial failures only)
 - `dial-timeout`
-- `global.target-tls-insecure`
-- `global.max-body-buffer`
 - `proxies.auto` and `proxies.manual`
 - every `rotation.*` setting (the scheduler reads them per cycle; a procedure
   already running keeps its own `drain-timeout` and probe settings)
@@ -374,22 +374,21 @@ and `proxies.manual` creates a fresh route state.
   framing, CONNECT framing or reply, and bound-address reads. No client bytes
   have crossed the tunnel yet, so these are route failures, not request
   failures.
-- **`setup`**: local request errors that behave the same on every route
-  (unsupported scheme, oversized configured credentials, invalid target) and
-  every error after the tunnel is established, including target TLS, writes,
-  reads, malformed responses, cancellation, and established-tunnel failures.
+- **`setup`**: local SOCKS request errors that behave the same on every route
+  (malformed target encoding, oversized configured credentials, invalid
+  target) and every error after the tunnel is established, including target
+  reads, writes, cancellation, and established-tunnel failures.
 - **`no_route`**: no eligible untried route remains.
 
-| Outcome                                                                                                | Pool handling                                | Request handling                                                        |
-| ------------------------------------------------------------------------------------------------------ | -------------------------------------------- | ----------------------------------------------------------------------- |
-| SOCKS endpoint DNS/TCP dial fails                                                                      | Record `proxy_connect`, exponential cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
-| SOCKS endpoint cannot authenticate                                                                     | Auth-block the route; no dial cooldown       | Retry a distinct eligible route; synthetic `502` only when none remains |
-| SOCKS handshake fails before the tunnel is established                                                 | Record `socks_connect`, exponential cooldown | Retry a distinct eligible route; synthetic `502` only when none remains |
-| Local request error (scheme, credentials, invalid target) or any error after the tunnel is established | No health mutation and no retry              | Sanitized `502`                                                         |
-| Target TLS, HTTP write/read, malformed response                                                        | No health mutation and no retry              | `502` unless client cancelled                                           |
-| Valid target HTTP response, including `407`, `408`, `429`, `5xx`                                       | Record success; no rotation/cooldown         | Forward once                                                            |
-| Client cancellation/disconnect                                                                         | No health mutation and no retry              | End operation                                                           |
-| Established tunnel breaks                                                                              | No health mutation                           | Close tunnel                                                            |
+| Outcome                                                                                                                       | Pool handling                                | Request handling                                                                 |
+| ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------- |
+| SOCKS endpoint DNS/TCP dial fails                                                                                             | Record `proxy_connect`, exponential cooldown | Retry a distinct eligible route; `05 01` general-failure reply when none remains |
+| SOCKS endpoint cannot authenticate                                                                                            | Auth-block the route; no dial cooldown       | Retry a distinct eligible route; `05 01` general-failure reply when none remains |
+| SOCKS handshake fails before the tunnel is established                                                                        | Record `socks_connect`, exponential cooldown | Retry a distinct eligible route; `05 01` general-failure reply when none remains |
+| Local SOCKS request error (invalid target encoding, credentials, invalid target) or any error after the tunnel is established | No health mutation and no retry              | Close loop; `05 01` general-failure reply for inbound setup errors               |
+| Target reads/writes fail or the target response is malformed                                                                  | No health mutation and no retry              | Close tunnel                                                                     |
+| Client cancellation/disconnect                                                                                                | No health mutation and no retry              | Close connection                                                                 |
+| Established tunnel breaks                                                                                                     | No health mutation                           | Close tunnel                                                                     |
 
 The pool serves the eligible route with the smallest weighted recency pass:
 every pick, completed request, and stale return advances the route's pass by
@@ -405,32 +404,61 @@ tried — weight- and family-blind, because soonest recovery is the only
 criterion that matters there. Authentication blocks remain until the route
 identity changes on reload.
 
-A target HTTP `407` is ordinary target response data. It is not SOCKS
-authentication data, does not rotate, and does not create cooldown.
+Target bytes are ordinary tunnel data. A byte sequence that resembles an HTTP
+`407` is not SOCKS authentication data, does not rotate, and does not create
+cooldown; once the tunnel is established, nothing the target sends alters
+route health.
 
-## HTTP and CONNECT behavior
+## SOCKS5 inbound behavior
 
-Clients send absolute-form HTTP requests. The forwarder opens one SOCKS5
-`CONNECT` tunnel to the target for each ordinary request, writes an origin-form
-request, and performs target TLS inside that tunnel for HTTPS. It removes
-hop-by-hop headers, including `Connection`-listed headers and
-`Proxy-Authorization`, in both directions.
+Each proxy listener is a SOCKS5 server (RFC 1928). Clients connect and
+complete a version-negotiation greeting, then issue exactly
+one `CONNECT` request per connection.
 
-Bodies up to `global.max-body-buffer` are replayable after an endpoint dial,
-SOCKS handshake, or authentication fallback. Known-larger bodies stream
-immediately; unknown-length bodies are probed up to the limit. Once streamed
-bytes have been consumed, the body cannot safely be retried. Declared request
-trailers retain chunked framing.
+### Authentication
 
-For CONNECT, the service returns `200 Connection Established` only after the
-SOCKS target CONNECT succeeds, then relays bytes bidirectionally. Failures after
-that point do not alter route health.
+Only NO AUTHENTICATION REQUIRED (`0x00`) is accepted. Username/password
+authentication (RFC 1929) is deliberately not supported: a client whose
+greeting offers no `0x00` method receives `05 ff` and the connection is
+closed.
 
-Relayed bytes are never inspected or buffered: streamed responses such as
-server-sent events are flushed per chunk, and established tunnels have no
-timeouts. An upstream that breaks the tunnel mid-stream resets the client
-connection, so a truncated stream stays visibly truncated instead of reading as
-a clean end.
+### Commands
+
+`CONNECT` is the only supported command. `BIND` and `UDP ASSOCIATE` are
+answered with `05 07` (command not supported) and the connection is closed.
+
+### Target addresses
+
+IPv4 (`0x01`), domain name (`0x03`), and IPv6 (`0x04`) target address types
+are all supported. Domain targets are forwarded as names: DNS resolution
+happens at the outbound SOCKS route (socks5h semantics) and the gateway never
+resolves target names itself.
+
+### Replies
+
+- Success: `05 00` with a zero BND.ADDR/BND.PORT. Clients must ignore the
+  bound address; the gateway does not bind a local relay endpoint.
+- No eligible route remains (`no_route`) and local setup errors: `05 01`
+  (general failure), followed by a close.
+- Unsupported command: `05 07`, followed by a close.
+- Malformed or truncated frames — bad version, bad reserved byte, unknown
+  ATYP, zero target port, implausible lengths — close the connection with no
+  reply at all.
+
+### Handshake deadline
+
+A 30-second read deadline bounds the greeting/request exchange and is cleared
+once the tunnel is established. Established tunnels have no timeouts.
+
+### Keep-alive
+
+One client connection carries one `CONNECT`, i.e. one tunnel. Clients that
+pool connections — for example HTTP clients speaking SOCKS5 — obtain one
+tunnel per pooled connection and may reuse it across requests; tunnel scoping
+is now the client's choice. The gateway never buffers or inspects relayed
+bytes and never terminates the client's tunnel; an upstream that breaks the
+tunnel mid-stream closes the client connection, so a truncated stream stays
+visibly truncated instead of reading as a clean end.
 
 ## Admin and observability
 
@@ -447,7 +475,10 @@ redacted `pool` state. It additionally reports safe per-listener counters —
 `requests` and `failovers` (in-band route fallbacks, distinct from rotations) —
 each route's `kind` and `origin`, each manual route's rotation view (see
 "Manual rotation routes"), and the active `balance` family split when one is
-configured. Route identities are always `host:port`, never
+configured. A listener's `requests` counter advances only on a valid `CONNECT`
+command that reaches route selection; a greeted client that is rejected during
+protocol negotiation (no `0x00` method, unsupported command, malformed frame)
+never advances it. Route identities are always `host:port`, never
 userinfo; rotate-API headers, bodies, and URLs never appear anywhere in the
 output. Each route's `failures` and `lastDialError` cover endpoint dial and
 SOCKS handshake failures.
@@ -473,19 +504,37 @@ docker compose up -d --build
 curl http://127.0.0.1:30120/status
 ```
 
-Compose publishes ports `30120` (admin), `30121` (mixed), `30122` (v4), and
-`30123` (v6) on all host interfaces. The admin process listener deliberately
-binds all interfaces inside its network namespace; operators control exposure
-through Docker port publishing, Docker networks, and firewall policy. The image
-remains a static binary in `scratch` with CA certificates and no shell; its
-healthcheck invokes the binary subcommand directly. Compose retains at most
-three 10 MiB JSON log files.
+Compose publishes ports `30120` (admin, HTTP), `30121` (mixed SOCKS5),
+`30122` (v4 SOCKS5), and `30123` (v6 SOCKS5) on all host interfaces. The admin
+process listener deliberately binds all interfaces inside its network
+namespace; operators control exposure through Docker port publishing, Docker
+networks, and firewall policy. The image remains a static binary in `scratch`
+with CA certificates and no shell; its healthcheck invokes the binary
+subcommand directly. Compose retains at most three 10 MiB JSON log files.
 
-## Migration from `proxies.txt`
+## Migrating inbound clients to SOCKS5
 
-For each old line, create one `proxies.auto` item and choose `kind` from your
-provider's documented public egress family. There is no safe automatic family
-detection from the SOCKS hostname/IP. `proxies.txt` is no longer loaded.
+The listener protocol changed from HTTP forward proxying to SOCKS5, so inbound
+clients migrate:
+
+- Switch each client's proxy URL to a SOCKS5 URL. With a curl-style client this
+  is `curl --socks5-hostname 127.0.0.1:30121 https://example.com/`; in a
+  browser or library, configure the SOCKS5 proxy (host `127.0.0.1`, port
+  `30121`) with remote DNS — the gateway never resolves target names.
+- Remove any `global:` block from `config.yaml`. The old
+  `global.target-tls-insecure` and `global.max-body-buffer` keys are no longer
+  accepted and the config fails validation otherwise (on first boot the process
+  refuses to start).
+- Since only NO AUTHENTICATION is offered, a client configured to send SOCKS
+  username/password must have that mode disabled.
+- Keep-alive is now client-owned: one client connection carries exactly one
+  tunnel, and pooled clients reuse it across requests. HTTP clients over SOCKS
+  typically do this automatically.
+
+For each old `proxies.txt` line, create one `proxies.auto` item and choose
+`kind` from your provider's documented public egress family. There is no safe
+automatic family detection from the SOCKS hostname/IP. `proxies.txt` is no
+longer loaded.
 
 ## Build and verification
 
@@ -506,7 +555,7 @@ listener and the admin listener against one shared budget, `SHUTDOWN_GRACE`
 (default 55s). It is one deadline for the whole process, not a window per
 listener, so even a fully busy worst case exits near the budget; an idle
 process exits immediately. When the budget expires, the remaining listeners are
-still closed, and hijacked CONNECT tunnels that `http.Server.Shutdown` does not
+still closed, and established tunnels that `http.Server.Shutdown` does not
 track are force-closed. Size the surrounding orchestrator above the budget --
 for example `stop_grace_period: 60s` in compose -- so its kill timer never cuts
 the drain short.

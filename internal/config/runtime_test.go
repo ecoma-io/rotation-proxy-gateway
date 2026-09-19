@@ -46,9 +46,6 @@ cooldown:
   max: 1m
 dial-timeout: 7s
 ` + rotationBlock + `
-global:
-  target-tls-insecure: true
-  max-body-buffer: 42
 proxies:
   auto:
     - proxy: socks5://alice:secret@v4.example:1080
@@ -95,7 +92,7 @@ func TestLoadRuntimeParsesManualRoutesAndRotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadRuntime() error = %v", err)
 	}
-	if cfg.MaxRetries != 4 || cfg.CooldownBase != 2*time.Second || cfg.CooldownMax != time.Minute || cfg.DialTimeout != 7*time.Second || !cfg.TargetTLSInsecure || cfg.MaxBodyBuffer != 42 || cfg.LogLevel != "debug" {
+	if cfg.MaxRetries != 4 || cfg.CooldownBase != 2*time.Second || cfg.CooldownMax != time.Minute || cfg.DialTimeout != 7*time.Second || cfg.LogLevel != "debug" {
 		t.Fatalf("unexpected runtime config: %+v", cfg)
 	}
 	if len(cfg.Routes) != 2 || cfg.Routes[0].Kind != EgressV4 || cfg.Routes[1].Kind != EgressV6 {
@@ -232,6 +229,7 @@ func TestLoadRuntimeStrictAndCredentialSafe(t *testing.T) {
 	}{
 		{"unknown top level", "unknown: value\n", "invalid keys"},
 		{"per route override", "      target-tls-insecure: false\n", "invalid keys"},
+		{"legacy global block", "global:\n  target-tls-insecure: true\n", "invalid keys"},
 		{"invalid kind", "      kind: ipv4\n", "kind must be exactly v4 or v6"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -272,8 +270,7 @@ func TestLoadRuntimeRejectsInvalidRuntimeValues(t *testing.T) {
 		{"zero retries", "max-retries: 4", "max-retries: 0", "max-retries must be >= 1"},
 		{"cooldown ordering", "  base: 2s\n  max: 1m", "  base: 2m\n  max: 1s", "must not exceed"},
 		{"non-positive timeout", "dial-timeout: 7s", "dial-timeout: 0s", "dial-timeout must be positive"},
-		{"negative body buffer", "  max-body-buffer: 42", "  max-body-buffer: -1", "global.max-body-buffer must be >= 0"},
-		{"nested unknown key", "  target-tls-insecure: true", "  target-tls-insecure: true\n  unknown: value", "invalid keys"},
+		{"nested unknown key", "  base: 2s\n  max: 1m", "  base: 2s\n  max: 1m\n  unknown: value", "invalid keys"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			content := strings.Replace(validRuntimeConfig, tc.old, tc.replacement, 1)

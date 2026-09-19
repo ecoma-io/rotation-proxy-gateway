@@ -1,20 +1,20 @@
-// Package proxyserver implements the inbound HTTP forward proxy. All outbound
-// traffic is tunneled through SOCKS5 routes from the proxy pool.
+// Package proxyserver implements the inbound SOCKS5 proxy. Client connections
+// speak RFC 1928 CONNECT with no authentication; every accepted tunnel is
+// relayed through SOCKS5 routes from the shared health-aware pool.
 package proxyserver
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,35 +23,28 @@ import (
 	"rotation-proxy-gateway/internal/pool"
 )
 
-var hopByHopHeaders = map[string]bool{
-	"connection":          true,
-	"proxy-connection":    true,
-	"keep-alive":          true,
-	"proxy-authenticate":  true,
-	"proxy-authorization": true,
-	"te":                  true,
-	"trailer":             true,
-	"trailers":            true,
-	"transfer-encoding":   true,
-	"upgrade":             true,
-}
+// inboundHandshakeTimeout bounds the client-side greeting, request, and reply
+// exchange, mirroring the old HTTP ReadHeaderTimeout. It is cleared once the
+// success reply is written so established tunnels have no timeouts.
+const inboundHandshakeTimeout = 30 * time.Second
 
-// stripHopByHop removes hop-by-hop headers, including any named by the
-// Connection header itself.
-func stripHopByHop(h http.Header) {
-	for _, tokens := range h.Values("Connection") {
-		for _, tok := range strings.Split(tokens, ",") {
-			h.Del(strings.TrimSpace(tok))
-		}
-	}
-	for name := range h {
-		if hopByHopHeaders[strings.ToLower(name)] {
-			h.Del(name)
-		}
-	}
-}
+// SOCKS5 wire constants (RFC 1928).
+const (
+	socksVersion             = 0x05
+	socksAuthNone            = 0x00
+	socksAuthUnaccepted      = 0xff
+	socksCmdConnect          = 0x01
+	socksCmdBind             = 0x02
+	socksCmdUDPAssociate     = 0x03
+	socksAtypIPv4            = 0x01
+	socksAtypDomain          = 0x03
+	socksAtypIPv6            = 0x04
+	socksReplySuccess        = 0x00
+	socksReplyGeneral        = 0x01
+	socksReplyCmdUnsupported = 0x07
+)
 
-// Server is the inbound HTTP forward-proxy handler.
+// Server is the inbound SOCKS5 listener handler.
 type Server struct {
 	store    *pool.Store
 	log      *slog.Logger
@@ -59,13 +52,12 @@ type Server struct {
 	listener string
 	allow    func(*pool.Proxy) bool
 	dial     func(context.Context, *url.URL, string, time.Duration) (net.Conn, error)
-	// tlsCache lets repeated absolute-form https targets resume TLS sessions
-	// inside their per-request tunnels instead of paying a full handshake
-	// every time. The cache itself is safe for concurrent use.
-	tlsCache tls.ClientSessionCache
 
 	cmu   sync.Mutex
 	conns map[net.Conn]struct{}
+	// live counts tracked sessions so Shutdown can wait for the drain without
+	// polling the connection map.
+	live sync.WaitGroup
 
 	startTime time.Time
 	requests  atomic.Uint64
@@ -85,9 +77,9 @@ func (s *Server) ListenerStatus() ListenerStatus {
 	}
 }
 
-// NewRuntime builds a listener-specific proxy Server whose new requests use
-// atomic runtime generations. Every request loads its generation once so route
-// picks, health reports, and request settings stay within one snapshot even
+// NewRuntime builds a listener-specific proxy Server whose new sessions use
+// atomic runtime generations. Every session loads its generation once so route
+// picks, health reports, and session settings stay within one snapshot even
 // when a reload publishes a new generation in parallel.
 func NewRuntime(store *pool.Store, log *slog.Logger, version, listener string, allowed ...config.EgressKind) *Server {
 	allow := func(p *pool.Proxy) bool {
@@ -105,9 +97,48 @@ func NewRuntime(store *pool.Store, log *slog.Logger, version, listener string, a
 		listener:  listener,
 		allow:     allow,
 		dial:      dialVia,
-		tlsCache:  tls.NewLRUClientSessionCache(0),
 		conns:     map[net.Conn]struct{}{},
 		startTime: time.Now(),
+	}
+}
+
+// Serve accepts client connections until ln is closed. It returns nil after a
+// deliberate listener close (shutdown) and the accept error otherwise.
+func (s *Server) Serve(ln net.Listener) error {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return err
+		}
+		s.live.Add(1)
+		go func() {
+			defer s.live.Done()
+			s.serveConn(conn)
+		}()
+	}
+}
+
+// Shutdown waits for active sessions to finish. When ctx expires before the
+// drain completes, tracked client connections are force-closed, the remaining
+// sessions finish on their closed connections, and ctx.Err() is returned.
+// Closing the listener itself is the caller's job: it stops new accepts at a
+// precisely chosen point in the shutdown sequence.
+func (s *Server) Shutdown(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.live.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		s.CloseConns()
+		<-done
+		return ctx.Err()
 	}
 }
 
@@ -120,402 +151,67 @@ func (s *Server) pick(gen *pool.Generation, exclude map[*pool.Proxy]bool) *pool.
 	return gen.Pool.PickFor(exclude, s.allow)
 }
 
-type requestSettings struct {
-	maxRetries        int
-	maxBodyBuffer     int64
-	dialTimeout       time.Duration
-	targetTLSInsecure bool
+type sessionSettings struct {
+	maxRetries  int
+	dialTimeout time.Duration
 }
 
-// generationSettings derives request-scoped values from one loaded generation
-// so a reload cannot change retry, body, timeout, or TLS policy part-way
-// through an operation.
-func generationSettings(gen *pool.Generation) requestSettings {
+// generationSettings derives session-scoped values from one loaded generation
+// so a reload cannot change retry or timeout policy part-way through a session.
+func generationSettings(gen *pool.Generation) sessionSettings {
 	cfg := gen.Config
-	return requestSettings{
-		maxRetries:        cfg.MaxRetries,
-		maxBodyBuffer:     cfg.MaxBodyBuffer,
-		dialTimeout:       cfg.DialTimeout,
-		targetTLSInsecure: cfg.TargetTLSInsecure,
+	return sessionSettings{
+		maxRetries:  cfg.MaxRetries,
+		dialTimeout: cfg.DialTimeout,
 	}
 }
 
-// settings reports the current generation's request values. Tests use it to
+// settings reports the current generation's session values. Tests use it to
 // assert publication; serving paths load the generation once and derive the
 // settings from that same snapshot.
-func (s *Server) settings() requestSettings {
+func (s *Server) settings() sessionSettings {
 	return generationSettings(s.generation())
 }
 
-func (s *Server) roundTripWithSettings(ctx context.Context, p *pool.Proxy, out *http.Request, settings requestSettings) (*http.Response, error) {
-	return s.roundTripViaSOCKSWithOptions(ctx, p, out, settings.dialTimeout, settings.targetTLSInsecure)
-}
+// serveConn runs one client session: SOCKS5 greeting, one CONNECT request, and
+// the established-tunnel relay. Protocol-level rejects log under
+// error_kind=bad_request and never advance the request counter or touch the
+// pool; only a valid CONNECT does both.
+func (s *Server) serveConn(conn net.Conn) {
+	s.trackConn(conn)
+	defer s.untrackConn(conn)
+	defer conn.Close() //nolint:errcheck // relay shutdown handles write failure
 
-func (s *Server) roundTripViaSOCKSWithOptions(ctx context.Context, p *pool.Proxy, out *http.Request, dialTimeout time.Duration, targetTLSInsecure bool) (*http.Response, error) {
-	target, err := targetAddress(out.URL)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := s.dial(ctx, p.URL, target, dialTimeout)
-	if err != nil {
-		return nil, err
-	}
-	fail := func(err error) (*http.Response, error) {
-		_ = conn.Close()
-		return nil, err
-	}
-	if out.URL.Scheme == "https" {
-		host := out.URL.Hostname()
-		tlsConn := tls.Client(conn, &tls.Config{
-			ServerName:         host,
-			InsecureSkipVerify: targetTLSInsecure,
-			ClientSessionCache: s.tlsCache,
-		})
-		hsCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-		err := tlsConn.HandshakeContext(hsCtx)
-		cancel()
-		if err != nil {
-			return fail(fmt.Errorf("target TLS handshake: %w", err))
-		}
-		conn = tlsConn
-	}
-	// Buffer the request write: http.Request.Write emits the start line,
-	// headers, and body in many small writes, which would otherwise each
-	// become a syscall and a small TCP segment on the tunnel.
-	bw := bufio.NewWriterSize(conn, 4<<10)
-	if err := out.Write(bw); err != nil {
-		return fail(fmt.Errorf("write target request: %w", err))
-	}
-	if err := bw.Flush(); err != nil {
-		return fail(fmt.Errorf("write target request: %w", err))
-	}
-	resp, err := http.ReadResponse(bufio.NewReader(conn), out)
-	if err != nil {
-		return fail(fmt.Errorf("read target response: %w", err))
-	}
-	resp.Body = &connReadCloser{ReadCloser: resp.Body, conn: conn}
-	return resp, nil
-}
+	// The deadline covers greeting, request, and reply framing; the success
+	// path clears it before relaying.
+	conn.SetDeadline(time.Now().Add(inboundHandshakeTimeout)) //nolint:errcheck // best-effort hardening
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	req, err := readSocksRequest(conn)
+	if err != nil {
+		s.log.Debug("socks request rejected", "error_kind", "bad_request", "error", socksRejectLogValue(err))
+		return
+	}
+	if req.cmd != socksCmdConnect {
+		writeSocksReply(conn, socksReplyCmdUnsupported) //nolint:errcheck // the connection closes either way
+		s.log.Debug("socks command not supported", "error_kind", "bad_request")
+		return
+	}
+
 	requestID := s.requests.Add(1)
 	log := s.log.With("request_id", requestID)
-	if r.Method == http.MethodConnect {
-		s.handleTunnel(w, r, log)
-		return
-	}
-	s.handleHTTP(w, r, log)
+	s.serveTunnel(conn, req.target, log)
 }
 
-// handleHTTP forwards a plain absolute-form request through a SOCKS5 route.
-// It loads one generation for the whole operation so route picks, health
-// reports, and request settings stay consistent across reloads.
-func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Logger) {
+// serveTunnel dials the target through the pool with the retry/exclude loop,
+// sends the success reply once, and relays until either side ends the stream.
+// It loads one generation for the whole session so route picks and health
+// reports stay consistent across reloads.
+func (s *Server) serveTunnel(clientConn net.Conn, target string, log *slog.Logger) {
 	gen := s.generation()
 	settings := generationSettings(gen)
 	start := time.Now()
-	target := httpTargetLogValue(r.URL)
-	if !r.URL.IsAbs() || r.Host == "" {
-		http.Error(w, "proxy request requires an absolute URI", http.StatusBadRequest)
-		log.Warn("request rejected", "target", target, "error_kind", "bad_request")
-		return
-	}
-	if r.URL.Scheme != "http" && r.URL.Scheme != "https" {
-		http.Error(w, "proxy request requires an http or https URI", http.StatusBadRequest)
-		log.Warn("request rejected", "target", target, "error_kind", "bad_request")
-		return
-	}
-	log.Debug("request start", "method", r.Method, "target", target)
-
-	// Known-large bodies can stream immediately. Unknown-length bodies are
-	// buffered up to the cap so small bodies remain replayable after an
-	// endpoint dial, SOCKS handshake, or authentication fallback. A buffered
-	// prefix of a larger unknown-length body is replayable only until SOCKS
-	// setup succeeds. Certain-bodyless requests (declared length zero, no
-	// chunked framing — the ordinary GET/HEAD/DELETE shape) skip the probe:
-	// nothing to read and nothing to replay.
-	var body []byte
-	streamMode := r.ContentLength > settings.maxBodyBuffer
-	directStream := streamMode
-	certainlyBodiless := r.ContentLength == 0 && len(r.TransferEncoding) == 0
-	if !streamMode && !certainlyBodiless {
-		b, err := io.ReadAll(io.LimitReader(r.Body, settings.maxBodyBuffer+1))
-		if err != nil {
-			_ = r.Body.Close()
-			http.Error(w, "failed to read request body", http.StatusBadRequest)
-			log.Warn("request rejected", "target", target, "error_kind", "body_read", "error", logErrorValue(err))
-			return
-		}
-		body = b
-		if int64(len(body)) > settings.maxBodyBuffer {
-			streamMode = true
-		} else {
-			_ = r.Body.Close()
-		}
-	}
-	log.Debug("request body mode", "target", target, "body_mode", bodyLogMode(streamMode))
-	stripHopByHop(r.Header)
-
-	exclude := map[*pool.Proxy]bool{}
-	attempts := 0
-	for attempt := 0; attempt < settings.maxRetries; attempt++ {
-		attemptNumber := attempt + 1
-		if r.Context().Err() != nil {
-			if streamMode {
-				_ = r.Body.Close()
-			}
-			log.Debug("request canceled", "target", target, "attempts", attempt)
-			return
-		}
-		p := s.pick(gen, exclude)
-		if p == nil {
-			break
-		}
-		// Hold the route until this handler returns: the pick counts as
-		// in-flight work for rotation draining, and earlier excluded attempts
-		// release when the handler ends rather than leaking.
-		defer p.Release()
-		attempts = attemptNumber
-		out := buildOutbound(r, body)
-		if streamMode {
-			if directStream {
-				out.Body = r.Body
-			} else {
-				out.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), r.Body))
-			}
-			out.ContentLength = r.ContentLength
-			out.TransferEncoding = append([]string(nil), r.TransferEncoding...)
-			// r.Body populates r.Trailer at EOF. Retain the same map rather
-			// than the clone made by Request.Clone so Request.Write sees the
-			// final trailer values after streaming the body.
-			out.Trailer = r.Trailer
-		}
-		resp, err := s.roundTripWithSettings(r.Context(), p, out, settings)
-		if streamMode && !isProxyDialError(err) && !isProxyAuthError(err) && !isSocksHandshakeError(err) {
-			_ = r.Body.Close()
-		}
-		if err != nil {
-			if r.Context().Err() != nil {
-				if streamMode {
-					_ = r.Body.Close()
-				}
-				log.Debug("request canceled", "target", target, "attempts", attemptNumber)
-				return
-			}
-			switch {
-			case isProxyDialError(err):
-				cooldown := gen.Pool.ReportFailure(p, err)
-				exclude[p] = true
-				s.failovers.Add(1)
-				log.Warn("upstream dial failed", "target", target, "upstream", upstreamLogValue(p),
-					"attempt", attemptNumber, "error_kind", errorKindProxyConnect,
-					"error", logErrorValue(err), "cooldown", cooldown.String())
-				continue
-			case isSocksHandshakeError(err):
-				cooldown := gen.Pool.ReportFailure(p, err)
-				exclude[p] = true
-				s.failovers.Add(1)
-				log.Warn("upstream handshake failed", "target", target, "upstream", upstreamLogValue(p),
-					"attempt", attemptNumber, "error_kind", errorKindSocksConnect,
-					"error", logErrorValue(err), "cooldown", cooldown.String())
-				continue
-			case isProxyAuthError(err):
-				gen.Pool.ReportAuthBlocked(p, err)
-				exclude[p] = true
-				s.failovers.Add(1)
-				log.Warn("upstream auth failed", "target", target, "upstream", upstreamLogValue(p),
-					"attempt", attemptNumber, "error_kind", errorKindAuthRoute,
-					"error", logErrorValue(err))
-				continue
-			default:
-				if r.Context().Err() != nil {
-					log.Debug("request canceled", "target", target, "attempts", attemptNumber)
-					return
-				}
-				http.Error(w, "upstream SOCKS setup failed", http.StatusBadGateway)
-				log.Warn("upstream setup failed", "target", target, "upstream", upstreamLogValue(p),
-					"attempt", attemptNumber, "error_kind", logErrorKind(err), "error", logErrorValue(err),
-					"duration", logDuration(time.Since(start)))
-				return
-			}
-		}
-
-		if streamMode {
-			_ = r.Body.Close()
-		}
-		if r.Context().Err() != nil {
-			_ = resp.Body.Close()
-			log.Debug("request canceled", "target", target, "attempts", attemptNumber)
-			return
-		}
-		gen.Pool.ReportSuccess(p)
-		s.writeResponse(log, w, resp)
-		log.Info("request", "method", r.Method, "target", target, "upstream", upstreamLogValue(p),
-			"status", resp.StatusCode, "attempts", attemptNumber, "duration", logDuration(time.Since(start)))
-		return
-	}
-
-	if streamMode {
-		_ = r.Body.Close()
-	}
-	http.Error(w, "no usable upstream SOCKS routes", http.StatusBadGateway)
-	log.Warn("request failed", "target", target, "attempts", attempts,
-		"error_kind", errorKindNoRoute, "duration", logDuration(time.Since(start)))
-}
-
-// buildOutbound clones the client request for a route attempt. Buffered bodies
-// are replayed from memory; empty bodies without trailers use nil rather than an
-// empty reader so net/http keeps no-body request framing.
-func buildOutbound(r *http.Request, body []byte) *http.Request {
-	out := r.Clone(r.Context())
-	out.RequestURI = "" // http.Request.Write derives origin-form from URL.
-	out.Close = true    // each SOCKS tunnel is scoped to this request.
-	if len(r.Trailer) > 0 {
-		// A trailer requires chunked framing. The body probe has reached EOF, so
-		// these values are complete and safe to clone for each retry.
-		out.Body = io.NopCloser(bytes.NewReader(body))
-		out.ContentLength = -1
-		out.TransferEncoding = []string{"chunked"}
-		return out
-	}
-	out.Trailer = nil
-	out.TransferEncoding = nil
-	if len(body) > 0 {
-		out.Body = io.NopCloser(bytes.NewReader(body))
-		out.ContentLength = int64(len(body))
-		return out
-	}
-	out.Body = nil
-	out.ContentLength = 0
-	return out
-}
-
-func targetAddress(u *url.URL) (string, error) {
-	host := u.Hostname()
-	if host == "" {
-		return "", fmt.Errorf("target URL has no host")
-	}
-	port := u.Port()
-	if port == "" {
-		switch u.Scheme {
-		case "http":
-			port = "80"
-		case "https":
-			port = "443"
-		default:
-			return "", fmt.Errorf("unsupported target scheme %q", u.Scheme)
-		}
-	}
-	return net.JoinHostPort(host, port), nil
-}
-
-type connReadCloser struct {
-	io.ReadCloser
-	conn net.Conn
-}
-
-func (c *connReadCloser) Close() error {
-	err := c.ReadCloser.Close()
-	if closeErr := c.conn.Close(); err == nil {
-		err = closeErr
-	}
-	return err
-}
-
-// flushWriter flushes after every write so streamed bodies — server-sent
-// events in particular — reach the client as they arrive instead of waiting
-// for the net/http output buffer to fill.
-type flushWriter struct {
-	w http.ResponseWriter
-}
-
-func (fw flushWriter) Write(p []byte) (int, error) {
-	n, err := fw.w.Write(p)
-	if flusher, ok := fw.w.(http.Flusher); ok {
-		flusher.Flush()
-	}
-	return n, err
-}
-
-// copyBufPool lends 64KiB relay buffers. Relaying is the hot path for both
-// streamed responses and CONNECT tunnels, and io.Copy's implicit 32KiB buffer
-// would be allocated per relay; the pool keeps one larger buffer per
-// in-flight copy instead.
-var copyBufPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, 64<<10)
-		return &buf
-	},
-}
-
-func copyWithPooledBuffer(dst io.Writer, src io.Reader) (int64, error) {
-	bufp := copyBufPool.Get().(*[]byte)
-	n, err := io.CopyBuffer(dst, src, *bufp)
-	copyBufPool.Put(bufp)
-	return n, err
-}
-
-func (s *Server) writeResponse(log *slog.Logger, w http.ResponseWriter, resp *http.Response) {
-	stripHopByHop(resp.Header)
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	if _, err := copyWithPooledBuffer(flushWriter{w: w}, resp.Body); err != nil {
-		// The client sees a truncated body: nothing to retry and no health to
-		// mutate, but the log attributes the mid-body drop to this request.
-		log.Warn("response relay failed", "error_kind", logErrorKind(err), "error", logErrorValue(err))
-	}
-	_ = resp.Body.Close()
-}
-
-// writeTunnelFailure answers a CONNECT that never reached its upstream with a
-// 502 and closes the hijacked connection. Both steps are best-effort: route
-// health is the caller's business and a write failure just means the client
-// is already gone.
-func writeTunnelFailure(conn net.Conn) {
-	_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
-	_ = conn.Close()
-}
-
-// handleTunnel relays an inbound CONNECT tunnel through the SOCKS5 pool.
-// Retries occur only before the SOCKS target connection succeeds. It loads
-// one generation for the whole operation so route picks and health reports
-// stay consistent across reloads.
-func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.Logger) {
-	gen := s.generation()
-	settings := generationSettings(gen)
-	start := time.Now()
-	target := r.URL.Host
-	if _, _, err := net.SplitHostPort(target); err != nil {
-		target = net.JoinHostPort(r.URL.Host, "443")
-	}
-	logTarget := tunnelTargetLogValue(target)
+	logTarget := socksTargetLogValue(target)
 	log.Debug("tunnel start", "target", logTarget)
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "tunneling unsupported", http.StatusInternalServerError)
-		log.Error("tunnel unsupported", "target", logTarget, "error_kind", "server")
-		return
-	}
-	clientConn, brw, err := hj.Hijack()
-	if err != nil {
-		log.Error("hijack failed", "target", logTarget, "error", logErrorValue(err))
-		return
-	}
-	s.trackConn(clientConn)
-	defer s.untrackConn(clientConn)
-
-	var prefix []byte
-	if n := brw.Reader.Buffered(); n > 0 {
-		prefix = make([]byte, n)
-		if _, err := io.ReadFull(brw.Reader, prefix); err != nil {
-			_ = clientConn.Close()
-			return
-		}
-	}
 
 	exclude := map[*pool.Proxy]bool{}
 	var upstream net.Conn
@@ -523,11 +219,6 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 	var attempts int
 	for attempt := 0; attempt < settings.maxRetries; attempt++ {
 		attempts = attempt + 1
-		if r.Context().Err() != nil {
-			log.Debug("tunnel canceled", "target", logTarget, "attempts", attempt)
-			_ = clientConn.Close()
-			return
-		}
 		p := s.pick(gen, exclude)
 		if p == nil {
 			break
@@ -535,13 +226,8 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 		// The winning pick holds the route for the tunnel's whole lifetime;
 		// earlier excluded attempts release when the handler ends.
 		defer p.Release()
-		up, err := s.dial(r.Context(), p.URL, target, settings.dialTimeout)
+		up, err := s.dial(context.Background(), p.URL, target, settings.dialTimeout)
 		if err != nil {
-			if r.Context().Err() != nil {
-				log.Debug("tunnel canceled", "target", logTarget, "attempts", attempts)
-				_ = clientConn.Close()
-				return
-			}
 			switch {
 			case isProxyDialError(err):
 				cooldown := gen.Pool.ReportFailure(p, err)
@@ -568,7 +254,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 					"error", logErrorValue(err))
 				continue
 			default:
-				writeTunnelFailure(clientConn)
+				writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the connection closes either way
 				log.Warn("upstream setup failed", "target", logTarget, "upstream", upstreamLogValue(p),
 					"attempt", attempts, "error_kind", logErrorKind(err), "error", logErrorValue(err),
 					"duration", logDuration(time.Since(start)))
@@ -580,21 +266,14 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 		break
 	}
 	if upstream == nil {
-		writeTunnelFailure(clientConn)
+		writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the connection closes either way
 		log.Warn("tunnel failed", "target", logTarget, "attempts", len(exclude),
 			"error_kind", errorKindNoRoute, "duration", logDuration(time.Since(start)))
 		return
 	}
-	if len(prefix) > 0 {
-		// A failed prefix write means the upstream is gone; the relay below
-		// surfaces the broken tunnel and shutdown handles the connection.
-		_, _ = upstream.Write(prefix)
-	}
-	// The 200 fits the hijacked bufio buffer, so only Flush reaches the
-	// network — and a failure there means the client is already gone. The
-	// relay surfaces the dead connection; nothing else to do here.
-	_, _ = brw.WriteString("HTTP/1.1 200 Connection established\r\n\r\n")
-	_ = brw.Flush()
+	writeSocksReply(clientConn, socksReplySuccess) //nolint:errcheck // relay shutdown handles write failure
+	// Established tunnels carry no timeouts.
+	clientConn.SetDeadline(time.Time{}) //nolint:errcheck // best-effort hardening
 	log.Info("tunnel", "target", logTarget, "upstream", upstreamLogValue(chosen),
 		"attempts", attempts, "duration", logDuration(time.Since(start)))
 
@@ -611,18 +290,155 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 			// A broken upstream must not masquerade as a clean end of stream:
 			// reset the client side so a truncated stream stays truncated.
 			if tc, ok := clientConn.(*net.TCPConn); ok {
-				_ = tc.SetLinger(0)
+				tc.SetLinger(0)
 			}
 		}
-		_ = clientConn.Close() // unblocks the client-to-upstream direction
+		clientConn.Close() // unblocks the client-to-upstream direction
 	}()
 	n, err := copyWithPooledBuffer(upstream, clientConn)
 	closes <- relayResult{direction: relayToUpstream, bytes: n, err: err}
-	_ = upstream.Close()
-	_ = clientConn.Close() // unblocks the other direction
+	upstream.Close()   //nolint:errcheck // best-effort teardown
+	clientConn.Close() //nolint:errcheck // unblocks the other direction
 	first := <-closes
 	second := <-closes // the forced close of the remaining side is an artifact
 	recordTunnelClose(log, logTarget, chosen, start, first, second)
+}
+
+// socksRequest is one parsed inbound CONNECT-able request: the host:port
+// target and the requested command.
+type socksRequest struct {
+	target string
+	cmd    byte
+}
+
+// readSocksRequest performs the RFC 1928 greeting (version 5, NO
+// AUTHENTICATION REQUIRED only) and reads one request. Parse failures return
+// an error and the connection must simply close: the RFC defines no reply for
+// a request the server could not parse, and an unknown address type makes the
+// frame length unknowable. Parseable but unsupported commands (BIND, UDP
+// ASSOCIATE) return with the command so the caller can answer 0x07.
+func readSocksRequest(conn net.Conn) (socksRequest, error) {
+	// Greeting: VER NMETHODS METHODS...
+	head := make([]byte, 2)
+	if _, err := io.ReadFull(conn, head); err != nil {
+		return socksRequest{}, fmt.Errorf("read greeting: %w", err)
+	}
+	if head[0] != socksVersion {
+		return socksRequest{}, fmt.Errorf("unexpected SOCKS version 0x%02x", head[0])
+	}
+	if head[1] == 0 {
+		return socksRequest{}, errors.New("empty method list")
+	}
+	methods := make([]byte, head[1])
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return socksRequest{}, fmt.Errorf("read methods: %w", err)
+	}
+	offered := false
+	for _, m := range methods {
+		if m == socksAuthNone {
+			offered = true
+			break
+		}
+	}
+	if !offered {
+		conn.Write([]byte{socksVersion, socksAuthUnaccepted}) //nolint:errcheck // the connection closes either way
+		return socksRequest{}, errors.New("no acceptable authentication method")
+	}
+	if _, err := conn.Write([]byte{socksVersion, socksAuthNone}); err != nil {
+		return socksRequest{}, fmt.Errorf("write method selection: %w", err)
+	}
+
+	// Request: VER CMD RSV ATYP DST.ADDR DST.PORT
+	req := make([]byte, 4)
+	if _, err := io.ReadFull(conn, req); err != nil {
+		return socksRequest{}, fmt.Errorf("read request: %w", err)
+	}
+	if req[0] != socksVersion {
+		return socksRequest{}, fmt.Errorf("unexpected request version 0x%02x", req[0])
+	}
+	if req[2] != 0x00 {
+		return socksRequest{}, fmt.Errorf("non-zero reserved byte 0x%02x", req[2])
+	}
+	switch atyp := req[3]; atyp {
+	case socksAtypIPv4:
+		addr := make([]byte, 6)
+		if _, err := io.ReadFull(conn, addr); err != nil {
+			return socksRequest{}, fmt.Errorf("read IPv4 target: %w", err)
+		}
+		target, err := joinSocksTarget(net.IP(addr[:4]).String(), addr[4:])
+		if err != nil {
+			return socksRequest{}, err
+		}
+		return socksRequest{target: target, cmd: req[1]}, nil
+	case socksAtypDomain:
+		lenByte := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenByte); err != nil {
+			return socksRequest{}, fmt.Errorf("read domain length: %w", err)
+		}
+		if lenByte[0] == 0 {
+			return socksRequest{}, errors.New("empty domain name")
+		}
+		name := make([]byte, lenByte[0])
+		if _, err := io.ReadFull(conn, name); err != nil {
+			return socksRequest{}, fmt.Errorf("read domain target: %w", err)
+		}
+		portBytes := make([]byte, 2)
+		if _, err := io.ReadFull(conn, portBytes); err != nil {
+			return socksRequest{}, fmt.Errorf("read domain port: %w", err)
+		}
+		target, err := joinSocksTarget(string(name), portBytes)
+		if err != nil {
+			return socksRequest{}, err
+		}
+		return socksRequest{target: target, cmd: req[1]}, nil
+	case socksAtypIPv6:
+		addr := make([]byte, 18)
+		if _, err := io.ReadFull(conn, addr); err != nil {
+			return socksRequest{}, fmt.Errorf("read IPv6 target: %w", err)
+		}
+		target, err := joinSocksTarget(net.IP(addr[:16]).String(), addr[16:])
+		if err != nil {
+			return socksRequest{}, err
+		}
+		return socksRequest{target: target, cmd: req[1]}, nil
+	default:
+		return socksRequest{}, fmt.Errorf("unsupported address type 0x%02x", atyp)
+	}
+}
+
+// joinSocksTarget validates the port and renders host:port. A zero port is a
+// parse failure: there is no meaningful CONNECT target without one.
+func joinSocksTarget(host string, portBytes []byte) (string, error) {
+	port := binary.BigEndian.Uint16(portBytes)
+	if port == 0 {
+		return "", errors.New("zero target port")
+	}
+	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
+}
+
+// writeSocksReply writes a full SOCKS reply with a zero IPv4 BND.ADDR/PORT.
+// The gateway cannot know the upstream bound address; RFC 1928 clients must
+// ignore it in a CONNECT success reply.
+func writeSocksReply(w io.Writer, code byte) error {
+	_, err := w.Write([]byte{socksVersion, code, 0x00, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
+	return err
+}
+
+// copyBufPool lends 64KiB relay buffers. Relaying is the hot path for
+// established tunnels, and io.Copy's implicit 32KiB buffer would be allocated
+// per relay; the pool keeps one larger buffer per in-flight copy instead.
+var copyBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 64<<10)
+		return &buf
+	},
+}
+
+func copyWithPooledBuffer(dst io.Writer, src io.Reader) (int64, error) {
+	bufp := copyBufPool.Get().(*[]byte)
+	n, err := io.CopyBuffer(dst, src, *bufp)
+	copyBufPool.Put(bufp)
+	return n, err
 }
 
 // relayResult is the outcome of one direction of an established tunnel relay.
@@ -685,9 +501,10 @@ func (s *Server) untrackConn(c net.Conn) {
 	s.cmu.Unlock()
 }
 
-// CloseTunnels closes hijacked client connections; http.Server.Shutdown does
-// not track hijacked connections, so shutdown calls this after its grace period.
-func (s *Server) CloseTunnels() {
+// CloseConns closes every tracked client connection, including established
+// tunnels and sessions still inside their handshake. Shutdown calls it when
+// the shared grace budget expires.
+func (s *Server) CloseConns() {
 	s.cmu.Lock()
 	conns := make([]net.Conn, 0, len(s.conns))
 	for c := range s.conns {
@@ -695,7 +512,7 @@ func (s *Server) CloseTunnels() {
 	}
 	s.cmu.Unlock()
 	for _, c := range conns {
-		_ = c.Close()
+		c.Close() //nolint:errcheck // best-effort force-close
 	}
 }
 
@@ -706,16 +523,15 @@ func (s *Server) AdminMux() *http.ServeMux {
 
 // AdminMux serves aggregate health/status for all proxy listener views sharing
 // a runtime generation store. Existing status fields remain global totals;
-// listeners adds safe per-listener counters. rotations reports completed
-// manual-route IP rotations from the rotation engine (nil omits the field);
-// failovers counts in-band route fallbacks and stays a listener metric. The
-// pool snapshot comes from the current generation so /status changes
-// atomically with serving behavior.
+// listeners adds safe per-listener counters — requests counts valid CONNECT
+// commands (protocol rejects never advance it) and failovers counts in-band
+// route fallbacks, distinct from rotations. The pool snapshot comes from the
+// current generation so /status changes atomically with serving behavior.
 func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = io.WriteString(w, "ok\n")
+		io.WriteString(w, "ok\n")
 	})
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -745,9 +561,7 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 		if rotations != nil {
 			status["rotations"] = rotations()
 		}
-		// A failing encode means the status consumer disconnected; net/http
-		// records it on the connection and there is no fallback representation.
-		_ = json.NewEncoder(w).Encode(status)
+		json.NewEncoder(w).Encode(status)
 	})
 	return mux
 }

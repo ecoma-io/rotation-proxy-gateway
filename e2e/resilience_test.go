@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -31,7 +30,6 @@ func TestE2E_ExhaustedPoolNoRouteWithCooldownDoubling(t *testing.T) {
 	})
 	cfg.MaxRetries = 2 // both routes tried per request, then terminal no_route
 	g := NewGateway(t, cfg)
-	client := ProxyClient(g.MixedAddr)
 
 	// Request n leaves each route at n consecutive failures and a cooldown of
 	// base*2^(n-1). Requests run back to back, so /status must report the
@@ -45,15 +43,7 @@ func TestE2E_ExhaustedPoolNoRouteWithCooldownDoubling(t *testing.T) {
 		{3, 20 * time.Second},
 	}
 	for i, step := range steps {
-		resp, err := client.Get(target.URL + "/")
-		if err != nil {
-			t.Fatalf("request %d: %v", i, err)
-		}
-		body, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusBadGateway || string(body) != "no usable upstream SOCKS routes\n" {
-			t.Fatalf("request %d: status=%d body=%q, want terminal no-route 502", i, resp.StatusCode, body)
-		}
+		failedSocksTunnel(t, g.MixedAddr, target.Host)
 
 		st, err := g.Status()
 		if err != nil {
@@ -88,8 +78,8 @@ func TestE2E_ExhaustedPoolNoRouteWithCooldownDoubling(t *testing.T) {
 	}
 }
 
-// A hijacked CONNECT tunnel established before a reload must keep relaying on
-// its original upstream connection across generation swaps.
+// A tunnel established before a reload must keep relaying on its original
+// upstream connection across generation swaps.
 func TestE2E_TunnelSurvivesReload(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
@@ -101,22 +91,8 @@ func TestE2E_TunnelSurvivesReload(t *testing.T) {
 		{Proxy: socksA.RouteValue(), Kind: "v4"},
 	}))
 
-	conn, err := net.DialTimeout("tcp", g.MixedAddr, 5*time.Second)
-	if err != nil {
-		t.Fatalf("dial mixed listener: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(60 * time.Second)) // covers reload settles
-	_, _ = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target.Host, target.Host)
+	conn := socksTunnel(t, g.MixedAddr, target.Host)
 	br := bufio.NewReader(conn)
-	tunnelResp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
-	if err != nil {
-		t.Fatalf("read CONNECT response: %v", err)
-	}
-	_ = tunnelResp.Body.Close()
-	if tunnelResp.StatusCode != http.StatusOK {
-		t.Fatalf("CONNECT status=%d, want 200", tunnelResp.StatusCode)
-	}
 
 	// Grow and shrink the pool while the tunnel stays open.
 	g.ReloadConfig(defaultGatewayConfig([]RouteConfig{
@@ -155,22 +131,8 @@ func TestE2E_TunnelBreakDoesNotMutateHealth(t *testing.T) {
 	cfg.LogLevel = "debug" // tunnel close records are flow detail
 	g := NewGateway(t, cfg)
 
-	conn, err := net.DialTimeout("tcp", g.MixedAddr, 5*time.Second)
-	if err != nil {
-		t.Fatalf("dial mixed listener: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
-	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target.Host, target.Host) //nolint:errcheck // the read is the assertion
+	conn := socksTunnel(t, g.MixedAddr, target.Host)
 	br := bufio.NewReader(conn)
-	tunnelResp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
-	if err != nil {
-		t.Fatalf("read CONNECT response: %v", err)
-	}
-	_ = tunnelResp.Body.Close()
-	if tunnelResp.StatusCode != http.StatusOK {
-		t.Fatalf("CONNECT status=%d, want 200", tunnelResp.StatusCode)
-	}
 
 	// Tear the target down under the live tunnel, then push a request through:
 	// the relay must end and the client must observe the close.

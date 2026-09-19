@@ -3,7 +3,6 @@ package proxyserver
 import (
 	"errors"
 	"net"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -31,30 +30,28 @@ func upstreamLogValue(p *pool.Proxy) string {
 	return cleanLogValue(p.URL.Host)
 }
 
-// httpTargetLogValue returns only the HTTP target host or host:port. It
-// deliberately excludes URL userinfo, paths, queries, and fragments.
-func httpTargetLogValue(u *url.URL) string {
-	if u == nil || u.Hostname() == "" {
-		return "unknown"
-	}
-	if port := u.Port(); port != "" {
-		return cleanLogValue(net.JoinHostPort(u.Hostname(), port))
-	}
-	return cleanLogValue(u.Hostname())
-}
-
-// tunnelTargetLogValue keeps only a CONNECT target's normalized host:port.
-func tunnelTargetLogValue(target string) string {
+// socksTargetLogValue keeps only a SOCKS target's normalized host:port.
+func socksTargetLogValue(target string) string {
 	host, port, err := net.SplitHostPort(target)
 	if err != nil || !validPortNumber(port) {
 		// SplitHostPort "succeeds" on any colon (e.g. a userinfo-shaped
 		// "user:pass@host" target with no real port); only a numeric port
 		// proves the split is real. Anything else falls back to the
 		// userinfo-stripping path, the only credential defense on
-		// scheme-less CONNECT targets.
+		// scheme-less targets.
 		return cleanLogValue(dropUserinfo(target))
 	}
 	return cleanLogValue(net.JoinHostPort(dropUserinfo(host), port))
+}
+
+// socksRejectLogValue bounds and sanitizes a protocol-reject reason. Reject
+// errors are constructed locally from framing bytes; the sanitizer is the
+// single defense keeping any odd byte sequence out of logs.
+func socksRejectLogValue(err error) string {
+	if err == nil {
+		return ""
+	}
+	return sanitize.ErrorString(err)
 }
 
 func validPortNumber(port string) bool {
@@ -71,13 +68,6 @@ func dropUserinfo(value string) string {
 
 func logDuration(duration time.Duration) string {
 	return duration.Truncate(time.Millisecond).String()
-}
-
-func bodyLogMode(streamMode bool) string {
-	if streamMode {
-		return "streamed"
-	}
-	return "replayable"
 }
 
 func logErrorKind(err error) string {

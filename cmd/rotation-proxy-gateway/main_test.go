@@ -3,13 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -236,50 +238,112 @@ func TestBootstrapShutdownGraceEnv(t *testing.T) {
 	})
 }
 
-func serveTestListener(t *testing.T, handler http.Handler) (net.Listener, *http.Server) {
+func newTestLogger() *slog.Logger {
+	// Error level keeps the output clean: pre-greeting conns killed by the
+	// shutdown tests log at debug, and dropped tunnels at warn.
+	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+}
+
+// newTestStore builds a pool store with no routes: the shutdown tests exercise
+// listener lifecycle only, never a route pick.
+func newTestStore() *pool.Store {
+	runtime := &config.RuntimeConfig{
+		MaxRetries:   1,
+		DialTimeout:  time.Second,
+		CooldownBase: time.Second,
+		CooldownMax:  time.Minute,
+	}
+	return pool.NewStore(runtime, pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}))
+}
+
+// awaitReachable dials the listener until the address accepts TCP connections,
+// so tests never race their first request against Serve starting up.
+func awaitReachable(t *testing.T, ln net.Listener) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		conn, err := net.DialTimeout("tcp", ln.Addr().String(), 100*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("listener %s never became reachable: %v", ln.Addr(), err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// serveSocksListener binds an ephemeral loopback address, serves the SOCKS
+// server on it, and waits until the address accepts TCP dials. Cleanup closes
+// the listener, which makes Serve return.
+func serveSocksListener(t *testing.T, srv *proxyserver.Server) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve(ln) }() // Serve returns nil once shutdown closes ln
+	t.Cleanup(func() { _ = ln.Close() })
+	awaitReachable(t, ln)
+	return ln
+}
+
+// serveAdminListener is the admin counterpart: the admin listener stays a
+// plain *http.Server rather than a proxyserver.Server.
+func serveAdminListener(t *testing.T, handler http.Handler) (net.Listener, *http.Server) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
-	go srv.Serve(ln)                  //nolint:errcheck // shutdownAll stops the server
-	t.Cleanup(func() { srv.Close() }) //nolint:errcheck // best-effort
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		conn, err := net.DialTimeout("tcp", ln.Addr().String(), 100*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			return ln, srv
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("test server %s never became reachable: %v", ln.Addr(), err)
-		}
-		time.Sleep(10 * time.Millisecond)
+	go srv.Serve(ln) //nolint:errcheck // shutdownAll and cleanup stop the server
+	t.Cleanup(func() { _ = srv.Close() })
+	awaitReachable(t, ln)
+	return ln, srv
+}
+
+// parkConn dials the listener and writes nothing, so the accepted session sits
+// in its SOCKS greeting read until the server force-closes the conn or the 30s
+// handshake deadline expires — a session that can never finish on its own.
+func parkConn(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+// assertForceClosed reads on a client conn the server should have force-closed:
+// the read must fail promptly and must not merely time out.
+func assertForceClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, err := conn.Read(make([]byte, 1))
+	switch {
+	case err == nil:
+		t.Fatalf("conn to %s is still open after shutdownAll: read returned data", conn.RemoteAddr())
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		t.Fatalf("conn to %s is still open 5s after shutdownAll", conn.RemoteAddr())
 	}
 }
 
 func TestShutdownAllClosesProxyListenersThenAdmin(t *testing.T) {
-	var logBuf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelError}))
-	runtime := &config.RuntimeConfig{
-		MaxRetries:    1,
-		DialTimeout:   time.Second,
-		MaxBodyBuffer: 1 << 20,
-		CooldownBase:  time.Second,
-		CooldownMax:   time.Minute,
-	}
-	store := pool.NewStore(runtime, pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}))
+	log := newTestLogger()
+	store := newTestStore()
 	srvA := proxyserver.NewRuntime(store, log, "test", "mixed", config.EgressV4, config.EgressV6)
 	srvB := proxyserver.NewRuntime(store, log, "test", "v4", config.EgressV4)
 
-	lnA, httpA := serveTestListener(t, srvA)
-	lnB, httpB := serveTestListener(t, srvB)
-	lnAdmin, adminSrv := serveTestListener(t, proxyserver.AdminMux("test", time.Now(), store, map[string]*proxyserver.Server{"mixed": srvA}, nil))
+	lnA := serveSocksListener(t, srvA)
+	lnB := serveSocksListener(t, srvB)
+	lnAdmin, adminSrv := serveAdminListener(t, proxyserver.AdminMux("test", time.Now(), store, map[string]*proxyserver.Server{"mixed": srvA}, nil))
 
 	listeners := []runningListener{
-		{name: "mixed", server: srvA, http: httpA},
-		{name: "v4", server: srvB, http: httpB},
+		{name: "mixed", server: srvA, ln: lnA},
+		{name: "v4", server: srvB, ln: lnB},
 	}
 
 	done := make(chan struct{})
@@ -289,102 +353,118 @@ func TestShutdownAllClosesProxyListenersThenAdmin(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(15 * time.Second):
-		t.Fatal("shutdownAll did not return within 15s")
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdownAll on a process with no live sessions did not return within 2s, well under the 5s grace")
 	}
 
-	// Each server was bound to an ephemeral port; after shutdown the listener
-	// address is closed so redialing must fail.
+	// Each listener was bound to an ephemeral port; after shutdownAll the
+	// sockets are closed so redialing must fail.
 	for _, ln := range []net.Listener{lnA, lnB, lnAdmin} {
 		if conn, err := net.DialTimeout("tcp", ln.Addr().String(), 200*time.Millisecond); err == nil {
 			_ = conn.Close()
-			t.Fatalf("server %s still reachable after shutdownAll", ln.Addr())
+			t.Fatalf("listener %s still reachable after shutdownAll", ln.Addr())
 		}
 	}
 }
 
 // shutdownAll must bound the whole drain with the single shared grace budget,
-// not hand each listener its own window: with every listener holding an active
-// request that can never finish, total shutdown time stays near one budget.
+// not hand each listener its own window: with every proxy listener holding a
+// client conn parked before its SOCKS greeting — a session that never finishes
+// on its own — total shutdown time stays near one budget.
+//
+// Liveness discipline: the parked conns get a fixed 250ms beat to be accepted
+// before shutdownAll starts, instead of polling "Shutdown has not returned
+// yet" on a goroutine. Both disciplines lose the same race — a conn accepted
+// too late means the drain finds no live session — but the beat keeps the
+// elapsed measurement and its bounds in one place, and loopback accepts land
+// microseconds after the dial, orders of magnitude below the beat. The
+// lower-bound assertion below still fails on a too-early return, so the beat
+// cannot turn a regression into a false pass.
 func TestShutdownAllSharedBudget(t *testing.T) {
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	releaseHandlers := func() { releaseOnce.Do(func() { close(release) }) }
-	t.Cleanup(releaseHandlers)
-	entered := make(chan struct{}, 2)
-	block := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
-		entered <- struct{}{}
-		<-release
-	})
-
-	var logBuf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelError}))
-	runtime := &config.RuntimeConfig{
-		MaxRetries:    1,
-		DialTimeout:   time.Second,
-		MaxBodyBuffer: 1 << 20,
-		CooldownBase:  time.Second,
-		CooldownMax:   time.Minute,
-	}
-	store := pool.NewStore(runtime, pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}))
+	log := newTestLogger()
+	store := newTestStore()
 	srvA := proxyserver.NewRuntime(store, log, "test", "mixed", config.EgressV4, config.EgressV6)
 	srvB := proxyserver.NewRuntime(store, log, "test", "v4", config.EgressV4)
-	lnA, httpA := serveTestListener(t, block)
-	lnB, httpB := serveTestListener(t, block)
-	lnAdmin, adminSrv := serveTestListener(t, http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+	lnA := serveSocksListener(t, srvA)
+	lnB := serveSocksListener(t, srvB)
+	lnAdmin, adminSrv := serveAdminListener(t, http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
 	listeners := []runningListener{
-		{name: "mixed", server: srvA, http: httpA},
-		{name: "v4", server: srvB, http: httpB},
+		{name: "mixed", server: srvA, ln: lnA},
+		{name: "v4", server: srvB, ln: lnB},
 	}
 
-	type clientResult struct{ err error }
-	results := make(chan clientResult, 2)
-	client := &http.Client{Transport: &http.Transport{}}
-	for _, ln := range []net.Listener{lnA, lnB} {
-		ln := ln
-		go func() {
-			resp, err := client.Get("http://" + ln.Addr().String() + "/held")
-			if err == nil {
-				_ = resp.Body.Close()
-			}
-			results <- clientResult{err: err}
-		}()
-	}
-	for range 2 {
-		select {
-		case <-entered:
-		case <-time.After(5 * time.Second):
-			t.Fatal("handlers never ran")
-		}
-	}
+	parkedA := parkConn(t, lnA.Addr().String())
+	parkedB := parkConn(t, lnB.Addr().String())
+	// One beat for both accept loops to start the parked sessions.
+	time.Sleep(250 * time.Millisecond)
 
 	const grace = 500 * time.Millisecond
 	start := time.Now()
-	shutdownAll(func() {}, listeners, adminSrv, grace)
+	done := make(chan struct{})
+	go func() {
+		shutdownAll(func() {}, listeners, adminSrv, grace)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdownAll did not return within 5s")
+	}
 	elapsed := time.Since(start)
+
+	// The parked sessions can never finish, so shutdownAll must wait out the
+	// budget before force-closing them.
 	if elapsed < grace-100*time.Millisecond {
 		t.Fatalf("shutdownAll returned after %s, want at least the %s budget (it must bound the drain)", elapsed, grace)
 	}
+	// One budget for all listeners: a per-listener window would push two proxy
+	// listeners to ~2x grace.
 	if elapsed >= 2*grace-100*time.Millisecond {
 		t.Fatalf("shutdownAll took %s, want within one shared %s budget, not one window per listener", elapsed, grace)
 	}
 
-	// Shutdown stops listeners and closes idle connections even when the
-	// shared budget expired before that listener's turn.
+	// The expired budget force-closed the parked client conns ...
+	assertForceClosed(t, parkedA)
+	assertForceClosed(t, parkedB)
+
+	// ... and every listener socket refuses new dials.
 	for _, ln := range []net.Listener{lnA, lnB, lnAdmin} {
 		if conn, err := net.DialTimeout("tcp", ln.Addr().String(), 200*time.Millisecond); err == nil {
 			_ = conn.Close()
-			t.Fatalf("server %s still reachable after shutdownAll", ln.Addr())
+			t.Fatalf("listener %s still reachable after shutdownAll", ln.Addr())
 		}
 	}
+}
 
-	releaseHandlers()
-	for range 2 {
-		select {
-		case <-results:
-		case <-time.After(5 * time.Second):
-			t.Fatal("client requests never finished after release")
-		}
+// A quiesced process must not wait out the budget: once the only session has
+// ended — the parked client closed its own conn, so the greeting read failed and
+// the server untracked the session — shutdownAll returns at once even with a
+// generous grace.
+func TestShutdownAllDrainsCompletedSessionsImmediately(t *testing.T) {
+	log := newTestLogger()
+	store := newTestStore()
+	srv := proxyserver.NewRuntime(store, log, "test", "mixed", config.EgressV4, config.EgressV6)
+	ln := serveSocksListener(t, srv)
+	_, adminSrv := serveAdminListener(t, http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+
+	parked := parkConn(t, ln.Addr().String())
+	// One beat so the server really accepted the conn and the session went
+	// live; closing it then fails the greeting read and ends the session. If
+	// the beat is missed, the conn is accepted as already closed and ends the
+	// same way, so the assertions below hold either way.
+	time.Sleep(100 * time.Millisecond)
+	_ = parked.Close()
+
+	listeners := []runningListener{{name: "mixed", server: srv, ln: ln}}
+	done := make(chan struct{})
+	go func() {
+		shutdownAll(func() {}, listeners, adminSrv, 5*time.Second)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("shutdownAll did not return within 1s although the only session had already ended (grace 5s)")
 	}
 }
 

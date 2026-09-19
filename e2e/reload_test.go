@@ -81,22 +81,14 @@ func TestE2E_ReloadShrinksToOtherFamily(t *testing.T) {
 
 	GetVia(t, ProxyClient(g.V4Addr), target.URL+"/", "e2e-echo:/")
 
-	// Drop the v4 route entirely: mixed and v6 keep working, v4 returns the
-	// ordinary no-route 502 while staying live.
+	// Drop the v4 route entirely: mixed and v6 keep working, v4 stays live and
+	// its CONNECT requests now get the general-failure reply (no-route).
 	cfg.Routes = []RouteConfig{{Proxy: v6.RouteValue(), Kind: "v6"}}
 	g.ReloadConfig(cfg, []string{v6.Addr})
 
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
 	GetVia(t, ProxyClient(g.V6Addr), target.URL+"/", "e2e-echo:/")
-	resp, err := ProxyClient(g.V4Addr).Get(target.URL + "/")
-	if err != nil {
-		t.Fatalf("v4 GET: %v", err)
-	}
-	_, _ = io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("v4 status=%d, want 502", resp.StatusCode)
-	}
+	failedSocksTunnel(t, g.V4Addr, target.Host)
 }
 
 func TestE2E_InvalidConfigKeepsServing(t *testing.T) {
@@ -114,13 +106,15 @@ func TestE2E_InvalidConfigKeepsServing(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The old global: block is rejected on reload (the gateway removed the HTTP
+	// era's settings), as are malformed YAML, duplicate routes, and an empty
+	// pool. The last-known-good config keeps serving through every rejection.
 	cases := map[string]string{
 		"malformed yaml": "log-level: [unclosed\nmax-retries: nope\n",
 		"duplicate route": fmt.Sprintf(`log-level: info
 max-retries: 3
 cooldown: {base: 5s, max: 1m}
 dial-timeout: 5s
-global: {target-tls-insecure: false, max-body-buffer: 67108864}
 proxies:
   auto:
     - {proxy: '%s', kind: v4}
@@ -131,7 +125,6 @@ proxies:
 max-retries: 3
 cooldown: {base: 5s, max: 1m}
 dial-timeout: 5s
-global: {target-tls-insecure: false, max-body-buffer: 67108864}
 proxies:
   auto:
     - {proxy: '%s'}
@@ -141,9 +134,18 @@ proxies:
 max-retries: 3
 cooldown: {base: 5s, max: 1m}
 dial-timeout: 5s
-global: {target-tls-insecure: false, max-body-buffer: 67108864}
 proxies:
   auto: []
+  manual: []
+`,
+		"removed global block": `log-level: info
+max-retries: 3
+cooldown: {base: 5s, max: 1m}
+dial-timeout: 5s
+global: {target-tls-insecure: false, max-body-buffer: 67108864}
+proxies:
+  auto:
+    - {proxy: '` + socks.RouteValue() + `', kind: v4}
   manual: []
 `,
 	}
@@ -179,8 +181,8 @@ func TestE2E_ReloadChangedCredsResetState(t *testing.T) {
 	g := NewGateway(t, cfg)
 
 	// Request until the wrong-creds route is auth-blocked. The dead second
-	// route cools down, so the auth fallback exhausts and returns 502; both
-	// outcomes burn the block into pool state, which is what we assert on.
+	// route cools down, so the auth fallback exhausts and the CONNECT fails;
+	// both outcomes burn the block into pool state, which is what we assert on.
 	g.WaitForCondition(15*time.Second, "auth block on wrong-creds route", func(st *Status) bool {
 		resp, err := ProxyClient(g.MixedAddr).Get(target.URL + "/")
 		if err == nil {
@@ -288,7 +290,7 @@ func TestE2E_ReloadAppliesLogLevel(t *testing.T) {
 	g := NewGateway(t, cfg)
 
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
-	if out := g.Logs(); strings.Contains(out, `msg="request start"`) {
+	if out := g.Logs(); strings.Contains(out, `msg="tunnel start"`) {
 		t.Fatalf("debug line present at info level:\n%s", out)
 	}
 
@@ -298,7 +300,7 @@ func TestE2E_ReloadAppliesLogLevel(t *testing.T) {
 	// it to apply; wait for the reload log instead of the pool snapshot.
 	waitForLog(t, g, `msg="configuration reloaded"`, reloadSettle)
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
-	waitForLog(t, g, `msg="request start"`, reloadSettle)
+	waitForLog(t, g, `msg="tunnel start"`, reloadSettle)
 }
 
 func TestE2E_ReloadDoesNotDropInFlight(t *testing.T) {

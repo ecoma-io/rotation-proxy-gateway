@@ -1,6 +1,7 @@
 package e2e_test
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -397,7 +398,11 @@ func TestRotationDeadRouteRotatesUnverified(t *testing.T) {
 	}
 }
 
-func TestRotationSingleManualRouteWindowReturns502(t *testing.T) {
+// TestRotationSingleManualRouteWindowNoRoute: while the only route is
+// mid-rotation the client's CONNECT gets the general-failure reply (no-route
+// window, surfaced as a SOCKS transport error, not an HTTP status); afterwards
+// traffic flows again.
+func TestRotationSingleManualRouteWindowNoRoute(t *testing.T) {
 	skipShort(t)
 	rt := newRotationTest(t, 1)
 	rt.flipOnCall()
@@ -411,30 +416,27 @@ func TestRotationSingleManualRouteWindowReturns502(t *testing.T) {
 	g := startRotationGateway(t, cfg, rt.trace)
 
 	// While the only route is mid-rotation, requests get the ordinary
-	// no-route 502; afterwards traffic flows again.
-	client := ProxyClient(g.MixedAddr)
+	// no-route failure; afterwards traffic flows again.
+	sawNoRoute := false
 	deadline := time.Now().Add(6 * time.Second)
-	saw502 := false
 	for time.Now().Before(deadline) {
-		resp, err := client.Get(echo.URL + "/")
+		conn, err := dialSocksTunnel(context.Background(), g.MixedAddr, echo.Host)
 		if err != nil {
+			if strings.Contains(err.Error(), "reply 0x01") {
+				sawNoRoute = true
+				break
+			}
 			t.Fatalf("request during rotation: %v", err)
 		}
-		body := make([]byte, 64)
-		_, _ = resp.Body.Read(body)
-		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusBadGateway {
-			saw502 = true
-			break
-		}
+		_ = conn.Close()
 		time.Sleep(20 * time.Millisecond)
 	}
-	if !saw502 {
-		t.Fatal("never observed the ordinary no-route 502 during the rotating window")
+	if !sawNoRoute {
+		t.Fatal("never observed the no-route window during the rotating period")
 	}
 	waitRotation(t, g, rt.sims[0], "to return to serving after the window",
 		func(v *RotationView) bool { return v.State == "idle" && v.LastIP == "198.51.100.10" }, 10*time.Second)
-	GetVia(t, client, echo.URL+"/", "e2e-echo:/")
+	GetVia(t, ProxyClient(g.MixedAddr), echo.URL+"/", "e2e-echo:/")
 }
 
 func TestRotationReloadRemovesRouteAbortsProcedure(t *testing.T) {
@@ -677,11 +679,15 @@ func TestRotationLifecycleStatesVisibleInStatus(t *testing.T) {
 
 	// A request held across the 4s mark keeps the route draining: at ~3.4s
 	// the request is mid-flight (it ends ~5.9s), the interval fires at the
-	// first tick past 4s, and the drain waits for it before rotating.
+	// first tick past 4s, and the drain waits for it before rotating. The
+	// body must be read to completion: client.Get returns at the headers, and
+	// closing the body there would tear down the one-tunnel-per-request SOCKS
+	// relay early, releasing the route's in-flight hold before the drain.
 	time.Sleep(3400 * time.Millisecond)
 	go func() {
 		resp, err := ProxyClient(g.MixedAddr).Get(held.URL + "/held")
 		if err == nil {
+			_, _ = io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 		}
 	}()

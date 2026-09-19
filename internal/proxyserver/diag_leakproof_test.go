@@ -1,8 +1,12 @@
 package proxyserver
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -103,6 +107,52 @@ func TestLogErrorValueLeakProof(t *testing.T) {
 	gotANSI := logErrorValue(errors.New("x\x1b[31mred\x1b[0m"))
 	if strings.Contains(gotANSI, "\x1b") {
 		t.Fatalf("logErrorValue contains ESC: %q", truncateDiag(gotANSI))
+	}
+}
+
+// A full serving flow — a credentialed route that fails and a fallback that
+// succeeds — must leave the process diagnostics free of route credentials
+// while keeping the redacted route identity operators need.
+func TestStatusAndLogsStayCleanAfterServingFailures(t *testing.T) {
+	dead := &url.URL{Scheme: "socks5", User: url.UserPassword("route-user", "route-password"), Host: "dead.test:1080"}
+	good := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute, config.KindBalance{})
+	var logs safeLogBuffer
+	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	s.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+		if pu.Host == dead.Host {
+			return nil, &ProxyDialError{Err: errors.New("dial socks5://route-user:route-password@dead.test:1080: connect refused")}
+		}
+		return dialVia(ctx, pu, target, timeout)
+	}
+	addr := startServer(t, s)
+
+	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	readBanner(t, conn)
+	_ = conn.Close()
+
+	admin := httptest.NewServer(s.AdminMux())
+	defer admin.Close()
+	resp, err := http.Get(admin.URL + "/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output := waitForLog(t, &logs, "msg=tunnel")
+	for name, view := range map[string]string{"logs": output, "/status": string(body)} {
+		for _, secret := range []string{"route-user", "route-password"} {
+			if strings.Contains(view, secret) {
+				t.Fatalf("%s leaked %q:\n%s", name, secret, truncateDiag(view))
+			}
+		}
+	}
+	if !strings.Contains(string(body), "dead.test:1080") {
+		t.Fatalf("/status lost the route identity:\n%s", truncateDiag(string(body)))
 	}
 }
 

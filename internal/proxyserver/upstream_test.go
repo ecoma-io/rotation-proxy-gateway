@@ -14,6 +14,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/pool"
 )
 
 type socksOptions struct {
@@ -91,16 +94,16 @@ func (s *fakeSocks) handle(conn net.Conn) {
 		return
 	}
 	if s.opts.connectRep != 0 {
-		writeSocksReply(conn, s.opts.connectRep)
+		fakeSocksReply(conn, s.opts.connectRep)
 		return
 	}
 	up, err := net.Dial("tcp", target)
 	if err != nil {
-		writeSocksReply(conn, 0x05)
+		fakeSocksReply(conn, 0x05)
 		return
 	}
 	defer func() { _ = up.Close() }()
-	writeSocksReply(conn, 0x00)
+	fakeSocksReply(conn, 0x00)
 	if len(s.opts.connectPrefix) > 0 {
 		conn.Write(s.opts.connectPrefix) //nolint:errcheck
 	}
@@ -233,7 +236,10 @@ func readSocksConnect(br *bufio.Reader) (string, error) {
 	return net.JoinHostPort(host, strconv.Itoa(int(portBytes[0])<<8|int(portBytes[1]))), nil
 }
 
-func writeSocksReply(conn net.Conn, rep byte) {
+// fakeSocksReply writes a full upstream SOCKS reply with a zero IPv4 bound
+// address. Named separately from the gateway's writeSocksReply so the file-local
+// test double stays independent of the server's own encoder.
+func fakeSocksReply(conn net.Conn, rep byte) {
 	conn.Write([]byte{0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) //nolint:errcheck
 }
 
@@ -446,7 +452,8 @@ func TestDialViaBufferedPrefixDelivered(t *testing.T) {
 }
 
 // Connect-framing failures are handshake failures: with a single route the
-// request exhausts to the sanitized no-route 502 while recording dial health.
+// request exhausts to the gateway's general-failure reply while recording dial
+// health against the route.
 func TestConnectFramingFailuresExhaustToNoRoute(t *testing.T) {
 	rawCases := []struct {
 		name string
@@ -458,15 +465,12 @@ func TestConnectFramingFailuresExhaustToNoRoute(t *testing.T) {
 	for _, tc := range rawCases {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := startSocks5Proxy(t, socksOptions{connectRaw: tc.raw})
-			ts, pl := newForwarder(t, fs)
-			resp, err := proxiedClient(t, ts.URL).Get("http://example.com/")
-			if err != nil {
-				t.Fatalf("GET: %v", err)
-			}
-			body, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			if resp.StatusCode != http.StatusBadGateway || string(body) != "no usable upstream SOCKS routes\n" {
-				t.Fatalf("status=%d body=%q, want sanitized no-route 502", resp.StatusCode, body)
+			pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+			s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
+			conn, code := socksConnectReply(t, addr, "example.com:80", socksCmdConnect)
+			_ = conn.Close()
+			if code != socksReplyGeneral {
+				t.Fatalf("reply = 0x%02x, want general failure 0x01", code)
 			}
 			snap := pl.Snapshot()[0]
 			if snap.Successes != 0 || snap.AuthFailures != 0 || snap.Failures != 1 || snap.Available {
@@ -474,6 +478,9 @@ func TestConnectFramingFailuresExhaustToNoRoute(t *testing.T) {
 			}
 			if got := len(fs.hits); got != 1 {
 				t.Fatalf("SOCKS attempts = %d, want 1", got)
+			}
+			if status := s.ListenerStatus(); status.Requests != 1 || status.Failovers != 1 {
+				t.Fatalf("listener status = %+v", status)
 			}
 		})
 	}

@@ -1,14 +1,15 @@
 package e2e_test
 
 import (
-	"bufio"
-	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -26,6 +27,18 @@ func waitForLog(t *testing.T, g *Gateway, want string, timeout time.Duration) st
 	return ""
 }
 
+// isConnResetError reports connection-reset errors seen when the server closes
+// a socket that still holds unread client bytes (no reply frame was written).
+func isConnResetError(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) {
+		if oe, ok := ne.(*net.OpError); ok {
+			return errors.Is(oe, syscall.ECONNRESET)
+		}
+	}
+	return errors.Is(err, syscall.ECONNRESET)
+}
+
 func deadRouteValue(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -37,127 +50,20 @@ func deadRouteValue(t *testing.T) string {
 	return "socks5://" + addr
 }
 
-// postVia sends a POST with the given payload through a gateway listener and
-// returns the status plus the echoed body.
-func postVia(t *testing.T, client *http.Client, targetURL string, payload []byte) (int, []byte) {
+// failedSocksTunnel asserts the gateway rejects the CONNECT attempt with the
+// SOCKS general-failure reply (0x01): no-route exhaustion and setup failures
+// surface to a client as a SOCKS transport error, not an HTTP status. It fails
+// the test when the tunnel unexpectedly establishes; rejection is the pass.
+func failedSocksTunnel(t *testing.T, proxyAddr, target string) {
 	t.Helper()
-	resp, err := client.Post(targetURL+"/body", "application/octet-stream", bytes.NewReader(payload))
-	if err != nil {
-		t.Fatalf("POST: %v", err)
+	conn, err := dialSocksTunnel(context.Background(), proxyAddr, target)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatalf("CONNECT %s through %s unexpectedly succeeded", target, proxyAddr)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, body
-}
-
-// Bodies at or under max-body-buffer are buffered and therefore replayable:
-// a dial or auth fallback must still deliver the whole request body.
-func TestE2E_POSTReplayAfterDialFallback(t *testing.T) {
-	if testing.Short() {
-		t.Skip("e2e")
+	if !strings.Contains(err.Error(), "reply 0x01") {
+		t.Fatalf("CONNECT %s through %s: error=%v, want reply 0x01", target, proxyAddr, err)
 	}
-	good := NewSocksSim(t, SocksOK, "", "")
-	target := NewEchoBodyTarget(t)
-	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
-		{Proxy: deadRouteValue(t), Kind: "v4"},
-		{Proxy: good.RouteValue(), Kind: "v4"},
-	}))
-
-	payload := bytes.Repeat([]byte("b"), 1024) // buffered: far under the 64MiB cap
-	status, body := postVia(t, ProxyClient(g.MixedAddr), target.URL, payload)
-	if status != http.StatusOK || !bytes.Equal(body, payload) {
-		t.Fatalf("status=%d len(body)=%d, want 200 with the full payload replayed", status, len(body))
-	}
-
-	g.WaitForCondition(5*time.Second, "POST dial fallback recorded", func(st *Status) bool {
-		return len(st.Pool) == 2 && st.Pool[0].Failures == 1 && st.Pool[1].Successes == 1
-	})
-}
-
-func TestE2E_POSTReplayAfterAuthFallback(t *testing.T) {
-	if testing.Short() {
-		t.Skip("e2e")
-	}
-	bad := NewSocksSim(t, SocksAuthRequired, "e2e-user", "e2e-pass")
-	good := NewSocksSim(t, SocksOK, "", "")
-	target := NewEchoBodyTarget(t)
-	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
-		{Proxy: "socks5://wrong-user:wrong-pass@" + bad.Addr, Kind: "v4"},
-		{Proxy: good.RouteValue(), Kind: "v4"},
-	}))
-
-	payload := bytes.Repeat([]byte("a"), 2048)
-	status, body := postVia(t, ProxyClient(g.MixedAddr), target.URL, payload)
-	if status != http.StatusOK || !bytes.Equal(body, payload) {
-		t.Fatalf("status=%d len(body)=%d, want 200 with the full payload replayed", status, len(body))
-	}
-
-	st := g.WaitForCondition(5*time.Second, "POST auth fallback recorded", func(st *Status) bool {
-		return len(st.Pool) == 2 && st.Pool[0].AuthBlocked && st.Pool[0].AuthFailures == 1 && st.Pool[1].Successes == 1
-	})
-	if st.Pool[0].Failures != 0 || st.Pool[0].CooldownFor != "0s" {
-		t.Fatalf("auth fallback created dial health damage: %+v", st.Pool[0])
-	}
-}
-
-// A body known larger than max-body-buffer streams immediately, but a SOCKS
-// handshake failure happens before any byte is forwarded: the fallback must
-// still deliver the full body through the good route.
-func TestE2E_LargePOSTHandshakeFailureRetriesWithFullBody(t *testing.T) {
-	if testing.Short() {
-		t.Skip("e2e")
-	}
-	reject := NewSocksSim(t, SocksRejectTarget, "", "")
-	good := NewSocksSim(t, SocksOK, "", "")
-	target := NewEchoBodyTarget(t)
-	cfg := defaultGatewayConfig([]RouteConfig{
-		{Proxy: reject.RouteValue(), Kind: "v4"},
-		{Proxy: good.RouteValue(), Kind: "v4"},
-	})
-	cfg.MaxBodyBuffer = 1024 // 4KiB payload is known-large: streams immediately
-	g := NewGateway(t, cfg)
-
-	payload := bytes.Repeat([]byte("s"), 4096)
-	status, body := postVia(t, ProxyClient(g.MixedAddr), target.URL, payload)
-	if status != http.StatusOK || !bytes.Equal(body, payload) {
-		t.Fatalf("status=%d len(body)=%d, want 200 with the full payload echoed", status, len(body))
-	}
-	if got := good.Hits.Load(); got != 1 {
-		t.Fatalf("good route hits=%d, want 1", got)
-	}
-
-	st := g.WaitForCondition(5*time.Second, "handshake fallback recorded", func(st *Status) bool {
-		return len(st.Pool) == 2 && st.Pool[0].Failures == 1 && st.Pool[1].Successes == 1
-	})
-	if st.Pool[0].CooldownFor == "0s" {
-		t.Fatalf("rejecting route should cool down: %+v", st.Pool[0])
-	}
-}
-
-// A streamed body that fails before the route is dialed must be replayed in
-// full on the fallback: the echo proves no bytes were consumed.
-func TestE2E_LargePOSTDialFailureRetriesWithFullBody(t *testing.T) {
-	if testing.Short() {
-		t.Skip("e2e")
-	}
-	good := NewSocksSim(t, SocksOK, "", "")
-	target := NewEchoBodyTarget(t)
-	cfg := defaultGatewayConfig([]RouteConfig{
-		{Proxy: deadRouteValue(t), Kind: "v4"},
-		{Proxy: good.RouteValue(), Kind: "v4"},
-	})
-	cfg.MaxBodyBuffer = 1024 // 4KiB payload streams; ContentLength is known
-	g := NewGateway(t, cfg)
-
-	payload := bytes.Repeat([]byte("d"), 4096)
-	status, body := postVia(t, ProxyClient(g.MixedAddr), target.URL, payload)
-	if status != http.StatusOK || !bytes.Equal(body, payload) {
-		t.Fatalf("status=%d len(body)=%d, want 200 with all 4096 bytes echoed", status, len(body))
-	}
-
-	g.WaitForCondition(5*time.Second, "streamed dial fallback recorded", func(st *Status) bool {
-		return len(st.Pool) == 2 && st.Pool[0].Failures == 1 && st.Pool[1].Successes == 1
-	})
 }
 
 func TestE2E_MixedV4ForwardHTTP(t *testing.T) {
@@ -178,16 +84,9 @@ func TestE2E_MixedV4ForwardHTTP(t *testing.T) {
 		_ = body
 	}
 
-	// v6 listener has no eligible route: ordinary no-route 502.
-	resp, err := ProxyClient(g.V6Addr).Get(target.URL + "/hello")
-	if err != nil {
-		t.Fatalf("v6 GET: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("v6 status=%d, want 502", resp.StatusCode)
-	}
+	// v6 listener has no eligible route: the CONNECT gets the general-failure
+	// reply and the tunnel fails to establish.
+	failedSocksTunnel(t, g.V6Addr, target.Host)
 
 	st, err := g.Status()
 	if err != nil {
@@ -217,33 +116,11 @@ func TestE2E_V6OnlyPool(t *testing.T) {
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/x", "e2e-echo:/x")
 	GetVia(t, ProxyClient(g.V6Addr), target.URL+"/x", "e2e-echo:/x")
 
-	resp, err := ProxyClient(g.V4Addr).Get(target.URL + "/x")
-	if err != nil {
-		t.Fatalf("v4 GET: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("v4 status=%d, want 502", resp.StatusCode)
-	}
+	failedSocksTunnel(t, g.V4Addr, target.Host)
 }
 
-func TestE2E_HTTPSAbsoluteFormThroughGateway(t *testing.T) {
-	if testing.Short() {
-		t.Skip("e2e")
-	}
-	socks := NewSocksSim(t, SocksOK, "", "")
-	target := NewTLSEchoTarget(t)
-	cfg := defaultGatewayConfig([]RouteConfig{{Proxy: socks.RouteValue(), Kind: "v4"}})
-	cfg.TLSInsecure = true
-	g := NewGateway(t, cfg)
-
-	status, _, body := RawProxyRequest(t, g.MixedAddr, http.MethodGet, target.URL+"/secure", nil, nil)
-	if status != http.StatusOK || string(body) != "e2e-tls-echo" {
-		t.Fatalf("status=%d body=%q", status, body)
-	}
-}
-
+// One CONNECT-to-TLS-target test through ProxyClientInsecureTLS: the gateway is
+// a pure TCP relay once the tunnel is up and TLS runs inside the test client.
 func TestE2E_CONNECTTunnelToTLS(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
@@ -330,8 +207,8 @@ func TestE2E_AuthFailureFallsBackWithoutCooldown(t *testing.T) {
 }
 
 // With a single route whose SOCKS CONNECT fails, the route is excluded within
-// the request: the pool exhausts to the sanitized no-route 502 while the
-// failure is recorded in route health.
+// the request: the pool exhausts to the no-route general-failure reply while
+// the failure is recorded in route health.
 func TestE2E_SocksHandshakeFailureExhaustsToNoRoute(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
@@ -341,15 +218,7 @@ func TestE2E_SocksHandshakeFailureExhaustsToNoRoute(t *testing.T) {
 		{Proxy: reject.RouteValue(), Kind: "v4"},
 	}))
 
-	resp, err := ProxyClient(g.MixedAddr).Get("http://example.com/")
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway || string(body) != "no usable upstream SOCKS routes\n" {
-		t.Fatalf("status=%d body=%q, want sanitized no-route 502", resp.StatusCode, body)
-	}
+	failedSocksTunnel(t, g.MixedAddr, "example.com:80")
 	if got := reject.Hits.Load(); got != 1 {
 		t.Fatalf("SOCKS attempts=%d, want 1 (route excluded after one handshake failure)", got)
 	}
@@ -429,6 +298,11 @@ func TestE2E_ConnectTunnelHandshakeFailureFallsBack(t *testing.T) {
 	}
 }
 
+// Target HTTP statuses pass through the tunnel untouched: the gateway is a pure
+// TCP relay once CONNECT succeeds, so a 407/429/5xx from the origin reaches the
+// client as-is and never touches route health. There is no hop-by-hop header
+// processing in the gateway (the tunnel carries client HTTP verbatim), so the
+// old Proxy-Authorization assertion now lives in the tunnel relay overhang.
 func TestE2E_TargetStatusesPassThrough(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
@@ -450,9 +324,6 @@ func TestE2E_TargetStatusesPassThrough(t *testing.T) {
 			if resp.StatusCode != status || string(body) != "e2e-status" {
 				t.Fatalf("status=%d body=%q", resp.StatusCode, body)
 			}
-			if resp.Header.Get("Proxy-Authorization") != "" {
-				t.Fatal("Proxy-Authorization response header reached client")
-			}
 			st, _ := g.Status()
 			if st.Pool[0].Successes != 1 || st.Pool[0].Failures != 0 {
 				t.Fatalf("target status changed health: %+v", st.Pool[0])
@@ -461,53 +332,6 @@ func TestE2E_TargetStatusesPassThrough(t *testing.T) {
 				t.Fatalf("SOCKS attempts=%d, want 1", got)
 			}
 		})
-	}
-}
-
-func TestE2E_HopByHopStrippedUpstream(t *testing.T) {
-	if testing.Short() {
-		t.Skip("e2e")
-	}
-	socks := NewSocksSim(t, SocksOK, "", "")
-	seen := make(chan http.Header, 1)
-	target := NewHeaderCaptureTarget(t, seen)
-	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
-		{Proxy: socks.RouteValue(), Kind: "v4"},
-	}))
-
-	req, _ := http.NewRequest(http.MethodGet, target.URL+"/", nil)
-	req.Header.Set("X-Keep", "1")
-	req.Header.Set("Proxy-Authorization", "Basic c2VjcmV0")
-	req.Header.Set("Connection", "X-Drop")
-	req.Header.Set("X-Drop", "yes")
-	resp, err := ProxyClient(g.MixedAddr).Do(req)
-	if err != nil {
-		t.Fatalf("GET: %v", err)
-	}
-	_, _ = io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status=%d", resp.StatusCode)
-	}
-	select {
-	case h := <-seen:
-		if h.Get("X-Keep") != "1" {
-			t.Fatal("X-Keep was stripped")
-		}
-		for _, name := range []string{"Proxy-Authorization", "X-Drop"} {
-			if h.Get(name) != "" {
-				t.Fatalf("%s reached upstream", name)
-			}
-		}
-		// The gateway scopes each SOCKS tunnel to one request (Close=true),
-		// so net/http re-adds "Connection: close" on the wire. The contract
-		// is that the client's Connection tokens (X-Drop) are gone, not that
-		// the header itself is absent.
-		if got := h.Get("Connection"); got != "" && got != "close" {
-			t.Fatalf("upstream Connection=%q, want empty or close", got)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("target never saw the request")
 	}
 }
 
@@ -524,7 +348,7 @@ func TestE2E_NoCredentialLeak(t *testing.T) {
 	}))
 
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
-	waitForLog(t, g, "msg=request", 5*time.Second)
+	waitForLog(t, g, "msg=tunnel", 5*time.Second)
 
 	resp, err := http.Get("http://" + g.AdminAddr + "/status")
 	if err != nil {
@@ -583,7 +407,7 @@ func TestE2E_ManualRouteServesWithoutExposingSecrets(t *testing.T) {
 	// The pool's only route is the manual one, so a successful request
 	// proves manual routes serve.
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
-	waitForLog(t, g, "msg=request", 5*time.Second)
+	waitForLog(t, g, "msg=tunnel", 5*time.Second)
 	// Wait out the boot baseline precheck so its logging is complete before
 	// the leak assertions below.
 	waitRotation(t, g, socks, "recorded its boot baseline", func(v *RotationView) bool {
@@ -619,39 +443,44 @@ func TestE2E_ManualRouteServesWithoutExposingSecrets(t *testing.T) {
 	}
 }
 
-// An HTTPS target whose TLS handshake fails inside the SOCKS tunnel is a
-// setup failure: one sanitized 502, no fallback, no health mutation. This
-// runs with the secure default (target-tls-insecure: false), which must
-// actually verify certificates.
-func TestE2E_TargetTLSFailureIsSingleSanitized502(t *testing.T) {
+// Protocol-level conformance against the real binary. These requests never
+// advance the request counter and never touch the pool.
+
+// A well-formed BIND (cmd 0x02) and UDP ASSOCIATE (cmd 0x03) get reply code
+// 0x07 (command not supported).
+func TestE2E_InboundUnsupportedCommandsGetCmdReply(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
 	socks := NewSocksSim(t, SocksOK, "", "")
-	target := NewTLSEchoTarget(t) // self-signed: the secure default rejects it
 	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
 		{Proxy: socks.RouteValue(), Kind: "v4"},
 	}))
 
-	status, _, body := RawProxyRequest(t, g.MixedAddr, http.MethodGet, target.URL+"/secure", nil, nil)
-	if status != http.StatusBadGateway || string(body) != "upstream SOCKS setup failed\n" {
-		t.Fatalf("status=%d body=%q, want sanitized 502", status, body)
+	for _, cmd := range []byte{0x02, 0x03} {
+		frame := []byte{0x05, cmd, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90}
+		head, rest, err := socksProbe(t, g.MixedAddr, nil, frame)
+		if err != nil {
+			t.Fatalf("cmd 0x%02x: probe: %v", cmd, err)
+		}
+		if head[0] != 0x05 || head[1] != 0x07 {
+			t.Fatalf("cmd 0x%02x: reply head %v, want 05 07", cmd, head)
+		}
+		_ = rest
 	}
-	if got := socks.Hits.Load(); got != 1 {
-		t.Fatalf("SOCKS attempts=%d, want 1 (no retry)", got)
+
+	st, _ := g.Status()
+	if st.Listeners["mixed"].Requests != 0 {
+		t.Fatalf("rejected commands advanced the request counter: %+v", st.Listeners)
 	}
-	st, err := g.Status()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !st.Pool[0].Available || st.Pool[0].Failures != 0 || st.Pool[0].Successes != 0 {
-		t.Fatalf("TLS handshake failure changed health: %+v", st.Pool[0])
+	if got := socks.Hits.Load(); got != 0 {
+		t.Fatalf("SOCKS attempts=%d, want 0 (no route dialed)", got)
 	}
 }
 
-// Non-absolute-form and non-HTTP(S) request targets are rejected with 400
-// before any route is dialed, leaving the pool untouched.
-func TestE2E_InvalidAbsoluteFormRequestsAreRejected(t *testing.T) {
+// A malformed frame (bad version, unknown ATYP) gets NO reply frame: the
+// connection just closes, per RFC 1928, and the pool stays untouched.
+func TestE2E_InboundMalformedFramesCloseWithoutReply(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
@@ -660,44 +489,70 @@ func TestE2E_InvalidAbsoluteFormRequestsAreRejected(t *testing.T) {
 		{Proxy: socks.RouteValue(), Kind: "v4"},
 	}))
 
-	rawGet := func(t *testing.T, requestLine, host string) (int, string) {
-		t.Helper()
-		conn, err := net.DialTimeout("tcp", g.MixedAddr, 5*time.Second)
-		if err != nil {
-			t.Fatalf("dial mixed listener: %v", err)
-		}
-		defer func() { _ = conn.Close() }()
-		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-		fmt.Fprintf(conn, "%s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", requestLine, host) //nolint:errcheck // the response code is the assertion
-		resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
-		if err != nil {
-			t.Fatalf("read rejection response: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		body, _ := io.ReadAll(resp.Body)
-		return resp.StatusCode, string(body)
+	cases := map[string][]byte{
+		"bad version":  {0x04, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90},
+		"unknown atyp": {0x05, 0x01, 0x00, 0x09, 127, 0, 0, 1, 0x1f, 0x90},
 	}
-
-	for name, tc := range map[string]struct{ line, host string }{
-		"origin-form path": {"GET /only-a-path", "example.com"},
-		"ftp scheme":       {"GET ftp://example.com/file", "example.com"},
-	} {
+	for name, frame := range cases {
 		t.Run(name, func(t *testing.T) {
-			status, body := rawGet(t, tc.line, tc.host)
-			if status != http.StatusBadRequest || !strings.Contains(body, "proxy request requires") {
-				t.Fatalf("status=%d body=%q, want 400 with a rejection message", status, body)
+			head, _, err := socksProbe(t, g.MixedAddr, nil, frame)
+			if err == nil {
+				t.Fatalf("probe unexpectedly got a reply head %v", head)
+			}
+			// The server must send NO reply frame: the client observes a closed
+			///reset connection (EOF, ErrUnexpectedEOF, or ECONNRESET), never a
+			// 0x01/0x07-style reply with bytes.
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !isConnResetError(err) {
+				t.Fatalf("probe error=%v, want EOF/UnexpectedEOF/reset from a closed connection", err)
 			}
 		})
 	}
-	waitForLog(t, g, "error_kind=bad_request", 5*time.Second)
-	if got := socks.Hits.Load(); got != 0 {
-		t.Fatalf("SOCKS attempts=%d, want 0 for rejected requests", got)
+
+	st, _ := g.Status()
+	if st.Listeners["mixed"].Requests != 0 {
+		t.Fatalf("malformed requests advanced the request counter: %+v", st.Listeners)
 	}
-	st, err := g.Status()
+	if got := socks.Hits.Load(); got != 0 {
+		t.Fatalf("SOCKS attempts=%d, want 0 (no route dialed)", got)
+	}
+}
+
+// No route dialed on a greeting-level reject: the client offering no 0x00
+// method gets 05 ff and the connection closes.
+func TestE2E_InboundGreetingReject(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	socks := NewSocksSim(t, SocksOK, "", "")
+	cfg := defaultGatewayConfig([]RouteConfig{
+		{Proxy: socks.RouteValue(), Kind: "v4"},
+	})
+	cfg.LogLevel = "debug" // protocol rejects log at debug
+	g := NewGateway(t, cfg)
+
+	conn, err := net.DialTimeout("tcp", g.MixedAddr, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Pool[0].Successes != 0 || st.Pool[0].Failures != 0 {
-		t.Fatalf("rejected requests changed health: %+v", st.Pool[0])
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	// Offer only username/password auth: the server accepts NO AUTHENTICATION
+	// REQUIRED exclusively.
+	_, _ = conn.Write([]byte{0x05, 0x01, 0x02})
+	choice := make([]byte, 2)
+	if _, err := io.ReadFull(conn, choice); err != nil {
+		t.Fatalf("read method selection: %v", err)
 	}
+	if choice[0] != 0x05 || choice[1] != 0xff {
+		t.Fatalf("method selection=%v, want 05 ff", choice)
+	}
+
+	st, _ := g.Status()
+	if st.Listeners["mixed"].Requests != 0 {
+		t.Fatalf("greeting reject advanced the request counter: %+v", st.Listeners)
+	}
+	if got := socks.Hits.Load(); got != 0 {
+		t.Fatalf("SOCKS attempts=%d, want 0 (no route dialed)", got)
+	}
+	waitForLog(t, g, "error_kind=bad_request", 5*time.Second)
 }

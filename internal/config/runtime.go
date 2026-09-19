@@ -181,17 +181,15 @@ type BootstrapConfig struct {
 // RuntimeConfig is the immutable set of values used by new client operations.
 // Callers must replace the entire value on reload rather than mutate it.
 type RuntimeConfig struct {
-	MaxRetries        int
-	CooldownBase      time.Duration
-	CooldownMax       time.Duration
-	DialTimeout       time.Duration
-	TargetTLSInsecure bool
-	MaxBodyBuffer     int64
-	LogLevel          string
-	Routes            []RouteSpec
-	ManualRoutes      []ManualRouteSpec
-	Rotation          RotationSettings
-	Balance           KindBalance
+	MaxRetries   int
+	CooldownBase time.Duration
+	CooldownMax  time.Duration
+	DialTimeout  time.Duration
+	LogLevel     string
+	Routes       []RouteSpec
+	ManualRoutes []ManualRouteSpec
+	Rotation     RotationSettings
+	Balance      KindBalance
 }
 
 type fileConfig struct {
@@ -200,7 +198,6 @@ type fileConfig struct {
 	Cooldown    cooldownFileConfig `mapstructure:"cooldown"`
 	DialTimeout string             `mapstructure:"dial-timeout"`
 	Rotation    rotationFileConfig `mapstructure:"rotation"`
-	Global      globalFileConfig   `mapstructure:"global"`
 	Proxies     proxiesFileConfig  `mapstructure:"proxies"`
 	Balance     balanceFileConfig  `mapstructure:"balance"`
 }
@@ -215,11 +212,6 @@ type balanceFileConfig struct {
 type cooldownFileConfig struct {
 	Base string `mapstructure:"base"`
 	Max  string `mapstructure:"max"`
-}
-
-type globalFileConfig struct {
-	TargetTLSInsecure bool  `mapstructure:"target-tls-insecure"`
-	MaxBodyBuffer     int64 `mapstructure:"max-body-buffer"`
 }
 
 type rotationFileConfig struct {
@@ -450,15 +442,13 @@ func runtimeFromFile(raw fileConfig) (*RuntimeConfig, error) {
 	}
 
 	cfg := &RuntimeConfig{
-		MaxRetries:        raw.MaxRetries,
-		CooldownBase:      base,
-		CooldownMax:       max,
-		DialTimeout:       dialTimeout,
-		TargetTLSInsecure: raw.Global.TargetTLSInsecure,
-		MaxBodyBuffer:     raw.Global.MaxBodyBuffer,
-		LogLevel:          raw.LogLevel,
-		Rotation:          rotation,
-		Balance:           balance,
+		MaxRetries:   raw.MaxRetries,
+		CooldownBase: base,
+		CooldownMax:  max,
+		DialTimeout:  dialTimeout,
+		LogLevel:     raw.LogLevel,
+		Rotation:     rotation,
+		Balance:      balance,
 	}
 	for i, route := range raw.Proxies.Auto {
 		spec, err := parseRouteSpec(route)
@@ -833,9 +823,6 @@ func (c *RuntimeConfig) validate() error {
 	}
 	if c.DialTimeout <= 0 {
 		errs = append(errs, fmt.Errorf("dial-timeout must be positive, got %s", c.DialTimeout))
-	}
-	if c.MaxBodyBuffer < 0 {
-		errs = append(errs, fmt.Errorf("global.max-body-buffer must be >= 0, got %d", c.MaxBodyBuffer))
 	}
 	switch c.LogLevel {
 	case "debug", "info", "warn", "error":

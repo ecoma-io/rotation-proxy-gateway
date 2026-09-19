@@ -13,10 +13,10 @@ services:
         VERSION: 0.1.0-dev
     container_name: rpgw
     ports:
-      - "30121:30121" # mixed IPv4/IPv6 egress forward proxy
-      - "30122:30122" # IPv4-egress forward proxy
-      - "30123:30123" # IPv6-egress forward proxy
-      - "30120:30120" # admin: healthz and status
+      - "30121:30121" # mixed IPv4/IPv6 egress SOCKS5 listener
+      - "30122:30122" # IPv4-egress SOCKS5 listener
+      - "30123:30123" # IPv6-egress SOCKS5 listener
+      - "30120:30120" # admin (HTTP): healthz and status
     environment:
       # Bootstrap-only settings: changes require a container restart.
       CONFIG_FILE: /app/config.yaml
