@@ -1,0 +1,22 @@
+{
+  "name": "rotation-proxy-gateway",
+  "private": true,
+  "description": "Node-side repository toolchain (commitlint, lefthook, prettier) for a Go project — nothing here ships.",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@12.3.4",
+  "engines": {
+    "node": ">=24",
+    "pnpm": ">=11"
+  },
+  "scripts": {
+    "prepare": "lefthook install",
+    "format": "prettier --write --ignore-unknown .",
+    "format:check": "prettier --check --ignore-unknown ."
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.2.2",
+    "@commitlint/config-conventional": "^21.2.2",
+    "lefthook": "^2.1.14",
+    "prettier": "^3.9.8"
+  }
+}

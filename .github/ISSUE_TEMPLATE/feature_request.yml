@@ -1,0 +1,66 @@
+name: Feature request
+description: Propose a capability — routing, rotation, observability, configuration.
+title: "feat: "
+labels: ["needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        [`README.md`](../../blob/main/README.md) is the behavior contract. A
+        proposal that moves documented behavior must say which sections
+        change, and the pull request that lands it updates those sections in
+        the same pass.
+
+        Already-decided out of scope (a proposal here should argue the
+        decision, not restate the wish):
+
+        - Non-SOCKS5 upstream routes (HTTP/HTTPS proxies).
+        - Per-route `target-tls-insecure` or `max-body-buffer` — both are
+          deliberately global settings.
+        - Manual reload triggers (SIGHUP, filesystem events) — the 1s
+          content-hash poller is a design, not a gap; see README
+          "Reload behavior" for the blind spot no watcher fixes.
+  - type: checkboxes
+    id: before-filing
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched existing issues for a duplicate.
+          required: true
+        - label: This does not conflict with a decision listed out of scope above.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What are you proposing?
+    validations:
+      required: true
+  - type: textarea
+    id: quiet-direction
+    attributes:
+      label: What happens to in-flight requests and route health if this change is wrong in the quiet direction?
+      description: >
+        The dangerous failure here is the silent one — a credential that
+        reaches a log line, a route that cools down when it must not, a
+        rotation that takes a route out of service nobody asked it to. "No
+        quiet direction" is a valid answer when it is true.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+    validations:
+      required: false
+  - type: checkboxes
+    id: pr
+    attributes:
+      label: Would you like to open the pull request for this?
+      options:
+        - label: I am willing to open a pull request for this.

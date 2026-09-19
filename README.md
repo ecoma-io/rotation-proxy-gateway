@@ -5,6 +5,12 @@ inbound HTTP proxy endpoints and routes traffic through a health-aware pool of
 **SOCKS5-only** upstream routes. It supports ordinary absolute-form HTTP
 requests and inbound `CONNECT` tunnels.
 
+<p align="center">
+  <a href="https://github.com/ecoma-io/rotation-proxy-gateway/actions/workflows/ci.yml"><img src="https://github.com/ecoma-io/rotation-proxy-gateway/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/ecoma-io/rotation-proxy-gateway/actions/workflows/analysis.yml"><img src="https://github.com/ecoma-io/rotation-proxy-gateway/actions/workflows/analysis.yml/badge.svg" alt="Analysis" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache 2.0" /></a>
+</p>
+
 > **Status:** This document is the normative behavior contract. In particular,
 > never infer SOCKS route health from a destination HTTP response.
 
@@ -504,3 +510,12 @@ still closed, and hijacked CONNECT tunnels that `http.Server.Shutdown` does not
 track are force-closed. Size the surrounding orchestrator above the budget --
 for example `stop_grace_period: 60s` in compose -- so its kill timer never cuts
 the drain short.
+
+## Community
+
+- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md) — the commands, the hooks,
+  the commit and pull-request conventions, how a release happens.
+- Code of conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+- Security: [SECURITY.md](SECURITY.md) — never a public issue for a
+  vulnerability.
+- License: [LICENSE](LICENSE) — Apache 2.0.

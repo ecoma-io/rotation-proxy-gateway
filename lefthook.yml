@@ -1,0 +1,23 @@
+# A hook slow enough to notice is a hook contributors learn to skip with
+# --no-verify — so this file formats what is staged and nothing more; the
+# heavier gates (vet, lint, race, E2E) live in CI where they run the same way
+# for every contributor.
+pre-commit:
+  parallel: false
+  commands:
+    gofmt:
+      glob: "*.go"
+      run: gofmt -w {staged_files}
+      stage_fixed: true
+    format:
+      glob: "*.{md,yml,yaml,json,json5,mjs}"
+      run: pnpm exec prettier --write --ignore-unknown {staged_files}
+      stage_fixed: true
+commit-msg:
+  commands:
+    commitlint:
+      run: pnpm exec commitlint --edit {1}
+pre-push:
+  commands:
+    test:
+      run: go test ./...

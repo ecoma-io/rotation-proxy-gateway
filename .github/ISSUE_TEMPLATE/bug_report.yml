@@ -1,0 +1,83 @@
+name: Bug report
+description: The gateway behaves differently from its documented contract.
+title: "bug: "
+labels: ["needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        [`README.md`](../../blob/main/README.md) is the behavior contract —
+        please quote the passage the behavior disagrees with. Failure
+        classification, reload semantics, rotation states, and the
+        logging/`/status` contract each have their own section.
+
+        **Do not report a security vulnerability here.** A credential, URL
+        userinfo, or rotate-API value reaching a log line, `/status`, or an
+        error goes through a [private security advisory](../../security/advisories/new)
+        instead — see [SECURITY.md](../../blob/main/SECURITY.md).
+
+        Never paste credentials, `config.yaml` contents, or route URLs into
+        this form; use placeholders.
+  - type: checkboxes
+    id: before-filing
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched existing issues for a duplicate.
+          required: true
+        - label: This report contains no credentials and no route URLs.
+          required: true
+  - type: textarea
+    id: what-happens
+    attributes:
+      label: What happens?
+      description: The observed behavior — terminal status codes, log lines (redacted), `/status` output.
+    validations:
+      required: true
+  - type: textarea
+    id: what-should-happen
+    attributes:
+      label: What should happen instead?
+      description: Quote the documented contract (README/AGENTS passage) the behavior disagrees with.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area does this belong to?
+      options:
+        - Route pool — selection, cooldown, auth state (internal/pool)
+        - Rotation engine — drain, probes, rotate calls, backoff (internal/rotation)
+        - Forward proxy listeners — HTTP/CONNECT handling (internal/proxyserver)
+        - SOCKS dialer (internal/socksdial)
+        - Config + hot reload (internal/config)
+        - E2E suite (e2e)
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: |
+        - `./bin/rpgw version` output (or image tag)
+        - Deployment: docker compose / bare binary
+        - OS and architecture
+    validations:
+      required: true
+  - type: textarea
+    id: anything-else
+    attributes:
+      label: Anything else?
+    validations:
+      required: false

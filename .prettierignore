@@ -1,0 +1,18 @@
+# Semgrep fixtures are load-bearing bytes: their whole job is to match (or
+# not match) rules, and prettier reformatting them would invalidate
+# `semgrep --test` in analysis.yml.
+.github/semgrep/
+bin/
+pnpm-lock.yaml
+node_modules/
+
+# Legacy documents and manifests, not yet prettier-formatted. They are the
+# normative contract (AGENTS.md, README.md) or deployment files; reformatting
+# them is a churn-only diff. Format on first touch: when a change edits one
+# of these anyway, drop it from this list in the same pull request.
+AGENTS.md
+CLAUDE.md
+README.md
+e2e/BENCH.md
+config.example.yaml
+compose.yaml
