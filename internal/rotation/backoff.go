@@ -3,6 +3,8 @@ package rotation
 import (
 	"math/rand/v2"
 	"time"
+
+	"rotation-proxy-gateway/internal/pool"
 )
 
 // BackoffFor returns how long to wait before the next rotation attempt of a
@@ -17,19 +19,10 @@ func BackoffFor(interval time.Duration, consecutive int, max time.Duration) time
 	if consecutive < 1 {
 		consecutive = 1
 	}
-	base := interval
-	for range consecutive - 1 {
-		// Saturating doubling: base only ever doubles while it still fits
-		// under max, so no intermediate value can overflow a duration.
-		if base >= max || base > max/2 {
-			base = max
-			break
-		}
-		base *= 2
-	}
-	if base > max {
-		base = max
-	}
+	// Saturating doubling shared with the pool's dial cooldown: base only
+	// ever doubles while it still fits under max, so no intermediate value
+	// can overflow a duration.
+	base := pool.SaturatingCooldown(interval, max, consecutive)
 	jittered := time.Duration(float64(base) * (0.9 + 0.2*rand.Float64()))
 	if jittered <= 0 {
 		return base

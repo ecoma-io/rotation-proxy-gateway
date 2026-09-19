@@ -153,8 +153,8 @@ func TestSaturatingCooldownMath(t *testing.T) {
 		{7, max}, // 64s would exceed max.
 		{100, max},
 	} {
-		if got := saturatingCooldown(base, max, tc.failures); got != tc.want {
-			t.Errorf("saturatingCooldown(%v, %v, %d) = %v, want %v", base, max, tc.failures, got, tc.want)
+		if got := SaturatingCooldown(base, max, tc.failures); got != tc.want {
+			t.Errorf("SaturatingCooldown(%v, %v, %d) = %v, want %v", base, max, tc.failures, got, tc.want)
 		}
 	}
 	for _, tc := range []struct {
@@ -172,12 +172,12 @@ func TestSaturatingCooldownMath(t *testing.T) {
 		{"huge base near overflow", time.Duration(1) << 62, time.Duration(1) << 62, 10, time.Duration(1) << 62, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := saturatingCooldown(tc.base, tc.max, tc.failures)
+			got := SaturatingCooldown(tc.base, tc.max, tc.failures)
 			if got != tc.want {
-				t.Fatalf("saturatingCooldown(%v, %v, %d) = %v, want %v", tc.base, tc.max, tc.failures, got, tc.want)
+				t.Fatalf("SaturatingCooldown(%v, %v, %d) = %v, want %v", tc.base, tc.max, tc.failures, got, tc.want)
 			}
 			if tc.wantNonNegZero && got < 0 {
-				t.Fatalf("saturatingCooldown(%v, %v, %d) = %v, must never be negative", tc.base, tc.max, tc.failures, got)
+				t.Fatalf("SaturatingCooldown(%v, %v, %d) = %v, must never be negative", tc.base, tc.max, tc.failures, got)
 			}
 		})
 	}

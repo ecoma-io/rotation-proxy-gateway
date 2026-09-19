@@ -308,8 +308,3 @@ func setupDynamicLogger(level string) zerolog.Logger {
 	zerolog.SetGlobalLevel(parseZerologLevel(level))
 	return logging.New(os.Stdout)
 }
-
-// setupLogger remains available to callers that only need a fixed logger.
-func setupLogger(level string) zerolog.Logger {
-	return setupDynamicLogger(level)
-}

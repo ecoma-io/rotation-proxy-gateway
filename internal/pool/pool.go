@@ -562,15 +562,16 @@ func (pl *Pool) ReportFailure(p *Proxy, err error) time.Duration {
 	if err != nil {
 		p.lastDialError = sanitize.ErrorString(err)
 	}
-	cd := saturatingCooldown(base, max, p.consecutiveFailures)
+	cd := SaturatingCooldown(base, max, p.consecutiveFailures)
 	p.cooldownUntil.Store(relNanos(now.Add(cd)))
 	return cd
 }
 
-// saturatingCooldown returns base doubled (failures-1) times, capped at max.
+// SaturatingCooldown returns base doubled (failures-1) times, capped at max.
 // It never overflows and never returns a negative duration, even when base or
-// max bypasses runtime configuration validation.
-func saturatingCooldown(base, max time.Duration, failures int) time.Duration {
+// max bypasses runtime configuration validation. The rotation engine's retry
+// backoff shares this spine so the two growth curves cannot drift apart.
+func SaturatingCooldown(base, max time.Duration, failures int) time.Duration {
 	if base <= 0 || max <= 0 {
 		return 0
 	}
