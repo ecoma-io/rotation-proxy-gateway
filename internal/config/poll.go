@@ -72,6 +72,7 @@ func (p *Poller) Run(ctx context.Context, log zerolog.Logger) {
 			if sum == p.last {
 				continue
 			}
+			log.Debug().Msg("config file content changed; signaling reload")
 			p.last = sum
 			select {
 			case p.changes <- struct{}{}:

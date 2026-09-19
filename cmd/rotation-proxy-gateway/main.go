@@ -232,11 +232,11 @@ func run() error {
 	for {
 		select {
 		case err := <-errCh:
-			shutdownAll(engineCancel, listeners, adminSrv, bootstrap.ShutdownGrace)
+			shutdownAll(log, engineCancel, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return err
 		case sig := <-sigCh:
 			log.Info().Str("signal", sig.String()).Str("grace", bootstrap.ShutdownGrace.String()).Msg("shutting down")
-			shutdownAll(engineCancel, listeners, adminSrv, bootstrap.ShutdownGrace)
+			shutdownAll(log, engineCancel, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return nil
 		case <-poller.Changes():
 			// The poller hash-gates on applied content, so one signal means one
@@ -258,19 +258,35 @@ func run() error {
 // forceCloseWait, 1s) times the three listeners, plus the admin shutdown —
 // with the default 55s grace that is ~58s, and the surrounding orchestrator's
 // kill timer (compose stop_grace_period: 60s) must stay above it.
-func shutdownAll(engineCancel context.CancelFunc, listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
+func shutdownAll(log zerolog.Logger, engineCancel context.CancelFunc, listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
 	engineCancel()
+	log.Debug().Msg("rotation engine canceled")
 	ctx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
+	start := time.Now()
+	drained := 0
 	for _, listener := range listeners {
-		listener.ln.Close()           //nolint:errcheck // stop accepting immediately
-		listener.server.Shutdown(ctx) //nolint:errcheck // expiry force-closes inside
+		listener.ln.Close() //nolint:errcheck // stop accepting immediately
+		if err := listener.server.Shutdown(ctx); err != nil {
+			log.Warn().Str("listener", listener.name).Str("error", sanitize.ErrorString(err)).
+				Msg("proxy listener closed; grace expired and sessions were force-closed")
+			continue
+		}
+		drained++
+		log.Info().Str("listener", listener.name).Msg("proxy listener drained")
 	}
-	shutdownServer(adminSrv, ctx)
+	if err := shutdownServer(adminSrv, ctx); err != nil {
+		log.Warn().Str("error", sanitize.ErrorString(err)).Msg("admin listener closed; grace expired")
+	} else {
+		log.Info().Msg("admin listener closed")
+	}
+	log.Info().Int("listeners", len(listeners)).Int("drained", drained).
+		Str("elapsed", time.Since(start).Truncate(time.Millisecond).String()).
+		Msg("shutdown complete")
 }
 
-func shutdownServer(server *http.Server, ctx context.Context) {
-	server.Shutdown(ctx) //nolint:errcheck // best-effort
+func shutdownServer(server *http.Server, ctx context.Context) error {
+	return server.Shutdown(ctx)
 }
 
 func parseZerologLevel(level string) zerolog.Level {

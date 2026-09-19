@@ -377,7 +377,7 @@ func TestShutdownAllClosesProxyListenersThenAdmin(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		shutdownAll(func() {}, listeners, adminSrv, 5*time.Second)
+		shutdownAll(logging.Nop(), func() {}, listeners, adminSrv, 5*time.Second)
 		close(done)
 	}()
 	select {
@@ -431,7 +431,7 @@ func TestShutdownAllSharedBudget(t *testing.T) {
 	start := time.Now()
 	done := make(chan struct{})
 	go func() {
-		shutdownAll(func() {}, listeners, adminSrv, grace)
+		shutdownAll(logging.Nop(), func() {}, listeners, adminSrv, grace)
 		close(done)
 	}()
 	select {
@@ -487,7 +487,7 @@ func TestShutdownAllDrainsCompletedSessionsImmediately(t *testing.T) {
 	listeners := []runningListener{{name: "mixed", server: srv, ln: ln}}
 	done := make(chan struct{})
 	go func() {
-		shutdownAll(func() {}, listeners, adminSrv, 5*time.Second)
+		shutdownAll(logging.Nop(), func() {}, listeners, adminSrv, 5*time.Second)
 		close(done)
 	}()
 	select {
