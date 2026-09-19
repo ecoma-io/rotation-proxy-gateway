@@ -134,8 +134,8 @@ func TestRuntimeListenerSelectsOnlyAllowedEgressKind(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d", resp.StatusCode)
 			}
@@ -167,7 +167,7 @@ func TestListenerLogsItsNameAndAdminAggregatesStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if got := waitForLog(t, &logs, "listener=v4"); got == "" {
 		t.Fatal("listener log missing")
 	}
@@ -178,7 +178,7 @@ func TestListenerLogsItsNameAndAdminAggregatesStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer status.Body.Close()
+	defer func() { _ = status.Body.Close() }()
 	var response struct {
 		Listeners map[string]ListenerStatus `json:"listeners"`
 		Pool      []pool.Status             `json:"pool"`
@@ -204,7 +204,7 @@ func TestRuntimeListenerNoEligibleRouteReturns502(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", resp.StatusCode)
 	}

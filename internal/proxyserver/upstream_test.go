@@ -66,19 +66,19 @@ func startSocks5Proxy(t *testing.T, opts socksOptions) *fakeSocks {
 			go fs.handle(conn)
 		}
 	}()
-	t.Cleanup(func() { ln.Close(); <-done })
+	t.Cleanup(func() { _ = ln.Close(); <-done })
 	fs.URL = &url.URL{Scheme: "socks5", Host: ln.Addr().String()}
 	return fs
 }
 
 func (s *fakeSocks) handle(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	select {
 	case s.hits <- struct{}{}:
 	default:
 	}
 	br := bufio.NewReader(conn)
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if err := readSocksGreeting(br, conn, s.opts); err != nil {
 		return
 	}
@@ -99,27 +99,27 @@ func (s *fakeSocks) handle(conn net.Conn) {
 		writeSocksReply(conn, 0x05)
 		return
 	}
-	defer up.Close()
+	defer func() { _ = up.Close() }()
 	writeSocksReply(conn, 0x00)
 	if len(s.opts.connectPrefix) > 0 {
 		conn.Write(s.opts.connectPrefix) //nolint:errcheck
 	}
-	conn.SetDeadline(time.Time{})
+	_ = conn.SetDeadline(time.Time{})
 	if n := br.Buffered(); n > 0 {
 		b := make([]byte, n)
-		io.ReadFull(br, b)
-		up.Write(b)
+		_, _ = io.ReadFull(br, b)
+		_, _ = up.Write(b)
 	}
 	go func() {
 		io.Copy(up, conn) //nolint:errcheck
-		up.Close()
+		_ = up.Close()
 	}()
 	if _, err := io.Copy(conn, up); err != nil {
 		// The target ended the stream abnormally. Reset the SOCKS peer too so
 		// it sees a broken tunnel rather than a clean close, modeling
 		// providers that drop live streams mid-flight.
 		if tc, ok := conn.(*net.TCPConn); ok {
-			tc.SetLinger(0)
+			_ = tc.SetLinger(0)
 		}
 	}
 }
@@ -240,7 +240,7 @@ func writeSocksReply(conn net.Conn, rep byte) {
 func startEchoTarget(t *testing.T) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		io.WriteString(w, "dial-via-ok")
+		_, _ = io.WriteString(w, "dial-via-ok")
 	}))
 	t.Cleanup(srv.Close)
 	u, err := url.Parse(srv.URL)
@@ -258,8 +258,8 @@ func TestDialViaSocks5(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dialVia: %v", err)
 		}
-		defer conn.Close()
-		fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", target)
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", target)
 		body, _ := io.ReadAll(conn)
 		if string(body) == "" {
 			t.Fatal("empty response through SOCKS")
@@ -272,7 +272,7 @@ func TestDialViaSocks5(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dialVia: %v", err)
 		}
-		conn.Close()
+		_ = conn.Close()
 	})
 }
 
@@ -282,7 +282,7 @@ func TestDialViaClassifiesEndpointAndAuthFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr := closed.Addr().String()
-	closed.Close()
+	_ = closed.Close()
 	pu := &url.URL{Scheme: "socks5", Host: addr}
 	_, err = dialVia(context.Background(), pu, "example.com:80", time.Second)
 	if !isProxyDialError(err) || isProxyAuthError(err) {
@@ -354,7 +354,7 @@ func TestDialViaGreetingFailuresAreHandshakeErrors(t *testing.T) {
 			if name == "unsupported method" {
 				op = "negotiate authentication"
 			}
-			assertSocksHandshakeError(t, err, op)
+			_ = assertSocksHandshakeError(t, err, op)
 		})
 	}
 }
@@ -383,7 +383,7 @@ func TestDialViaAuthFramingFailuresAreHandshakeErrors(t *testing.T) {
 			pu := *fs.URL
 			pu.User = url.UserPassword("u", "p")
 			_, err := dialVia(context.Background(), &pu, "example.com:80", time.Second)
-			assertSocksHandshakeError(t, err, "read authentication")
+			_ = assertSocksHandshakeError(t, err, "read authentication")
 		})
 	}
 }
@@ -409,11 +409,11 @@ func TestDialViaConnectFramingFailuresAreHandshakeErrors(t *testing.T) {
 				if err != nil {
 					t.Fatalf("dialVia: %v", err)
 				}
-				conn.Close()
+				_ = conn.Close()
 			case "unsupported bound type", "truncated bound ipv4":
-				assertSocksHandshakeError(t, err, "read bound address")
+				_ = assertSocksHandshakeError(t, err, "read bound address")
 			default:
-				assertSocksHandshakeError(t, err, "read connect")
+				_ = assertSocksHandshakeError(t, err, "read connect")
 			}
 		})
 	}
@@ -423,7 +423,7 @@ func TestDialViaOversizedTargetHostnameIsProtocolError(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	long := strings.Repeat("a", 256) + ".example:80"
 	_, err := dialVia(context.Background(), fs.URL, long, time.Second)
-	assertSocksProtocolError(t, err, "encode target")
+	_ = assertSocksProtocolError(t, err, "encode target")
 	if got := len(fs.hits); got != 1 {
 		t.Fatalf("SOCKS attempts = %d, want 1", got)
 	}
@@ -435,7 +435,7 @@ func TestDialViaBufferedPrefixDelivered(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dialVia: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	buf := make([]byte, len("early-bytes"))
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		t.Fatalf("read prefix: %v", err)
@@ -464,7 +464,7 @@ func TestConnectFramingFailuresExhaustToNoRoute(t *testing.T) {
 				t.Fatalf("GET: %v", err)
 			}
 			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode != http.StatusBadGateway || string(body) != "no usable upstream SOCKS routes\n" {
 				t.Fatalf("status=%d body=%q, want sanitized no-route 502", resp.StatusCode, body)
 			}
