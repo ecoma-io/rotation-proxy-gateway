@@ -127,7 +127,7 @@ func startStatusTarget(t *testing.T, status int, body string) string {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Proxy-Authorization", "must-not-reach-client")
 		w.WriteHeader(status)
-		io.WriteString(w, body)
+		_, _ = io.WriteString(w, body)
 	}))
 	t.Cleanup(srv.Close)
 	u, err := url.Parse(srv.URL)
@@ -141,7 +141,7 @@ func startEchoBodyTarget(t *testing.T) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
-		w.Write(b)
+		_, _ = w.Write(b)
 	}))
 	t.Cleanup(srv.Close)
 	u, err := url.Parse(srv.URL)
@@ -179,7 +179,7 @@ func TestPlainHTTPForwardThroughSOCKS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || string(body) != "dial-via-ok" {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
@@ -227,7 +227,7 @@ func TestInvalidInboundRequestsAreRejectedBeforeDialing(t *testing.T) {
 
 func TestHTTPSRoundTripThroughSOCKS(t *testing.T) {
 	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		io.WriteString(w, "https-via-socks")
+		_, _ = io.WriteString(w, "https-via-socks")
 	}))
 	defer target.Close()
 	fs := startSocks5Proxy(t, socksOptions{})
@@ -244,7 +244,7 @@ func TestHTTPSRoundTripThroughSOCKS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("roundTripWithSettings: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || string(body) != "https-via-socks" {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
@@ -263,7 +263,7 @@ func TestTargetStatusesPassThroughWithoutRotation(t *testing.T) {
 				t.Fatalf("GET: %v", err)
 			}
 			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode != status || string(body) != "target-status" {
 				t.Fatalf("status=%d body=%q", resp.StatusCode, body)
 			}
@@ -287,7 +287,7 @@ func TestRotatesOnEndpointDialFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadURL := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
-	closed.Close()
+	_ = closed.Close()
 	good := startSocks5Proxy(t, socksOptions{})
 	target := startEchoTarget(t)
 	pl := pool.NewRoutes(mixedRoutes(deadURL, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
@@ -297,7 +297,7 @@ func TestRotatesOnEndpointDialFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d, want 200", resp.StatusCode)
 	}
@@ -313,7 +313,7 @@ func TestLogsCorrelateDialFallbackAndRedactCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadURL := &url.URL{Scheme: "socks5", User: url.UserPassword("route-user", "route-password"), Host: closed.Addr().String()}
-	closed.Close()
+	_ = closed.Close()
 	good := startSocks5Proxy(t, socksOptions{})
 	target := startEchoTarget(t)
 	pl := pool.NewRoutes(mixedRoutes(deadURL, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
@@ -324,7 +324,7 @@ func TestLogsCorrelateDialFallbackAndRedactCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d, want 200", resp.StatusCode)
 	}
@@ -361,7 +361,7 @@ func TestAuthFailureFallsBackWithoutDialCooldown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d, want 200", resp.StatusCode)
 	}
@@ -385,7 +385,7 @@ func TestRotatesOnHandshakeFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d, want 200", resp.StatusCode)
 	}
@@ -404,7 +404,7 @@ func TestSOCKSHandshakeFailureExhaustsToNoRoute(t *testing.T) {
 		t.Fatalf("GET: %v", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway || string(body) != "no usable upstream SOCKS routes\n" {
 		t.Fatalf("status=%d body=%q, want sanitized no-route 502", resp.StatusCode, body)
 	}
@@ -423,7 +423,7 @@ func TestPOSTReplaysOnlyAfterDialFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadURL := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
-	closed.Close()
+	_ = closed.Close()
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(deadURL, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
 	ts := newForwarderCfg(t, pl, defaultRuntime())
@@ -433,7 +433,7 @@ func TestPOSTReplaysOnlyAfterDialFailure(t *testing.T) {
 		t.Fatalf("POST: %v", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || string(body) != "payload-123" {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
 	}
@@ -483,7 +483,7 @@ func TestKnownLargePOSTStreamsBeforeFullBodyIsAvailable(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		w.Write(b)
+		_, _ = w.Write(b)
 	}))
 	defer target.Close()
 	closed, err := net.Listen("tcp", "127.0.0.1:0")
@@ -491,7 +491,7 @@ func TestKnownLargePOSTStreamsBeforeFullBodyIsAvailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	dead := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
-	closed.Close()
+	_ = closed.Close()
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute, config.KindBalance{})
 	cfg := defaultRuntime()
@@ -517,7 +517,7 @@ func TestKnownLargePOSTStreamsBeforeFullBodyIsAvailable(t *testing.T) {
 	<-done
 
 	resp := rw.Result()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	got, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || string(got) != payload {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, got)
@@ -550,7 +550,7 @@ func TestRequestBodyBufferBoundaries(t *testing.T) {
 				t.Fatalf("POST: %v", err)
 			}
 			got, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode != http.StatusOK || string(got) != tc.body {
 				t.Fatalf("status=%d body=%q, want %q", resp.StatusCode, got, tc.body)
 			}
@@ -649,7 +649,7 @@ func TestStreamedChunkedBodyForwardsTrailers(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		fmt.Fprintf(w, "%s:%s", body, r.Trailer.Get("X-Checksum"))
+		_, _ = fmt.Fprintf(w, "%s:%s", body, r.Trailer.Get("X-Checksum"))
 	}))
 	defer target.Close()
 	fs := startSocks5Proxy(t, socksOptions{})
@@ -668,7 +668,7 @@ func TestStreamedChunkedBodyForwardsTrailers(t *testing.T) {
 
 	s.ServeHTTP(rec, req)
 	resp := rec.Result()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	got, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || string(got) != "abcd:streamed" {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, got)
@@ -681,7 +681,7 @@ func TestStreamedPOSTReplaysAfterDialFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	dead := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
-	closed.Close()
+	_ = closed.Close()
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute, config.KindBalance{})
 	cfg := defaultRuntime()
@@ -693,7 +693,7 @@ func TestStreamedPOSTReplaysAfterDialFallback(t *testing.T) {
 		t.Fatalf("POST: %v", err)
 	}
 	got, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || string(got) != "abcd" {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, got)
 	}
@@ -716,7 +716,7 @@ func TestPOSTReplaysAfterAuthFallback(t *testing.T) {
 		t.Fatalf("POST: %v", err)
 	}
 	got, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || string(got) != "abc" {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, got)
 	}
@@ -863,7 +863,7 @@ func TestCanceledTunnelDoesNotMutatePoolOrSend502(t *testing.T) {
 		return nil, &ProxyDialError{Err: context.Canceled}
 	}
 	serverConn, clientConn := net.Pipe()
-	defer clientConn.Close()
+	defer func() { _ = clientConn.Close() }()
 	req := httptest.NewRequest(http.MethodConnect, "http://TEST-target.invalid:443", nil).WithContext(ctx)
 	writer := &hijackerResponseWriter{conn: serverConn}
 	done := make(chan struct{})
@@ -871,7 +871,7 @@ func TestCanceledTunnelDoesNotMutatePoolOrSend502(t *testing.T) {
 		s.ServeHTTP(writer, req)
 		close(done)
 	}()
-	clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
 	var one [1]byte
 	n, readErr := clientConn.Read(one[:])
 	if n != 0 || readErr == nil {
@@ -902,11 +902,11 @@ func connectThrough(t *testing.T, proxyAddr, targetHostPort string) (net.Conn, *
 	if err != nil {
 		t.Fatalf("dial proxy: %v", err)
 	}
-	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetHostPort, targetHostPort)
+	_, _ = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetHostPort, targetHostPort)
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		t.Fatalf("read CONNECT response: %v", err)
 	}
 	return conn, br, resp
@@ -914,7 +914,7 @@ func connectThrough(t *testing.T, proxyAddr, targetHostPort string) (net.Conn, *
 
 func TestConnectTunnelThroughSOCKS(t *testing.T) {
 	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		io.WriteString(w, "tunnel-ok")
+		_, _ = io.WriteString(w, "tunnel-ok")
 	}))
 	defer tlsSrv.Close()
 	tu, _ := url.Parse(tlsSrv.URL)
@@ -922,7 +922,7 @@ func TestConnectTunnelThroughSOCKS(t *testing.T) {
 	ts, pl := newForwarder(t, fs)
 
 	conn, _, resp := connectThrough(t, ts.URL, tu.Host)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status=%d", resp.StatusCode)
 	}
@@ -938,7 +938,7 @@ func TestConnectTunnelThroughSOCKS(t *testing.T) {
 		t.Fatalf("GET through tunnel: %v", err)
 	}
 	body, _ := io.ReadAll(get.Body)
-	get.Body.Close()
+	_ = get.Body.Close()
 	if string(body) != "tunnel-ok" {
 		t.Fatalf("body=%q", body)
 	}
@@ -954,7 +954,7 @@ func TestTunnelAuthFailureFallsBack(t *testing.T) {
 	ts, pl := newForwarder(t, bad, good)
 
 	conn, _, resp := connectThrough(t, ts.URL, target)
-	conn.Close()
+	_ = conn.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
 	}
@@ -970,14 +970,14 @@ func TestTunnelLogsCorrelateDialFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	dead := &url.URL{Scheme: "socks5", User: url.UserPassword("TEST-user", "TEST-pass"), Host: closed.Addr().String()}
-	closed.Close()
+	_ = closed.Close()
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
 	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
 	conn, _, resp := connectThrough(t, ts.URL, startEchoTarget(t))
-	conn.Close()
+	_ = conn.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
 	}
@@ -1009,7 +1009,7 @@ func TestTunnelAuthFallbackLogsWithoutCooldown(t *testing.T) {
 	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
 	conn, _, resp := connectThrough(t, ts.URL, startEchoTarget(t))
-	conn.Close()
+	_ = conn.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
 	}
@@ -1027,7 +1027,7 @@ func TestTunnelHandshakeFailureExhaustsToNoRoute(t *testing.T) {
 	ts, pl := newForwarder(t, fs)
 
 	conn, _, resp := connectThrough(t, ts.URL, "example.com:443")
-	conn.Close()
+	_ = conn.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("CONNECT status=%d, want 502", resp.StatusCode)
 	}
@@ -1048,7 +1048,7 @@ func TestTunnelLogsCorrelateHandshakeFallback(t *testing.T) {
 	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
 	conn, _, resp := connectThrough(t, ts.URL, startEchoTarget(t))
-	conn.Close()
+	_ = conn.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
 	}
@@ -1078,13 +1078,13 @@ func TestTunnelRelaysPipelinedClientBytes(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		buf := make([]byte, len("TEST-prefix"))
 		if _, err := io.ReadFull(conn, buf); err == nil {
 			received <- string(buf)
 		}
 	}()
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	fs := startSocks5Proxy(t, socksOptions{})
 	ts, _ := newForwarder(t, fs)
 	pu, err := url.Parse(ts.URL)
@@ -1095,7 +1095,7 @@ func TestTunnelRelaysPipelinedClientBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	request := "CONNECT " + ln.Addr().String() + " HTTP/1.1\r\nHost: " + ln.Addr().String() + "\r\n\r\nTEST-prefix"
 	if _, err := conn.Write([]byte(request)); err != nil {
 		t.Fatal(err)
@@ -1104,7 +1104,7 @@ func TestTunnelRelaysPipelinedClientBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
 	}
@@ -1133,7 +1133,7 @@ func (c *blockingCloseConn) Close() error {
 
 func TestCloseTunnelsDoesNotHoldConnectionMapLockWhileClosing(t *testing.T) {
 	serverSide, clientSide := net.Pipe()
-	defer clientSide.Close()
+	defer func() { _ = clientSide.Close() }()
 	conn := &blockingCloseConn{
 		Conn:    serverSide,
 		started: make(chan struct{}),
@@ -1177,17 +1177,17 @@ func TestCloseTunnelsClosesIdleHijackedTunnel(t *testing.T) {
 	defer ts.Close()
 
 	conn, _, resp := connectThrough(t, ts.URL, startEchoTarget(t))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
 	}
 	s.CloseTunnels()
-	conn.SetReadDeadline(time.Now().Add(time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 	var one [1]byte
 	if _, err := conn.Read(one[:]); err == nil {
 		t.Fatal("idle hijacked tunnel stayed open after CloseTunnels")
 	}
-	conn.Close()
+	_ = conn.Close()
 }
 
 func TestAdminEndpoints(t *testing.T) {
@@ -1202,7 +1202,7 @@ func TestAdminEndpoints(t *testing.T) {
 		t.Fatalf("healthz: %v", err)
 	}
 	body, _ := io.ReadAll(hresp.Body)
-	hresp.Body.Close()
+	_ = hresp.Body.Close()
 	if hresp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) != "ok" {
 		t.Fatalf("healthz status=%d body=%q", hresp.StatusCode, body)
 	}
@@ -1211,7 +1211,7 @@ func TestAdminEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
-	defer sresp.Body.Close()
+	defer func() { _ = sresp.Body.Close() }()
 	if sresp.StatusCode != http.StatusOK {
 		t.Fatalf("status code=%d", sresp.StatusCode)
 	}
@@ -1233,7 +1233,7 @@ func startAbortTarget(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -1247,7 +1247,7 @@ func startAbortTarget(t *testing.T) string {
 }
 
 func abortTargetConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	// No request is read: over CONNECT the client only opens the tunnel and
 	// reads, so the partial response goes out unprompted.
 	fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: 4096\r\n\r\npartial") //nolint:errcheck
@@ -1256,7 +1256,7 @@ func abortTargetConn(conn net.Conn) {
 	// then (correctly) counts a handshake failure and retries until 502.
 	time.Sleep(100 * time.Millisecond)
 	if tc, ok := conn.(*net.TCPConn); ok {
-		tc.SetLinger(0) // reset instead of a clean close
+		_ = tc.SetLinger(0) // reset instead of a clean close
 	}
 }
 
@@ -1269,11 +1269,11 @@ func TestTunnelUpstreamResetLogsBrokenClose(t *testing.T) {
 	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
 	conn, _, resp := connectThrough(t, ts.URL, startAbortTarget(t))
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status=%d, want 200", resp.StatusCode)
 	}
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := io.Copy(io.Discard, conn); err == nil {
 		t.Fatal("tunnel stayed open after the target aborted the stream")
 	}

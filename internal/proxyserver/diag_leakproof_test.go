@@ -31,7 +31,7 @@ func TestStatusLeakProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var got struct {
 		Pool []pool.Status `json:"pool"`
 	}

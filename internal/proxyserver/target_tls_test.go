@@ -40,7 +40,7 @@ func TestTargetTLSHandshakeFailureIsSetupNotHealthChange(t *testing.T) {
 			s.ServeHTTP(rec, req)
 
 			resp := rec.Result()
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			body, _ := io.ReadAll(resp.Body)
 			if resp.StatusCode != http.StatusBadGateway || string(body) != "upstream SOCKS setup failed\n" {
 				t.Fatalf("status=%d body=%q, want sanitized 502", resp.StatusCode, body)

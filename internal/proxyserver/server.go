@@ -161,7 +161,7 @@ func (s *Server) roundTripViaSOCKSWithOptions(ctx context.Context, p *pool.Proxy
 		return nil, err
 	}
 	fail := func(err error) (*http.Response, error) {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	if out.URL.Scheme == "https" {
@@ -241,7 +241,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 	if !streamMode && !certainlyBodiless {
 		b, err := io.ReadAll(io.LimitReader(r.Body, settings.maxBodyBuffer+1))
 		if err != nil {
-			r.Body.Close()
+			_ = r.Body.Close()
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
 			log.Warn("request rejected", "target", target, "error_kind", "body_read", "error", logErrorValue(err))
 			return
@@ -250,7 +250,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 		if int64(len(body)) > settings.maxBodyBuffer {
 			streamMode = true
 		} else {
-			r.Body.Close()
+			_ = r.Body.Close()
 		}
 	}
 	log.Debug("request body mode", "target", target, "body_mode", bodyLogMode(streamMode))
@@ -262,7 +262,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 		attemptNumber := attempt + 1
 		if r.Context().Err() != nil {
 			if streamMode {
-				r.Body.Close()
+				_ = r.Body.Close()
 			}
 			log.Debug("request canceled", "target", target, "attempts", attempt)
 			return
@@ -292,12 +292,12 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 		}
 		resp, err := s.roundTripWithSettings(r.Context(), p, out, settings)
 		if streamMode && !isProxyDialError(err) && !isProxyAuthError(err) && !isSocksHandshakeError(err) {
-			r.Body.Close()
+			_ = r.Body.Close()
 		}
 		if err != nil {
 			if r.Context().Err() != nil {
 				if streamMode {
-					r.Body.Close()
+					_ = r.Body.Close()
 				}
 				log.Debug("request canceled", "target", target, "attempts", attemptNumber)
 				return
@@ -341,10 +341,10 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 		}
 
 		if streamMode {
-			r.Body.Close()
+			_ = r.Body.Close()
 		}
 		if r.Context().Err() != nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			log.Debug("request canceled", "target", target, "attempts", attemptNumber)
 			return
 		}
@@ -356,7 +356,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request, log *slog.Lo
 	}
 
 	if streamMode {
-		r.Body.Close()
+		_ = r.Body.Close()
 	}
 	http.Error(w, "no usable upstream SOCKS routes", http.StatusBadGateway)
 	log.Warn("request failed", "target", target, "attempts", attempts,
@@ -468,7 +468,16 @@ func (s *Server) writeResponse(log *slog.Logger, w http.ResponseWriter, resp *ht
 		// mutate, but the log attributes the mid-body drop to this request.
 		log.Warn("response relay failed", "error_kind", logErrorKind(err), "error", logErrorValue(err))
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
+}
+
+// writeTunnelFailure answers a CONNECT that never reached its upstream with a
+// 502 and closes the hijacked connection. Both steps are best-effort: route
+// health is the caller's business and a write failure just means the client
+// is already gone.
+func writeTunnelFailure(conn net.Conn) {
+	_, _ = conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+	_ = conn.Close()
 }
 
 // handleTunnel relays an inbound CONNECT tunnel through the SOCKS5 pool.
@@ -503,7 +512,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 	if n := brw.Reader.Buffered(); n > 0 {
 		prefix = make([]byte, n)
 		if _, err := io.ReadFull(brw.Reader, prefix); err != nil {
-			clientConn.Close()
+			_ = clientConn.Close()
 			return
 		}
 	}
@@ -516,7 +525,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 		attempts = attempt + 1
 		if r.Context().Err() != nil {
 			log.Debug("tunnel canceled", "target", logTarget, "attempts", attempt)
-			clientConn.Close()
+			_ = clientConn.Close()
 			return
 		}
 		p := s.pick(gen, exclude)
@@ -530,7 +539,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 		if err != nil {
 			if r.Context().Err() != nil {
 				log.Debug("tunnel canceled", "target", logTarget, "attempts", attempts)
-				clientConn.Close()
+				_ = clientConn.Close()
 				return
 			}
 			switch {
@@ -559,8 +568,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 					"error", logErrorValue(err))
 				continue
 			default:
-				clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
-				clientConn.Close()
+				writeTunnelFailure(clientConn)
 				log.Warn("upstream setup failed", "target", logTarget, "upstream", upstreamLogValue(p),
 					"attempt", attempts, "error_kind", logErrorKind(err), "error", logErrorValue(err),
 					"duration", logDuration(time.Since(start)))
@@ -572,17 +580,21 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 		break
 	}
 	if upstream == nil {
-		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
-		clientConn.Close()
+		writeTunnelFailure(clientConn)
 		log.Warn("tunnel failed", "target", logTarget, "attempts", len(exclude),
 			"error_kind", errorKindNoRoute, "duration", logDuration(time.Since(start)))
 		return
 	}
 	if len(prefix) > 0 {
-		upstream.Write(prefix) //nolint:errcheck // relay shutdown handles write failure
+		// A failed prefix write means the upstream is gone; the relay below
+		// surfaces the broken tunnel and shutdown handles the connection.
+		_, _ = upstream.Write(prefix)
 	}
-	brw.Writer.WriteString("HTTP/1.1 200 Connection established\r\n\r\n") //nolint:errcheck
-	brw.Writer.Flush()                                                    //nolint:errcheck
+	// The 200 fits the hijacked bufio buffer, so only Flush reaches the
+	// network — and a failure there means the client is already gone. The
+	// relay surfaces the dead connection; nothing else to do here.
+	_, _ = brw.WriteString("HTTP/1.1 200 Connection established\r\n\r\n")
+	_ = brw.Flush()
 	log.Info("tunnel", "target", logTarget, "upstream", upstreamLogValue(chosen),
 		"attempts", attempts, "duration", logDuration(time.Since(start)))
 
@@ -599,15 +611,15 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request, log *slog.
 			// A broken upstream must not masquerade as a clean end of stream:
 			// reset the client side so a truncated stream stays truncated.
 			if tc, ok := clientConn.(*net.TCPConn); ok {
-				tc.SetLinger(0)
+				_ = tc.SetLinger(0)
 			}
 		}
-		clientConn.Close() // unblocks the client-to-upstream direction
+		_ = clientConn.Close() // unblocks the client-to-upstream direction
 	}()
 	n, err := copyWithPooledBuffer(upstream, clientConn)
 	closes <- relayResult{direction: relayToUpstream, bytes: n, err: err}
-	upstream.Close()
-	clientConn.Close() // unblocks the other direction
+	_ = upstream.Close()
+	_ = clientConn.Close() // unblocks the other direction
 	first := <-closes
 	second := <-closes // the forced close of the remaining side is an artifact
 	recordTunnelClose(log, logTarget, chosen, start, first, second)
@@ -683,7 +695,7 @@ func (s *Server) CloseTunnels() {
 	}
 	s.cmu.Unlock()
 	for _, c := range conns {
-		c.Close()
+		_ = c.Close()
 	}
 }
 
@@ -703,7 +715,7 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		io.WriteString(w, "ok\n")
+		_, _ = io.WriteString(w, "ok\n")
 	})
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -733,7 +745,9 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 		if rotations != nil {
 			status["rotations"] = rotations()
 		}
-		json.NewEncoder(w).Encode(status)
+		// A failing encode means the status consumer disconnected; net/http
+		// records it on the connection and there is no fallback representation.
+		_ = json.NewEncoder(w).Encode(status)
 	})
 	return mux
 }
