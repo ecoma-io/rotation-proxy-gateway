@@ -126,7 +126,8 @@ func TestBalancedZeroShareFamilyIsStandby(t *testing.T) {
 }
 
 // The dedicated listeners ignore the ratio: their kind filter leaves one
-// family, and the balance layer then degenerates to the plain weighted order.
+// family, and the dedicated pick path then degenerates to the plain weighted
+// order — the balance layer is not consulted at all.
 func TestBalancedDedicatedKindIgnoresRatio(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := balancedPool(t, c, config.KindBalance{V4: 7, V6: 3}, config.EgressV4, config.EgressV6)
@@ -134,7 +135,7 @@ func TestBalancedDedicatedKindIgnoresRatio(t *testing.T) {
 	for i, kind := range []config.EgressKind{config.EgressV6, config.EgressV4} {
 		var got []config.EgressKind
 		for range 4 {
-			p := pl.PickFor(nil, only(kind))
+			p := pl.PickForDedicated(nil, only(kind))
 			if p == nil {
 				t.Fatalf("dedicated %s pick ran dry", kind)
 			}
@@ -143,6 +144,47 @@ func TestBalancedDedicatedKindIgnoresRatio(t *testing.T) {
 		if got[0] != kind || got[3] != kind {
 			t.Fatalf("dedicated picks %d = %v, want only %s", i, got, kind)
 		}
+	}
+}
+
+// Dedicated picks never touch the family clocks, not even the all-cooling
+// fallback: a burst of v4-listener traffic leaves the mixed split's phase
+// exactly where it was, and the next mixed pick continues as if the burst
+// never happened.
+func TestDedicatedPickNeverAdvancesFamilyClocks(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := balancedPool(t, c, config.KindBalance{V4: 1, V6: 1}, config.EgressV4, config.EgressV6)
+	before := pl.kindPass
+
+	for range 10 {
+		p := pl.PickForDedicated(nil, only(config.EgressV4))
+		if p == nil || p.Kind != config.EgressV4 {
+			t.Fatalf("dedicated pick = %v, want the v4 route", p)
+		}
+	}
+	if pl.kindPass != before {
+		t.Fatalf("family clocks = %v after the dedicated burst, want untouched %v", pl.kindPass, before)
+	}
+
+	// The mixed split is unaffected: with untouched clocks v4 wins the next
+	// mixed pick, and that pick does advance the clocks — proving the
+	// assertion above has teeth.
+	if got := pl.PickFor(nil, nil); got.Kind != config.EgressV4 {
+		t.Fatalf("first mixed pick after the dedicated burst = %s, want v4 (clocks untouched)", got.Kind)
+	}
+	afterMixed := pl.kindPass
+	if afterMixed == before {
+		t.Fatal("mixed pick did not advance the family clocks; the dedicated assertion proves nothing")
+	}
+
+	// The all-cooling fallback on the dedicated path keeps the same
+	// discipline: the cooling v4 route serves without touching the clocks.
+	pl.ReportFailure(pl.entries[0], errors.New("TEST dial refused"))
+	if p := pl.PickForDedicated(nil, only(config.EgressV4)); p == nil {
+		t.Fatal("dedicated cooling fallback ran dry")
+	}
+	if pl.kindPass != afterMixed {
+		t.Fatalf("family clocks = %v after the dedicated fallback, want untouched %v", pl.kindPass, afterMixed)
 	}
 }
 

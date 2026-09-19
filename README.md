@@ -140,7 +140,9 @@ while route `weight` still distributes picks inside one family. Each share is a
 whole number 1–1000; a family with no share only serves as standby when the
 shared family has no live route, and a family whose routes are all cooling or
 auth-blocked always defers to the other — availability beats the ratio. The
-dedicated v4/v6 listeners ignore the block. Without it, each family's share
+dedicated v4/v6 listeners ignore the block entirely: their picks consult no
+family ratio and never advance the family clocks, so a dedicated listener's
+traffic cannot skew the mixed split's phase. Without it, each family's share
 follows its routes' own weights, exactly as if the pool were flat. A reload
 that changes the ratio applies to the retained routes and carries the split's
 phase over.
@@ -397,7 +399,9 @@ proportionally to the configured weights and equal weights give true
 round-robin. On the mixed listener, a configured `balance` block composes a
 family clock above this order: the family whose clock is furthest behind
 serves first — zero-share families only as standby — and the weighted order
-then picks the route inside that family. A request never tries the same route
+then picks the route inside that family; only mixed picks move those clocks,
+so dedicated-listener traffic never shifts the split's phase. A request never
+tries the same route
 twice. Cooling routes are skipped when a usable eligible route exists; when
 all eligible non-auth-blocked routes cool down, the one recovering soonest is
 tried — weight- and family-blind, because soonest recovery is the only

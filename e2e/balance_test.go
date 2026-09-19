@@ -50,6 +50,24 @@ func TestE2E_BalancedFamilySplit(t *testing.T) {
 	if v6.Hits.Load() != 10 {
 		t.Fatalf("v6 simulator hits = %d, want 10 (dedicated listener only used v4)", v6.Hits.Load())
 	}
+
+	// The dedicated burst must leave the family clocks untouched: the mixed
+	// split continues its 3:1 handoff from the exact phase it stopped at.
+	// After 40 picks the v4 clock trails v6's by 10 stride units, so the
+	// next four mixed picks go v4,v6,v4,v4 (43/11 total) — a skewed clock
+	// (pushing v4 ahead by the burst) would instead hand those picks to v6
+	// and land 40/14.
+	client = ProxyClient(g.MixedAddr)
+	for range 4 {
+		GetVia(t, client, target.URL+"/b", "e2e-echo:/b")
+	}
+	st = g.WaitForCondition(5*time.Second, "post-burst mixed picks recorded", func(st *Status) bool {
+		return st.Pool[0].Successes+st.Pool[1].Successes == 54
+	})
+	if st.Pool[0].Successes != 43 || st.Pool[1].Successes != 11 {
+		t.Fatalf("post-burst split = %d/%d, want 43/11 (30+3 v4, 10+1 v6; a skewed clock would land 40/14)",
+			st.Pool[0].Successes, st.Pool[1].Successes)
+	}
 }
 
 // Reloading a new ratio retunes the split in place: the family clocks carry

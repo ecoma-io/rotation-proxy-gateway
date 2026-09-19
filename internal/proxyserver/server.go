@@ -148,8 +148,17 @@ func (s *Server) generation() *pool.Generation {
 	return s.store.Load()
 }
 
+// MixedListener is the listener name of the mixed v4/v6 egress view. The name
+// decides the pick path: dedicated views pick through PickForDedicated so
+// their traffic never advances the family-balance clocks the mixed view splits
+// by.
+const MixedListener = "mixed"
+
 func (s *Server) pick(gen *pool.Generation, exclude map[*pool.Proxy]bool) *pool.Proxy {
-	return gen.Pool.PickFor(exclude, s.allow)
+	if s.listener == MixedListener {
+		return gen.Pool.PickFor(exclude, s.allow)
+	}
+	return gen.Pool.PickForDedicated(exclude, s.allow)
 }
 
 type sessionSettings struct {

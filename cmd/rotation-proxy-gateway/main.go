@@ -154,7 +154,7 @@ func run() error {
 		name, addr string
 		kinds      []config.EgressKind
 	}{
-		{"mixed", bootstrap.MixedListenAddr, []config.EgressKind{config.EgressV4, config.EgressV6}},
+		{proxyserver.MixedListener, bootstrap.MixedListenAddr, []config.EgressKind{config.EgressV4, config.EgressV6}},
 		{"v4", bootstrap.V4ListenAddr, []config.EgressKind{config.EgressV4}},
 		{"v6", bootstrap.V6ListenAddr, []config.EgressKind{config.EgressV6}},
 	} {

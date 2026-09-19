@@ -298,14 +298,18 @@ func routeKey(u *url.URL, kind config.EgressKind, origin config.RouteOrigin) str
 // step back on the recency clock. The in-flight increment lands before the
 // pass advance: any observer that can already see the route as picked (an
 // advanced pass) therefore also sees the in-flight count, so a rotation drain
-// can never miss its holder. With family balance engaged, the event also
-// advances p's family clock by its stride, including on the all-cooling
-// fallback path so standby service keeps the split's bookkeeping honest.
-func (pl *Pool) serve(p *Proxy) {
+// can never miss its holder. advanceFamily is false for dedicated-listener
+// picks, whose traffic must leave the family clocks untouched. With family
+// balance engaged on the mixed path, the event also advances p's family clock
+// by its stride, including on the all-cooling fallback path so standby service
+// keeps the split's bookkeeping honest.
+func (pl *Pool) serve(p *Proxy, advanceFamily bool) {
 	p.inFlight.Add(1)
 	p.pass.Add(p.stride())
-	if k := kindIndex(p.Kind); pl.kindStride[k] > 0 {
-		pl.kindPass[k] += pl.kindStride[k]
+	if advanceFamily {
+		if k := kindIndex(p.Kind); pl.kindStride[k] > 0 {
+			pl.kindPass[k] += pl.kindStride[k]
+		}
 	}
 }
 
@@ -403,40 +407,65 @@ func (pl *Pool) jumpToBack(p *Proxy) {
 // Every successful pick holds one in-flight count on the returned route; the
 // caller releases it via Release when the request or tunnel finishes.
 func (pl *Pool) PickFor(exclude map[*Proxy]bool, allow func(*Proxy) bool) *Proxy {
+	return pl.pick(exclude, allow, true)
+}
+
+// PickForDedicated is the dedicated-listener variant of PickFor. Selection,
+// including the all-cooling fallback, is identical, but the pick consults no
+// family ratio and advances no family clock, so a dedicated listener's traffic
+// never shifts the mixed split's phase. The kind filter (allow) still bounds
+// which routes it can serve, which is what keeps a dedicated listener inside
+// its own egress family.
+func (pl *Pool) PickForDedicated(exclude map[*Proxy]bool, allow func(*Proxy) bool) *Proxy {
+	return pl.pick(exclude, allow, false)
+}
+
+// pick is the shared selection core. mixed=false is the dedicated path: pure
+// weighted recency within the allowed set, no family ratio, no family-clock
+// advance. Both paths hold pl.mu, which also owns the balanced path's scratch
+// buckets and the family clocks.
+func (pl *Pool) pick(exclude map[*Proxy]bool, allow func(*Proxy) bool, mixed bool) *Proxy {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
 	nowNano := relNanos(pl.Now())
 
+	// One fused pass serves both outcomes: available routes collect for the
+	// pick, and the soonest-recovering cooling route collects for the
+	// all-cooling fallback — the second full scan this used to need. The
+	// candidate sets are disjoint by construction (a fallback candidate has
+	// just failed availableAt), and the fallback ignores cooldown but never
+	// auth blocks or in-progress rotations.
 	allowed := func(p *Proxy) bool { return allow == nil || allow(p) }
 	var avail []*Proxy
+	var fallback *Proxy
+	var fallbackCooldown int64
 	for _, e := range pl.entries {
-		if allowed(e) && !exclude[e] && e.availableAt(nowNano) {
+		if !allowed(e) || exclude[e] {
+			continue
+		}
+		if e.availableAt(nowNano) {
 			avail = append(avail, e)
+			continue
+		}
+		if !e.authBlockedNow() && !e.rotatingNow() {
+			cu := e.cooldownNano()
+			if fallback == nil || cu < fallbackCooldown {
+				fallback, fallbackCooldown = e, cu
+			}
 		}
 	}
 	if len(avail) == 0 {
-		var best *Proxy
-		var bestCooldown int64
-		for _, e := range pl.entries {
-			if !allowed(e) || exclude[e] || e.authBlockedNow() || e.rotatingNow() {
-				continue
-			}
-			cu := e.cooldownNano()
-			if best == nil || cu < bestCooldown {
-				best, bestCooldown = e, cu
-			}
+		if fallback != nil {
+			pl.serve(fallback, mixed)
 		}
-		if best != nil {
-			pl.serve(best)
-		}
-		return best
+		return fallback
 	}
 
 	chosen := minRecencyPass(avail)
-	if pl.balanced() {
+	if mixed && pl.balanced() {
 		chosen = pl.pickBalanced(avail)
 	}
-	pl.serve(chosen)
+	pl.serve(chosen, mixed)
 	return chosen
 }
 
