@@ -1,0 +1,156 @@
+name: CI
+
+# Three jobs: verify (format + vet + lint + race + build), pr-title (the
+# commitlint gate the squash merge turns into the commit subject), and e2e
+# (the black-box suite against the real binary). ci-gate is the single
+# required-check name a branch ruleset can pin while the roster underneath it
+# evolves — add a job to `needs` and the gate tightens without touching
+# repository settings.
+#
+# Nothing is declared above the jobs except read permissions; every job
+# restates what it needs, because a job-level `permissions` block REPLACES
+# the workflow-level one rather than merging with it.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A push to main gets a run of its own per commit; a new push to a pull
+# request supersedes the in-flight run for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: read-all
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # `gofmt -l` exits 0 over findings; only emptiness means clean, so the
+      # check fails loudly on its own output rather than trusting an exit code.
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt findings — run 'gofmt -w .':"
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # Downloaded and checksum-pinned rather than taken from the runner image
+      # (whose copy moves underneath every job) and rather than an installer
+      # action (a second moving piece when the release tarball's digest is
+      # already the pin). The download itself retries bounded — a transient
+      # 5xx from the release endpoint must not fail the pipeline on an
+      # unchanged tree. The checksum line stays OUTSIDE the retry on purpose:
+      # it fails loudly on a wrong or partial download, and a retry must
+      # never paper over bytes that do not match the pin. Renovate bumps the
+      # URL via the regex custom manager in renovate.json5.
+      - name: Install the pinned golangci-lint
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/golangci-lint"
+          mkdir -p "$dir"
+          curl --silent --show-error --fail --location \
+            --retry 3 --retry-all-errors --retry-delay 10 \
+            --output "$dir/golangci-lint.tar.gz" \
+            "https://github.com/golangci/golangci-lint/releases/download/v2.12.2/golangci-lint-2.12.2-linux-amd64.tar.gz"
+          echo "8df580d2670fed8fa984aac0507099af8df275e665215f5c7a2ae3943893a553  $dir/golangci-lint.tar.gz" | sha256sum --check --strict
+          tar -xzf "$dir/golangci-lint.tar.gz" -C "$dir"
+          sudo mv "$dir/golangci-lint-2.12.2-linux-amd64/golangci-lint" /usr/local/bin/golangci-lint
+
+      - name: Lint
+        run: golangci-lint run ./...
+
+      # The unit suite: everything except the black-box E2E package, which
+      # builds the real binary and gets a job of its own below.
+      - name: Unit tests (race)
+        run: go test -race $(go list ./... | grep -v '/e2e$')
+
+      - name: Build
+        run: go build -trimpath -ldflags "-s -w -X main.version=ci-${GITHUB_SHA::12}" -o bin/rpgw ./cmd/rotation-proxy-gateway
+
+  pr-title:
+    name: pr-title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      # The lockfile pins the commitlint versions, and the packageManager
+      # field pins pnpm itself via corepack — no action and no unpinned npm
+      # install in the supply chain.
+      - name: Install the pinned toolchain
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+
+      # The squash merge makes this title the commit subject, so it is linted
+      # with the same config the commit-msg hook uses. The title reaches
+      # commitlint through an environment variable, never interpolated into
+      # the script (see .github/semgrep/workflows.yaml).
+      - name: Lint the pull-request title
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: printf '%s\n' "$PR_TITLE" | pnpm exec commitlint
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # The suite's TestMain builds the real binary itself; the simulators
+      # (SOCKS5, HTTP targets, rotate API) are in-process, so no Docker is
+      # involved on the runner.
+      - name: Black-box suite
+        run: go test ./e2e/ -count=1 -timeout 25m
+
+  ci-gate:
+    name: ci-gate
+    # The single check name a branch ruleset requires. `needs` names job IDs,
+    # so a future matrix job is still one entry; add a job here and the gate
+    # tightens without editing repository settings — forgetting to add it is
+    # the only way to widen what green means.
+    needs: [verify, pr-title, e2e]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # `needs` alone would let a skipped or cancelled job pass as green,
+      # since only `failure` blocks a dependent job by default. The pr-title
+      # job itself always runs (its inner step skips on pushes to main); a
+      # job-level skip is never legitimate here.
+      - name: Fail unless every job succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1

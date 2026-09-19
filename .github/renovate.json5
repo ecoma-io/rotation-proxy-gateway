@@ -1,0 +1,73 @@
+{
+  // Renovate runs only once the Mend GitHub App is installed on this
+  // repository; until then this file is inert — dependency updates simply do
+  // not arrive, and nothing else in CI depends on it. The pinning preset
+  // below is load-bearing for .github/semgrep/workflows.yaml's
+  // workflow-action-not-pinned-to-sha rule: it is what keeps every `uses:`
+  // on a full SHA with a readable `# vX.Y.Z` comment as actions release.
+  extends: [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":enableVulnerabilityAlertsWithLabel(security)",
+  ],
+  dependencyDashboard: true,
+  timezone: "Asia/Ho_Chi_Minh",
+  schedule: ["before 6am on monday"],
+  // A release published today may be compromised before its disclosure is
+  // public; three days of cooldown keeps main off the bleeding edge. The
+  // automation's job is a boring dependency tree, not a fresh one.
+  minimumReleaseAge: "3 days",
+  lockFileMaintenance: {
+    schedule: ["before 6am on monday"],
+  },
+  // Dependency pull requests must pass the same commitlint gate as human
+  // ones, so the scopes they write have to be in commitlint.config.mjs's
+  // scope-enum.
+  semanticCommits: "enabled",
+  semanticCommitType: "chore",
+  semanticCommitScope: "deps",
+  packageRules: [
+    {
+      description: "GitHub Actions bumps carry scope ci so commitlint passes.",
+      matchManagers: ["github-actions"],
+      semanticCommitScope: "ci",
+    },
+  ],
+  customManagers: [
+    {
+      // The pinned golangci-lint in ci.yml is downloaded by URL — not
+      // anything Renovate tracks by default — so this manager owns it. URL
+      // and version appear in one string; keep them bumping together.
+      customType: "regex",
+      fileMatch: ["^\\.github/workflows/ci\\.ya?ml$"],
+      matchStrings: [
+        "https://github.com/golangci/golangci-lint/releases/download/v(?<currentValue>[^/]+)/golangci-lint",
+      ],
+      depNameTemplate: "golangci/golangci-lint",
+      datasourceTemplate: "github-releases",
+    },
+    {
+      // Same shape for the checksum-verified gitleaks binary in analysis.yml.
+      customType: "regex",
+      fileMatch: ["^\\.github/workflows/analysis\\.ya?ml$"],
+      matchStrings: [
+        "https://github.com/zricethezav/gitleaks/releases/download/v(?<currentValue>[^/]+)/gitleaks",
+      ],
+      depNameTemplate: "zricethezav/gitleaks",
+      datasourceTemplate: "github-releases",
+    },
+    {
+      // The Semgrep analyser container is tag@digest so the version stays
+      // readable while the digest is what actually resolves; both halves
+      // bump together.
+      customType: "regex",
+      fileMatch: ["^\\.github/workflows/analysis\\.ya?ml$"],
+      matchStrings: [
+        "image:\\s*semgrep/semgrep:(?<currentValue>[0-9.]+)@(?<currentDigest>sha256:[a-f0-9]{64})",
+      ],
+      depNameTemplate: "semgrep/semgrep",
+      datasourceTemplate: "docker",
+      versioningTemplate: "semver",
+    },
+  ],
+}

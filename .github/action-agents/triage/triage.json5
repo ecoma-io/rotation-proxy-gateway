@@ -1,0 +1,20 @@
+// The triage labels sheet — what the action's dry-run record may express as
+// a decision. Ownership: `bug` and `enhancement` are returned by the issue
+// forms; GitHub is the source of truth for each label's description and
+// colour. The area labels a human picks from the bug form's dropdown (pool,
+// rotation, proxyserver, socksdial, config, e2e, docs) are deliberately NOT
+// here: routing an issue to a code area is a maintainer judgment, not a
+// model call.
+{
+  schemaVersion: 2,
+  labels: {
+    use: ["bug", "enhancement", "documentation", "question"],
+    roles: {
+      bug: "semantic-classification",
+      enhancement: "semantic-classification",
+      documentation: "semantic-classification",
+      question: "semantic-classification",
+    },
+    exclusive: ["semantic-classification"],
+  },
+}
