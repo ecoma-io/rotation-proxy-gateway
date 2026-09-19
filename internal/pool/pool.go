@@ -51,7 +51,7 @@ type Proxy struct {
 	strideStep    atomic.Uint64
 	weight        atomic.Uint64
 	inFlight      atomic.Int64
-	cooldownUntil atomic.Int64 // dial cooldown deadline, UnixNano; 0 = none
+	cooldownUntil atomic.Int64 // dial cooldown deadline, relNanos; 0 = none
 	authBlocked   atomic.Bool
 	rotating      atomic.Bool
 
@@ -88,6 +88,17 @@ func normalizeWeight(w int) uint64 {
 	return uint64(w)
 }
 
+// processStart anchors the cooldown clock. Cooldown deadlines are stored as
+// nanoseconds relative to it, not as UnixNano: t.Sub(processStart) uses the
+// monotonic reading whenever both times carry one, so cooldowns measure real
+// elapsed time and wall-clock steps (NTP corrections, manual date changes)
+// can neither expire nor extend a cooldown. Clocks without a monotonic
+// reading — the test fakes — fall back to wall arithmetic against the same
+// anchor, which is consistent as long as every site goes through relNanos.
+var processStart = time.Now()
+
+func relNanos(t time.Time) int64 { return int64(t.Sub(processStart)) }
+
 func newProxy(route config.RouteSpec, anchor uint64) *Proxy {
 	origin := effectiveOrigin(route.Origin)
 	p := &Proxy{URL: route.URL, Kind: route.Kind, Origin: origin}
@@ -108,9 +119,10 @@ func effectiveOrigin(origin config.RouteOrigin) config.RouteOrigin {
 	return origin
 }
 
-// availableAt reports whether the route may take a new pick at UnixNano time
-// nowNano. cooldownUntil 0 means no cooldown and is always available, which
-// also covers test clocks pinned at time.Unix(0, 0).
+// availableAt reports whether the route may take a new pick at nowNano, a
+// relNanos (monotonic-anchored) timestamp. cooldownUntil 0 means no cooldown
+// and is always available; a test clock pinned before processStart yields a
+// negative nowNano, which compares consistently against stored deadlines.
 func (p *Proxy) availableAt(nowNano int64) bool {
 	cu := p.cooldownUntil.Load()
 	return !p.authBlocked.Load() && !p.rotating.Load() && (cu == 0 || nowNano >= cu)
@@ -393,7 +405,7 @@ func (pl *Pool) jumpToBack(p *Proxy) {
 func (pl *Pool) PickFor(exclude map[*Proxy]bool, allow func(*Proxy) bool) *Proxy {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
-	nowNano := pl.Now().UnixNano()
+	nowNano := relNanos(pl.Now())
 
 	allowed := func(p *Proxy) bool { return allow == nil || allow(p) }
 	var avail []*Proxy
@@ -482,7 +494,7 @@ func (pl *Pool) ReportFailure(p *Proxy, err error) time.Duration {
 		}
 		return saturatingCooldown(base, max, p.consecutiveFailures)
 	}()
-	p.cooldownUntil.Store(now.Add(cd).UnixNano())
+	p.cooldownUntil.Store(relNanos(now.Add(cd)))
 	return cd
 }
 
@@ -554,7 +566,7 @@ func containsToken(haystack, needle string) bool {
 func (pl *Pool) Snapshot() []Status {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
-	nowNano := pl.Now().UnixNano()
+	nowNano := relNanos(pl.Now())
 	out := make([]Status, 0, len(pl.entries))
 	for _, e := range pl.entries {
 		e.mu.Lock()
