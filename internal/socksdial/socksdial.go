@@ -118,6 +118,20 @@ func dialTCP(ctx context.Context, addr string, timeout time.Duration) (net.Conn,
 	return conn, nil
 }
 
+// failSetup and failHandshake close the endpoint connection and wrap the
+// cause in the error class the proxy server's failure classification reads.
+// Plain functions rather than closures over conn: the failure paths then
+// allocate no extra escape-to-heap bookkeeping per call.
+func failSetup(conn net.Conn, op string, err error) (net.Conn, error) {
+	_ = conn.Close()
+	return nil, &SocksProtocolError{Op: op, Err: err}
+}
+
+func failHandshake(conn net.Conn, op string, err error) (net.Conn, error) {
+	_ = conn.Close()
+	return nil, &SocksHandshakeError{Op: op, Err: err}
+}
+
 // dialSocks5 tunnels to targetAddr through a SOCKS5 proxy per RFC 1928 with
 // optional username/password authentication per RFC 1929. Hostnames are sent
 // as domain names so the SOCKS endpoint resolves them.
@@ -126,15 +140,6 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 	if err != nil {
 		return nil, err
 	}
-	failSetup := func(op string, err error) (net.Conn, error) {
-		_ = conn.Close()
-		return nil, &SocksProtocolError{Op: op, Err: err}
-	}
-	failHandshake := func(op string, err error) (net.Conn, error) {
-		_ = conn.Close()
-		return nil, &SocksHandshakeError{Op: op, Err: err}
-	}
-
 	user, pass := "", ""
 	if pu.User != nil {
 		user = pu.User.Username()
@@ -143,7 +148,7 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 	wantAuth := user != "" || pass != ""
 
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return failHandshake("set handshake deadline", err)
+		return failHandshake(conn, "set handshake deadline", err)
 	}
 	br := bufio.NewReader(conn)
 
@@ -152,14 +157,14 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 		methods = []byte{0x00, 0x02}
 	}
 	if _, err := conn.Write(append([]byte{0x05, byte(len(methods))}, methods...)); err != nil {
-		return failHandshake("send greeting", err)
+		return failHandshake(conn, "send greeting", err)
 	}
 	choice := make([]byte, 2)
 	if _, err := io.ReadFull(br, choice); err != nil {
-		return failHandshake("read greeting", err)
+		return failHandshake(conn, "read greeting", err)
 	}
 	if choice[0] != 0x05 {
-		return failHandshake("read greeting", fmt.Errorf("unexpected SOCKS version 0x%02x", choice[0]))
+		return failHandshake(conn, "read greeting", fmt.Errorf("unexpected SOCKS version 0x%02x", choice[0]))
 	}
 	switch choice[1] {
 	case 0x00: // no auth needed
@@ -169,20 +174,20 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 			return nil, &ProxyAuthError{Reason: "endpoint requires credentials but none are configured"}
 		}
 		if len(user) > 255 || len(pass) > 255 {
-			return failSetup("encode credentials", fmt.Errorf("username or password exceeds SOCKS5 length limit"))
+			return failSetup(conn, "encode credentials", fmt.Errorf("username or password exceeds SOCKS5 length limit"))
 		}
 		b := append([]byte{0x01, byte(len(user))}, user...)
 		b = append(b, byte(len(pass)))
 		b = append(b, pass...)
 		if _, err := conn.Write(b); err != nil {
-			return failHandshake("send authentication", err)
+			return failHandshake(conn, "send authentication", err)
 		}
 		reply := make([]byte, 2)
 		if _, err := io.ReadFull(br, reply); err != nil {
-			return failHandshake("read authentication", err)
+			return failHandshake(conn, "read authentication", err)
 		}
 		if reply[0] != 0x01 {
-			return failHandshake("read authentication", fmt.Errorf("unexpected auth version 0x%02x", reply[0]))
+			return failHandshake(conn, "read authentication", fmt.Errorf("unexpected auth version 0x%02x", reply[0]))
 		}
 		if reply[1] != 0x00 {
 			_ = conn.Close()
@@ -192,36 +197,36 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 		_ = conn.Close()
 		return nil, &ProxyAuthError{Reason: "endpoint accepted no offered authentication method"}
 	default:
-		return failHandshake("negotiate authentication", fmt.Errorf("unsupported method 0x%02x", choice[1]))
+		return failHandshake(conn, "negotiate authentication", fmt.Errorf("unsupported method 0x%02x", choice[1]))
 	}
 
 	host, portStr, err := net.SplitHostPort(targetAddr)
 	if err != nil {
-		return failSetup("parse target", err)
+		return failSetup(conn, "parse target", err)
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port <= 0 || port > 65535 {
-		return failSetup("parse target", fmt.Errorf("invalid target port %q", portStr))
+		return failSetup(conn, "parse target", fmt.Errorf("invalid target port %q", portStr))
 	}
 	req, err := socksConnectRequest(host, uint16(port))
 	if err != nil {
-		return failSetup("encode target", err)
+		return failSetup(conn, "encode target", err)
 	}
 	if _, err := conn.Write(req); err != nil {
-		return failHandshake("send connect", err)
+		return failHandshake(conn, "send connect", err)
 	}
 	head := make([]byte, 4)
 	if _, err := io.ReadFull(br, head); err != nil {
-		return failHandshake("read connect", err)
+		return failHandshake(conn, "read connect", err)
 	}
 	if head[0] != 0x05 || head[2] != 0x00 {
-		return failHandshake("read connect", fmt.Errorf("invalid SOCKS response"))
+		return failHandshake(conn, "read connect", fmt.Errorf("invalid SOCKS response"))
 	}
 	if head[1] != 0x00 {
-		return failHandshake("connect target", fmt.Errorf("SOCKS reply 0x%02x", head[1]))
+		return failHandshake(conn, "connect target", fmt.Errorf("SOCKS reply 0x%02x", head[1]))
 	}
 	if err := discardSocksBoundAddress(br, head[3]); err != nil {
-		return failHandshake("read bound address", err)
+		return failHandshake(conn, "read bound address", err)
 	}
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		_ = conn.Close()
