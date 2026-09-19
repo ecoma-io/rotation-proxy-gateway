@@ -228,7 +228,19 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	if p == nil || gone() {
 		return
 	}
+	if e.rotate(ctx, gen, spec, p, id, gone) {
+		// The procedure aborted — shutdown, or a reload removed or replaced
+		// the route — so its rotation marker must be cleared. Every other
+		// outcome leaves the route's rotation state terminal already.
+		p.AbandonRotation()
+	}
+}
 
+// rotate runs one full rotation procedure: drain, baseline probe, rotate
+// call, verify, and the terminal bookkeeping. It reports that the procedure
+// aborted without reaching a terminal rotation state, so the caller clears
+// the route's rotation marker.
+func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.ManualRouteSpec, p *pool.Proxy, id string, gone func() bool) bool {
 	settings := gen.Config.Rotation
 	log := e.log.With().Str("route", p.URL.Host).Str("kind", string(p.Kind)).Logger()
 
@@ -261,17 +273,14 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 			break
 		}
 		if gone() {
-			p.AbandonRotation()
-			return
+			return true
 		}
 		if !sleepCtx(ctx, drainPoll) {
-			p.AbandonRotation()
-			return
+			return true
 		}
 	}
 	if gone() {
-		p.AbandonRotation()
-		return
+		return true
 	}
 
 	// 2. Baseline: what the egress IP is before rotating. Without it the
@@ -280,8 +289,7 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	enterPhase("rotating")
 	baseline, verified := e.baselineProbe(ctx, gen, spec, settings.IPCheckTimeout, log)
 	if gone() {
-		p.AbandonRotation()
-		return
+		return true
 	}
 	if !verified {
 		log.Warn().Msg("baseline probe failed; rotating without IP comparison")
@@ -297,8 +305,7 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	newIP, changed := e.verify(ctx, gen, spec, p, baseline, verified, settings, apiErr != nil, log)
 
 	if gone() {
-		p.AbandonRotation()
-		return
+		return true
 	}
 	if apiErr != nil {
 		log.Warn().Str("error", sanitize.ErrorString(apiErr)).Msg("rotate API call failed")
@@ -322,7 +329,7 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 			warnEv = warnEv.Str("retry_after_hint", dlog(retryAfter))
 		}
 		warnEv.Msg("rotation did not change the egress IP; retrying")
-		return
+		return false
 	}
 
 	// 5. Success: the new IP becomes the baseline, dial health earned by the
@@ -333,6 +340,7 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	e.rotations.Add(1)
 	e.setDue(id, e.Now().Add(spec.RotateInterval))
 	log.Info().Str("egress_ip", newIP).Str("next_in", dlog(spec.RotateInterval)).Msg("rotation complete")
+	return false
 }
 
 // verify polls the route's egress IP until it differs from the baseline and
