@@ -22,7 +22,7 @@ func kindedPool(t *testing.T) *Pool {
 		{URL: parse("socks5://v4a.test:1080"), Kind: config.EgressV4},
 		{URL: parse("socks5://v6.test:1080"), Kind: config.EgressV6},
 		{URL: parse("socks5://v4b.test:1080"), Kind: config.EgressV4},
-	}, time.Second, time.Minute)
+	}, time.Second, time.Minute, config.KindBalance{})
 }
 
 func only(kind config.EgressKind) func(*Proxy) bool {
@@ -64,7 +64,7 @@ func TestReconfigureResetsChangedKindAndSnapshotIsSafe(t *testing.T) {
 	pl.ReportFailure(old, errors.New("refused"))
 	next := pl.Reconfigure([]config.RouteSpec{
 		{URL: old.URL, Kind: config.EgressV6},
-	}, time.Second, time.Minute)
+	}, time.Second, time.Minute, config.KindBalance{})
 	got := next.PickFor(nil, nil)
 	if got == old {
 		t.Fatal("route with changed kind retained health identity")
@@ -78,7 +78,7 @@ func TestReconfigureResetsChangedKindAndSnapshotIsSafe(t *testing.T) {
 func TestReconfigureAppliesCooldownsToFutureFailures(t *testing.T) {
 	pl := kindedPool(t).Reconfigure([]config.RouteSpec{
 		{URL: mustURL(t, "socks5://v4a.test:1080"), Kind: config.EgressV4},
-	}, 3*time.Second, 3*time.Second)
+	}, 3*time.Second, 3*time.Second, config.KindBalance{})
 	p := pl.PickFor(nil, nil)
 	if got := pl.ReportFailure(p, nil); got != 3*time.Second {
 		t.Fatalf("cooldown = %s, want 3s", got)

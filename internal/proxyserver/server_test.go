@@ -106,7 +106,7 @@ func newForwarder(t *testing.T, socks ...*fakeSocks) (*httptest.Server, *pool.Po
 	for _, fs := range socks {
 		urls = append(urls, fs.URL)
 	}
-	pl := pool.NewRoutes(mixedRoutes(urls...), 30*time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(urls...), 30*time.Second, time.Minute, config.KindBalance{})
 	return newForwarderCfg(t, pl, defaultRuntime()), pl
 }
 
@@ -194,7 +194,7 @@ func TestPlainHTTPForwardThroughSOCKS(t *testing.T) {
 // untouched pool.
 func TestInvalidInboundRequestsAreRejectedBeforeDialing(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
 	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
@@ -231,7 +231,7 @@ func TestHTTPSRoundTripThroughSOCKS(t *testing.T) {
 	}))
 	defer target.Close()
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute, config.KindBalance{})
 	cfg := defaultRuntime()
 	cfg.TargetTLSInsecure = true
 	s := newRuntimeServer(pl, cfg, testLogger())
@@ -290,7 +290,7 @@ func TestRotatesOnEndpointDialFailure(t *testing.T) {
 	closed.Close()
 	good := startSocks5Proxy(t, socksOptions{})
 	target := startEchoTarget(t)
-	pl := pool.NewRoutes(mixedRoutes(deadURL, good.URL), 30*time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(deadURL, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
 	ts := newForwarderCfg(t, pl, defaultRuntime())
 
 	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
@@ -316,7 +316,7 @@ func TestLogsCorrelateDialFallbackAndRedactCredentials(t *testing.T) {
 	closed.Close()
 	good := startSocks5Proxy(t, socksOptions{})
 	target := startEchoTarget(t)
-	pl := pool.NewRoutes(mixedRoutes(deadURL, good.URL), 30*time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(deadURL, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
 	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
@@ -378,7 +378,7 @@ func TestRotatesOnHandshakeFailure(t *testing.T) {
 	reject := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
 	good := startSocks5Proxy(t, socksOptions{})
 	target := startEchoTarget(t)
-	pl := pool.NewRoutes(mixedRoutes(reject.URL, good.URL), 30*time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(reject.URL, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
 	ts := newForwarderCfg(t, pl, defaultRuntime())
 
 	resp, err := proxiedClient(t, ts.URL).Get("http://" + target + "/")
@@ -425,7 +425,7 @@ func TestPOSTReplaysOnlyAfterDialFailure(t *testing.T) {
 	deadURL := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
 	closed.Close()
 	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(deadURL, good.URL), 30*time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(deadURL, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
 	ts := newForwarderCfg(t, pl, defaultRuntime())
 
 	resp, err := proxiedClient(t, ts.URL).Post("http://"+startEchoBodyTarget(t)+"/", "text/plain", strings.NewReader("payload-123"))
@@ -493,7 +493,7 @@ func TestKnownLargePOSTStreamsBeforeFullBodyIsAvailable(t *testing.T) {
 	dead := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
 	closed.Close()
 	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute, config.KindBalance{})
 	cfg := defaultRuntime()
 	cfg.MaxBodyBuffer = 4
 	forwarder := newRuntimeServer(pl, cfg, testLogger())
@@ -540,7 +540,7 @@ func TestRequestBodyBufferBoundaries(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := startSocks5Proxy(t, socksOptions{})
-			pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
+			pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 			cfg := defaultRuntime()
 			cfg.MaxBodyBuffer = tc.cap
 			ts := newForwarderCfg(t, pl, cfg)
@@ -653,7 +653,7 @@ func TestStreamedChunkedBodyForwardsTrailers(t *testing.T) {
 	}))
 	defer target.Close()
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 	cfg := defaultRuntime()
 	cfg.MaxBodyBuffer = 3
 	s := newRuntimeServer(pl, cfg, testLogger())
@@ -683,7 +683,7 @@ func TestStreamedPOSTReplaysAfterDialFallback(t *testing.T) {
 	dead := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
 	closed.Close()
 	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute, config.KindBalance{})
 	cfg := defaultRuntime()
 	cfg.MaxBodyBuffer = 3
 	ts := newForwarderCfg(t, pl, cfg)
@@ -706,7 +706,7 @@ func TestStreamedPOSTReplaysAfterDialFallback(t *testing.T) {
 func TestPOSTReplaysAfterAuthFallback(t *testing.T) {
 	bad := startSocks5Proxy(t, socksOptions{user: "TEST-user", pass: "TEST-pass"})
 	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(bad.URL, good.URL), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(bad.URL, good.URL), time.Second, time.Minute, config.KindBalance{})
 	cfg := defaultRuntime()
 	cfg.MaxBodyBuffer = 3
 	ts := newForwarderCfg(t, pl, cfg)
@@ -739,7 +739,7 @@ func (b *errorReadCloser) Close() error {
 
 func TestBodyReadErrorIsLoggedAndDoesNotChangePool(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
 	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 	body := &errorReadCloser{err: errors.New("TEST body read failure")}
@@ -793,7 +793,7 @@ func TestCanceledStreamedRequestDoesNotMutatePoolOrRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pl := pool.NewRoutes(mixedRoutes(first, second), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(first, second), time.Second, time.Minute, config.KindBalance{})
 	cfg := defaultRuntime()
 	cfg.MaxBodyBuffer = 0
 	s := newRuntimeServer(pl, cfg, testLogger())
@@ -855,7 +855,7 @@ func TestCanceledTunnelDoesNotMutatePoolOrSend502(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pl := pool.NewRoutes(mixedRoutes(first, second), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(first, second), time.Second, time.Minute, config.KindBalance{})
 	s := newRuntimeServer(pl, defaultRuntime(), testLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 	s.dial = func(context.Context, *url.URL, string, time.Duration) (net.Conn, error) {
@@ -972,7 +972,7 @@ func TestTunnelLogsCorrelateDialFallback(t *testing.T) {
 	dead := &url.URL{Scheme: "socks5", User: url.UserPassword("TEST-user", "TEST-pass"), Host: closed.Addr().String()}
 	closed.Close()
 	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
 	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
@@ -1004,7 +1004,7 @@ func TestTunnelLogsCorrelateDialFallback(t *testing.T) {
 func TestTunnelAuthFallbackLogsWithoutCooldown(t *testing.T) {
 	bad := startSocks5Proxy(t, socksOptions{user: "TEST-user", pass: "TEST-pass"})
 	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(bad.URL, good.URL), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(bad.URL, good.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
 	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
@@ -1043,7 +1043,7 @@ func TestTunnelHandshakeFailureExhaustsToNoRoute(t *testing.T) {
 func TestTunnelLogsCorrelateHandshakeFallback(t *testing.T) {
 	reject := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
 	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(reject.URL, good.URL), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(reject.URL, good.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
 	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 
@@ -1139,7 +1139,7 @@ func TestCloseTunnelsDoesNotHoldConnectionMapLockWhileClosing(t *testing.T) {
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute), defaultRuntime(), testLogger())
+	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}), defaultRuntime(), testLogger())
 	s.trackConn(conn)
 	closed := make(chan struct{})
 	go func() {
@@ -1171,7 +1171,7 @@ func TestCloseTunnelsDoesNotHoldConnectionMapLockWhileClosing(t *testing.T) {
 
 func TestCloseTunnelsClosesIdleHijackedTunnel(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 	s := newRuntimeServer(pl, defaultRuntime(), testLogger())
 	ts := httptest.NewServer(s)
 	defer ts.Close()
@@ -1192,7 +1192,7 @@ func TestCloseTunnelsClosesIdleHijackedTunnel(t *testing.T) {
 
 func TestAdminEndpoints(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute, config.KindBalance{})
 	s := NewRuntime(pool.NewStore(defaultRuntime(), pl), testLogger(), "9.9.9-test", "mixed", config.EgressV4, config.EgressV6)
 	admin := httptest.NewServer(s.AdminMux())
 	defer admin.Close()
@@ -1264,7 +1264,7 @@ func abortTargetConn(conn net.Conn) {
 // record at warn without touching route health.
 func TestTunnelUpstreamResetLogsBrokenClose(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
 	ts := newForwarderCfgLogger(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
 

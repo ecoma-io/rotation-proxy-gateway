@@ -27,7 +27,7 @@ func generationRoutes(t *testing.T, raws ...string) []config.RouteSpec {
 
 func TestGenerationStoreRejectsIncomplete(t *testing.T) {
 	cfg := mustGenerationConfig(t, generationRoutes(t, "socks5://a.test:1080"), time.Second, time.Minute)
-	pl := NewRoutes(cfg.Routes, cfg.CooldownBase, cfg.CooldownMax)
+	pl := NewRoutes(cfg.Routes, cfg.CooldownBase, cfg.CooldownMax, config.KindBalance{})
 	for name, fn := range map[string]func(){
 		"nil config": func() { NewStore(nil, pl) },
 		"nil pool":   func() { NewStore(cfg, nil) },
@@ -46,7 +46,7 @@ func TestGenerationStoreRejectsIncomplete(t *testing.T) {
 
 func TestGenerationStorePublishesSnapshots(t *testing.T) {
 	cfg := mustGenerationConfig(t, generationRoutes(t, "socks5://a.test:1080"), time.Second, time.Minute)
-	store := NewStore(cfg, NewRoutes(cfg.Routes, cfg.CooldownBase, cfg.CooldownMax))
+	store := NewStore(cfg, NewRoutes(cfg.Routes, cfg.CooldownBase, cfg.CooldownMax, config.KindBalance{}))
 	if got := store.Load(); got.Config != cfg {
 		t.Fatal("store did not load initial generation")
 	}
@@ -63,7 +63,7 @@ func TestGenerationStorePublishesSnapshots(t *testing.T) {
 func TestGenerationPublishPreservesCanonicalState(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	cfg := mustGenerationConfig(t, generationRoutes(t, "socks5://a.test:1080", "socks5://b.test:1080"), 30*time.Second, time.Minute)
-	pl := NewRoutes(cfg.Routes, cfg.CooldownBase, cfg.CooldownMax)
+	pl := NewRoutes(cfg.Routes, cfg.CooldownBase, cfg.CooldownMax, config.KindBalance{})
 	pl.Now = c.NowFunc
 	store := NewStore(cfg, pl)
 
@@ -82,7 +82,7 @@ func TestGenerationPublishPreservesCanonicalState(t *testing.T) {
 func TestGenerationInFlightKeepsOriginalSnapshot(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	cfg := mustGenerationConfig(t, generationRoutes(t, "socks5://a.test:1080"), 30*time.Second, time.Minute)
-	pl := NewRoutes(cfg.Routes, cfg.CooldownBase, cfg.CooldownMax)
+	pl := NewRoutes(cfg.Routes, cfg.CooldownBase, cfg.CooldownMax, config.KindBalance{})
 	pl.Now = c.NowFunc
 	store := NewStore(cfg, pl)
 
@@ -108,7 +108,7 @@ func TestGenerationInFlightKeepsOriginalSnapshot(t *testing.T) {
 
 func TestGenerationConcurrentLoadPublishRaceFree(t *testing.T) {
 	cfg := mustGenerationConfig(t, generationRoutes(t, "socks5://a.test:1080"), time.Second, time.Minute)
-	store := NewStore(cfg, NewRoutes(cfg.Routes, cfg.CooldownBase, cfg.CooldownMax))
+	store := NewStore(cfg, NewRoutes(cfg.Routes, cfg.CooldownBase, cfg.CooldownMax, config.KindBalance{}))
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
 		wg.Add(2)

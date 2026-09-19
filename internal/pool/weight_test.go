@@ -20,7 +20,7 @@ func weightedPool(t *testing.T, c *clock, weights ...int) *Pool {
 			Weight: w,
 		})
 	}
-	pl := NewRoutes(routes, 30*time.Second, time.Minute)
+	pl := NewRoutes(routes, 30*time.Second, time.Minute, config.KindBalance{})
 	pl.Now = c.NowFunc
 	return pl
 }
@@ -176,7 +176,7 @@ func TestReconfigureRetunesWeightKeepingState(t *testing.T) {
 		{URL: mustURL(t, "socks5://w0.test:1080"), Kind: config.EgressV4, Weight: 1},
 		{URL: mustURL(t, "socks5://w1.test:1080"), Kind: config.EgressV4, Weight: 1},
 	}
-	pl := NewRoutes(specs, 30*time.Second, time.Minute)
+	pl := NewRoutes(specs, 30*time.Second, time.Minute, config.KindBalance{})
 	pl.Now = c.NowFunc
 
 	a := pl.PickFor(nil, nil)
@@ -189,7 +189,7 @@ func TestReconfigureRetunesWeightKeepingState(t *testing.T) {
 		{URL: specs[0].URL, Kind: config.EgressV4, Weight: 3},
 		{URL: specs[1].URL, Kind: config.EgressV4, Weight: 1},
 	}
-	next := pl.Reconfigure(retuned, 30*time.Second, time.Minute)
+	next := pl.Reconfigure(retuned, 30*time.Second, time.Minute, config.KindBalance{})
 	if next.entries[0] != a {
 		t.Fatalf("weight retune rebuilt the retained route")
 	}
@@ -218,7 +218,7 @@ func TestReconfigureAnchorsNewRouteAtRecencyFront(t *testing.T) {
 		{URL: mustURL(t, "socks5://w0.test:1080"), Kind: config.EgressV4, Weight: 1},
 		{URL: mustURL(t, "socks5://w1.test:1080"), Kind: config.EgressV4, Weight: 1},
 	}
-	pl := NewRoutes(specs, 30*time.Second, time.Minute)
+	pl := NewRoutes(specs, 30*time.Second, time.Minute, config.KindBalance{})
 	pl.Now = c.NowFunc
 	pl.PickFor(nil, nil)
 	pl.PickFor(nil, nil)
@@ -228,7 +228,7 @@ func TestReconfigureAnchorsNewRouteAtRecencyFront(t *testing.T) {
 		specs[1],
 		{URL: mustURL(t, "socks5://w2.test:1080"), Kind: config.EgressV4, Weight: 1},
 	}
-	next := pl.Reconfigure(grown, 30*time.Second, time.Minute)
+	next := pl.Reconfigure(grown, 30*time.Second, time.Minute, config.KindBalance{})
 
 	got := hosts(pickN(t, next, 3))
 	if !equalHosts(got, "w0.test:1080", "w1.test:1080", "w2.test:1080") {
@@ -244,7 +244,7 @@ func TestZeroWeightSpecBehavesAsDefault(t *testing.T) {
 		{URL: mustURL(t, "socks5://w0.test:1080"), Kind: config.EgressV4, Weight: 0},
 		{URL: mustURL(t, "socks5://w1.test:1080"), Kind: config.EgressV4, Weight: -3},
 	}
-	pl := NewRoutes(specs, 30*time.Second, time.Minute)
+	pl := NewRoutes(specs, 30*time.Second, time.Minute, config.KindBalance{})
 	pl.Now = c.NowFunc
 
 	snap := pl.Snapshot()

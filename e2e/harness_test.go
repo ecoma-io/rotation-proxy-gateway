@@ -74,6 +74,13 @@ type RotationConfig struct {
 	RetryBackoffMax string
 }
 
+// BalanceConfig is the family-split block; nil in GatewayConfig omits it. A
+// zero share omits the key, leaving that family as standby.
+type BalanceConfig struct {
+	V4 int
+	V6 int
+}
+
 // GatewayConfig is the full runtime YAML written for one gateway instance.
 type GatewayConfig struct {
 	LogLevel      string
@@ -86,6 +93,7 @@ type GatewayConfig struct {
 	Routes        []RouteConfig
 	Manual        []ManualRouteConfig
 	Rotation      *RotationConfig
+	Balance       *BalanceConfig
 }
 
 func defaultGatewayConfig(routes []RouteConfig) GatewayConfig {
@@ -127,6 +135,12 @@ type RotationView struct {
 	ConsecutiveSameIP int    `json:"consecutiveSameIP"`
 }
 
+// BalanceView is the active family split reported by /status when configured.
+type BalanceView struct {
+	V4 int `json:"v4"`
+	V6 int `json:"v6"`
+}
+
 // Status is the decoded /status body.
 type Status struct {
 	Version   string `json:"version"`
@@ -137,7 +151,8 @@ type Status struct {
 		Requests  uint64 `json:"requests"`
 		Failovers uint64 `json:"failovers"`
 	} `json:"listeners"`
-	Pool []PoolEntry `json:"pool"`
+	Pool    []PoolEntry  `json:"pool"`
+	Balance *BalanceView `json:"balance,omitempty"`
 }
 
 // Gateway is one real gateway subprocess with its own config file and ports.
@@ -206,6 +221,15 @@ func renderConfig(cfg GatewayConfig) string {
 		}
 		if cfg.Rotation.RetryBackoffMax != "" {
 			fmt.Fprintf(&sb, "  retry-backoff-max: %s\n", cfg.Rotation.RetryBackoffMax)
+		}
+	}
+	if cfg.Balance != nil {
+		sb.WriteString("balance:\n")
+		if cfg.Balance.V4 > 0 {
+			fmt.Fprintf(&sb, "  v4: %d\n", cfg.Balance.V4)
+		}
+		if cfg.Balance.V6 > 0 {
+			fmt.Fprintf(&sb, "  v6: %d\n", cfg.Balance.V6)
 		}
 	}
 	fmt.Fprintf(&sb, "global:\n  target-tls-insecure: %v\n  max-body-buffer: %d\n", cfg.TLSInsecure, cfg.MaxBodyBuffer)

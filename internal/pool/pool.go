@@ -179,28 +179,73 @@ type Pool struct {
 	base    time.Duration
 	max     time.Duration
 
+	// Family-balance state, both guarded by mu. kindStride holds each
+	// family's stride (strideUnits per configured share; 0 = no share), and
+	// kindPass is the family recency clock advanced by every serving event
+	// through serve. When any stride is positive, mixed picks first choose
+	// the family with the smaller kindPass, then the weighted route order
+	// picks inside it. Reconfigure carries kindPass across generations so a
+	// reload does not reset the split's phase. scratch is the per-pick family
+	// bucket used by pickBalanced, reused across picks to keep the balanced
+	// path allocation-free.
+	kindPass   [2]uint64
+	kindStride [2]uint64
+	scratch    [2][]*Proxy
+
 	// Now is the clock used for cooldowns; tests replace it.
 	Now func() time.Time
 }
 
-// NewRoutes builds a pool from validated, kinded routes of both origins.
-func NewRoutes(routes []config.RouteSpec, base, max time.Duration) *Pool {
+// NewRoutes builds a pool from validated, kinded routes of both origins. The
+// balance shares shape the mixed listener's family split; a zero KindBalance
+// keeps every family's share following the routes' own weights.
+func NewRoutes(routes []config.RouteSpec, base, max time.Duration, balance config.KindBalance) *Pool {
 	entries := make([]*Proxy, 0, len(routes))
 	for _, route := range routes {
 		entries = append(entries, newProxy(route, 0))
 	}
-	return &Pool{entries: entries, base: base, max: max, Now: time.Now}
+	pl := &Pool{entries: entries, base: base, max: max, Now: time.Now}
+	pl.setBalance(balance)
+	return pl
+}
+
+// setBalance installs per-generation family strides. Callers hold no lock
+// only during construction; Reconfigure calls it on the new pool before
+// publishing it.
+func (pl *Pool) setBalance(balance config.KindBalance) {
+	pl.kindStride[kindIndex(config.EgressV4)] = balanceStride(balance.V4)
+	pl.kindStride[kindIndex(config.EgressV6)] = balanceStride(balance.V6)
+}
+
+// balanceStride converts a configured share into a family-clock stride; no
+// share means the family never wins the clock comparison and only serves as
+// standby.
+func balanceStride(share int) uint64 {
+	if share < 1 {
+		return 0
+	}
+	return strideUnits / uint64(share)
+}
+
+func kindIndex(kind config.EgressKind) int {
+	if kind == config.EgressV6 {
+		return 1
+	}
+	return 0
 }
 
 // Reconfigure returns a new immutable route-list snapshot. Route state is
 // retained only for canonical URL+kind+origin matches; moving a route between
 // proxies.auto and proxies.manual rebuilds it because its role changed.
 // Retained entries pick up a changed configured weight in place — weight is
-// not identity, so retuning it keeps their health state. Existing in-flight
+// not identity, so retuning it keeps their health state. Family-balance
+// clocks carry over so a reload does not reset the split's phase, and a
+// changed ratio applies through the new strides. Existing in-flight
 // operations may safely keep using the original pool.
-func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration) *Pool {
+func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration, balance config.KindBalance) *Pool {
 	pl.mu.Lock()
 	entries := append([]*Proxy(nil), pl.entries...)
+	kindPass := pl.kindPass
 	now := pl.Now
 	pl.mu.Unlock()
 
@@ -228,7 +273,9 @@ func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration) 
 			next = append(next, newProxy(route, minPass))
 		}
 	}
-	return &Pool{entries: next, base: base, max: max, Now: now}
+	fresh := &Pool{entries: next, base: base, max: max, Now: now, kindPass: kindPass}
+	fresh.setBalance(balance)
+	return fresh
 }
 
 func routeKey(u *url.URL, kind config.EgressKind, origin config.RouteOrigin) string {
@@ -239,10 +286,73 @@ func routeKey(u *url.URL, kind config.EgressKind, origin config.RouteOrigin) str
 // step back on the recency clock. The in-flight increment lands before the
 // pass advance: any observer that can already see the route as picked (an
 // advanced pass) therefore also sees the in-flight count, so a rotation drain
-// can never miss its holder.
+// can never miss its holder. With family balance engaged, the event also
+// advances p's family clock by its stride, including on the all-cooling
+// fallback path so standby service keeps the split's bookkeeping honest.
 func (pl *Pool) serve(p *Proxy) {
 	p.inFlight.Add(1)
 	p.pass.Add(p.stride())
+	if k := kindIndex(p.Kind); pl.kindStride[k] > 0 {
+		pl.kindPass[k] += pl.kindStride[k]
+	}
+}
+
+// balanced reports whether any family has a configured share, which is what
+// engages the two-level mixed pick.
+func (pl *Pool) balanced() bool {
+	return pl.kindStride[0] > 0 || pl.kindStride[1] > 0
+}
+
+// preferredKind names the family the balance ratio asks for next: among
+// positive-share kinds, the one whose family clock is furthest behind. Equal
+// clocks prefer v4, keeping the choice deterministic. A zero share never wins
+// against a positive one; it only serves through pickBalanced's standby
+// defer. Callers hold pl.mu.
+func (pl *Pool) preferredKind() int {
+	hasV4, hasV6 := pl.kindStride[0] > 0, pl.kindStride[1] > 0
+	switch {
+	case hasV4 && (!hasV6 || pl.kindPass[0] <= pl.kindPass[1]):
+		return 0
+	case hasV6:
+		return 1
+	default:
+		return 0 // unreachable through balanced()
+	}
+}
+
+// pickBalanced chooses within the available routes under the family split:
+// the preferred family serves if it has a live route here, otherwise the
+// other one does — availability beats the ratio — and within a family the
+// weighted recency order decides. Callers hold pl.mu, which also owns the
+// scratch buckets; serve below advances the winning family's clock. Returns
+// nil when avail is empty, which callers exclude beforehand.
+func (pl *Pool) pickBalanced(avail []*Proxy) *Proxy {
+	pl.scratch[0] = pl.scratch[0][:0]
+	pl.scratch[1] = pl.scratch[1][:0]
+	for _, p := range avail {
+		k := kindIndex(p.Kind)
+		pl.scratch[k] = append(pl.scratch[k], p)
+	}
+	first := pl.preferredKind()
+	for _, k := range [2]int{first, 1 - first} {
+		if len(pl.scratch[k]) > 0 {
+			return minRecencyPass(pl.scratch[k])
+		}
+	}
+	return nil
+}
+
+// minRecencyPass returns the candidate with the smallest weighted recency
+// pass, first-seen order breaking ties.
+func minRecencyPass(candidates []*Proxy) *Proxy {
+	chosen := candidates[0]
+	chosenPass := chosen.recencyPass()
+	for _, e := range candidates[1:] {
+		if s := e.recencyPass(); s < chosenPass {
+			chosen, chosenPass = e, s
+		}
+	}
+	return chosen
 }
 
 // jumpToBack pushes a route behind the whole pool by its own weighted step —
@@ -266,13 +376,17 @@ func (pl *Pool) jumpToBack(p *Proxy) {
 // the current request. Among available entries it picks the smallest weighted
 // recency pass (stable order on ties): every serving event advances a route's
 // pass by strideUnits/weight, so picks distribute proportionally to the
-// configured weights and equal weights give true round-robin. When every
+// configured weights and equal weights give true round-robin. With a
+// configured family balance, the pick is two-level on the mixed path: the
+// family clock whose stride tracks the configured share chooses the family
+// first, then the weighted order picks inside it; a family without a live
+// route here defers to the other, so availability beats the ratio. When every
 // allowed, non-excluded, non-auth-blocked entry is cooling down it returns the
-// allowed route that recovers soonest — weight-independent, because soonest
-// recovery is the only criterion that matters there. Routes held by an
-// in-progress rotation are skipped on both paths. It returns nil when no
-// allowed entry remains. The filter is applied equally to both paths so a
-// dedicated v4/v6 listener never crosses into another egress kind.
+// allowed route that recovers soonest — weight- and family-independent,
+// because soonest recovery is the only criterion that matters there. Routes
+// held by an in-progress rotation are skipped on both paths. It returns nil
+// when no allowed entry remains. The filter is applied equally to both paths
+// so a dedicated v4/v6 listener never crosses into another egress kind.
 //
 // Every successful pick holds one in-flight count on the returned route; the
 // caller releases it via Release when the request or tunnel finishes.
@@ -306,12 +420,9 @@ func (pl *Pool) PickFor(exclude map[*Proxy]bool, allow func(*Proxy) bool) *Proxy
 		return best
 	}
 
-	chosen := avail[0]
-	chosenPass := chosen.recencyPass()
-	for _, e := range avail[1:] {
-		if s := e.recencyPass(); s < chosenPass {
-			chosen, chosenPass = e, s
-		}
+	chosen := minRecencyPass(avail)
+	if pl.balanced() {
+		chosen = pl.pickBalanced(avail)
 	}
 	pl.serve(chosen)
 	return chosen

@@ -78,9 +78,12 @@ Read [`README.md`](README.md) before changing failure classification.
 
 - The pool selects the usable **eligible** route with the smallest weighted
   recency pass: picks distribute proportionally to each route's `weight`
-  (default 1; all-equal weights are true round-robin). It is a single shared
-  pool: cooldown/auth state is visible through both dedicated and mixed
-  listeners.
+  (default 1; all-equal weights are true round-robin). The optional `balance`
+  block splits mixed-listener picks between egress families by relative share
+  (a family clock above the weighted order; zero-share families serve only as
+  standby; availability always beats the ratio; dedicated listeners ignore
+  it). It is a single shared pool: cooldown/auth state is visible through both
+  dedicated and mixed listeners.
 - Endpoint DNS/TCP failure is `proxy_connect`: cooldown then a distinct
   eligible fallback. SOCKS auth failure is `auth_route`, blocks the route, and
   may fall back, but never creates dial cooldown. A SOCKS handshake failure

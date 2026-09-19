@@ -26,6 +26,17 @@ cooldown:
 # Timeout covering SOCKS endpoint TCP dialing and SOCKS setup.
 dial-timeout: 10s
 
+# Optional family split for the mixed listener: shares are relative, so v4 7
+# + v6 3 sends about 70% of mixed traffic through v4 routes regardless of how
+# many routes each family has. Route weight still distributes picks inside
+# one family. A family with no share only serves as standby; a family with no
+# live route always defers to the other. The dedicated v4/v6 listeners ignore
+# this block. Delete it to let each family's share follow its routes' own
+# weights.
+balance:
+  v4: 7
+  v6: 3
+
 # Manual-route rotation knobs. Every value below is also the default.
 rotation:
   # How many rotations may run at once: a fixed count (1) or a percent of the

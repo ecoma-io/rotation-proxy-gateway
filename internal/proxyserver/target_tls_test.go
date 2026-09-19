@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
 )
 
@@ -29,7 +30,7 @@ func TestTargetTLSHandshakeFailureIsSetupNotHealthChange(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			targetURL := tc.target(t)
 			fs := startSocks5Proxy(t, socksOptions{})
-			pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
+			pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 			cfg := defaultRuntime()
 			cfg.TargetTLSInsecure = tc.insecure
 			s := newRuntimeServer(pl, cfg, testLogger())
@@ -69,7 +70,7 @@ func TestTargetTLSSessionsResume(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 	cfg := defaultRuntime()
 	cfg.TargetTLSInsecure = true
 	s := newRuntimeServer(pl, cfg, testLogger())

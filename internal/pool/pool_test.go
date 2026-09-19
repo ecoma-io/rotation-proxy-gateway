@@ -31,7 +31,7 @@ func newTestPool(t *testing.T, c *clock, urls ...string) *Pool {
 	for _, raw := range urls {
 		routes = append(routes, config.RouteSpec{URL: mustURL(t, raw), Kind: config.EgressV4})
 	}
-	pl := NewRoutes(routes, 30*time.Second, time.Minute)
+	pl := NewRoutes(routes, 30*time.Second, time.Minute, config.KindBalance{})
 	pl.Now = c.NowFunc
 	return pl
 }

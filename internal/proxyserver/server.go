@@ -715,13 +715,20 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 			requests += status.Requests
 			failovers += status.Failovers
 		}
+		gen := store.Load()
 		status := map[string]any{
 			"version":   version,
 			"uptime":    time.Since(started).Truncate(time.Second).String(),
 			"requests":  requests,
 			"failovers": failovers,
 			"listeners": perListener,
-			"pool":      store.Load().Pool.Snapshot(),
+			"pool":      gen.Pool.Snapshot(),
+		}
+		// The active family split is part of the serving contract, so /status
+		// reports exactly what the current generation enforces — omitted when
+		// no balance block is configured.
+		if bal := gen.Config.Balance; bal.V4 > 0 || bal.V6 > 0 {
+			status["balance"] = map[string]int{"v4": bal.V4, "v6": bal.V6}
 		}
 		if rotations != nil {
 			status["rotations"] = rotations()

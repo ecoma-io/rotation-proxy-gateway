@@ -18,7 +18,7 @@ import (
 // Test-first: AdminMux /status currently can expose raw arbitrary errors.
 func TestStatusLeakProof(t *testing.T) {
 	u, _ := url.Parse("socks5://proxy.test:1080")
-	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, 30*time.Second, time.Minute)
+	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, 30*time.Second, time.Minute, config.KindBalance{})
 	p := pl.PickFor(nil, nil)
 	raw := errors.New("dial socks5://TESTUSER:TESTP/ss?w@rd@proxy.test:1080: refused\x1b[31m" + strings.Repeat("z", 600))
 	pl.ReportFailure(p, raw)

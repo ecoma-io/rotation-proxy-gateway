@@ -269,7 +269,7 @@ func TestShutdownAllClosesProxyListenersThenAdmin(t *testing.T) {
 		CooldownBase:  time.Second,
 		CooldownMax:   time.Minute,
 	}
-	store := pool.NewStore(runtime, pool.NewRoutes(nil, time.Second, time.Minute))
+	store := pool.NewStore(runtime, pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}))
 	srvA := proxyserver.NewRuntime(store, log, "test", "mixed", config.EgressV4, config.EgressV6)
 	srvB := proxyserver.NewRuntime(store, log, "test", "v4", config.EgressV4)
 
@@ -326,7 +326,7 @@ func TestShutdownAllSharedBudget(t *testing.T) {
 		CooldownBase:  time.Second,
 		CooldownMax:   time.Minute,
 	}
-	store := pool.NewStore(runtime, pool.NewRoutes(nil, time.Second, time.Minute))
+	store := pool.NewStore(runtime, pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}))
 	srvA := proxyserver.NewRuntime(store, log, "test", "mixed", config.EgressV4, config.EgressV6)
 	srvB := proxyserver.NewRuntime(store, log, "test", "v4", config.EgressV4)
 	lnA, httpA := serveTestListener(t, block)

@@ -26,7 +26,7 @@ func TestRuntimeSettingsSnapshotUsesOneGeneration(t *testing.T) {
 		TargetTLSInsecure: false,
 		Routes:            []config.RouteSpec{{URL: a, Kind: config.EgressV4}},
 	}
-	store := pool.NewStore(initial, pool.NewRoutes(initial.Routes, time.Second, time.Minute))
+	store := pool.NewStore(initial, pool.NewRoutes(initial.Routes, time.Second, time.Minute, config.KindBalance{}))
 	server := NewRuntime(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "test", "mixed", config.EgressV4, config.EgressV6)
 
 	b, err := url.Parse("socks5://b.test:1080")
@@ -74,7 +74,7 @@ func TestRuntimeGenerationIsolatesInFlightWork(t *testing.T) {
 		DialTimeout:   3 * time.Second,
 		Routes:        []config.RouteSpec{{URL: a, Kind: config.EgressV4}},
 	}
-	store := pool.NewStore(initial, pool.NewRoutes(initial.Routes, time.Second, time.Minute))
+	store := pool.NewStore(initial, pool.NewRoutes(initial.Routes, time.Second, time.Minute, config.KindBalance{}))
 	server := NewRuntime(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "test", "mixed", config.EgressV4, config.EgressV6)
 
 	inFlight := server.generation()
@@ -114,7 +114,7 @@ func TestRuntimeListenerSelectsOnlyAllowedEgressKind(t *testing.T) {
 	pl := pool.NewRoutes([]config.RouteSpec{
 		{URL: v4.URL, Kind: config.EgressV4},
 		{URL: v6.URL, Kind: config.EgressV6},
-	}, time.Second, time.Minute)
+	}, time.Second, time.Minute, config.KindBalance{})
 	runtime := pool.NewStore(&config.RuntimeConfig{
 		MaxRetries:    2,
 		DialTimeout:   time.Second,
@@ -156,7 +156,7 @@ func TestRuntimeListenerSelectsOnlyAllowedEgressKind(t *testing.T) {
 
 func TestListenerLogsItsNameAndAdminAggregatesStatus(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes([]config.RouteSpec{{URL: fs.URL, Kind: config.EgressV4}}, time.Second, time.Minute)
+	pl := pool.NewRoutes([]config.RouteSpec{{URL: fs.URL, Kind: config.EgressV4}}, time.Second, time.Minute, config.KindBalance{})
 	runtime := pool.NewStore(&config.RuntimeConfig{MaxRetries: 1, DialTimeout: time.Second, MaxBodyBuffer: 1 << 20}, pl)
 	var logs safeLogBuffer
 	srv := NewRuntime(runtime, captureLogger(&logs, slog.LevelDebug), "test", "v4", config.EgressV4)
@@ -196,7 +196,7 @@ func TestRuntimeListenerNoEligibleRouteReturns502(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, time.Second, time.Minute)
+	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, time.Second, time.Minute, config.KindBalance{})
 	runtime := pool.NewStore(&config.RuntimeConfig{MaxRetries: 1, DialTimeout: time.Second, MaxBodyBuffer: 1 << 20}, pl)
 	srv := httptest.NewServer(NewRuntime(runtime, testLogger(), "test", "v6", config.EgressV6))
 	defer srv.Close()

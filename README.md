@@ -81,6 +81,9 @@ cooldown:
   base: 15s
   max: 10m
 dial-timeout: 10s
+balance:
+  v4: 7
+  v6: 3
 global:
   target-tls-insecure: false
   max-body-buffer: 67108864
@@ -119,6 +122,18 @@ peer. Equal weights — or no `weight` key at all — give true round-robin. The
 key exists on both `proxies.auto` and `proxies.manual` routes and is not part
 of route identity: a reload that only retunes weights keeps the route's health
 state.
+
+The optional `balance` block splits mixed-listener picks between the two egress
+families by relative share — `balance: {v4: 7, v6: 3}` sends about 70% of mixed
+traffic through `kind: v4` routes no matter how many routes each family has,
+while route `weight` still distributes picks inside one family. Each share is a
+whole number 1–1000; a family with no share only serves as standby when the
+shared family has no live route, and a family whose routes are all cooling or
+auth-blocked always defers to the other — availability beats the ratio. The
+dedicated v4/v6 listeners ignore the block. Without it, each family's share
+follows its routes' own weights, exactly as if the pool were flat. A reload
+that changes the ratio applies to the retained routes and carries the split's
+phase over.
 
 `global.target-tls-insecure` and `global.max-body-buffer` are global settings;
 per-route overrides are rejected. `target-tls-insecure` defaults to `false` and
@@ -374,11 +389,15 @@ The pool serves the eligible route with the smallest weighted recency pass:
 every pick, completed request, and stale return advances the route's pass by
 one step inversely proportional to its `weight`, so picks distribute
 proportionally to the configured weights and equal weights give true
-round-robin. A request never tries the same route twice. Cooling routes are
-skipped when a usable eligible route exists; when all eligible non-auth-blocked
-routes cool down, the one recovering soonest is tried — weight-blind, because
-soonest recovery is the only criterion that matters there. Authentication
-blocks remain until the route identity changes on reload.
+round-robin. On the mixed listener, a configured `balance` block composes a
+family clock above this order: the family whose clock is furthest behind
+serves first — zero-share families only as standby — and the weighted order
+then picks the route inside that family. A request never tries the same route
+twice. Cooling routes are skipped when a usable eligible route exists; when
+all eligible non-auth-blocked routes cool down, the one recovering soonest is
+tried — weight- and family-blind, because soonest recovery is the only
+criterion that matters there. Authentication blocks remain until the route
+identity changes on reload.
 
 A target HTTP `407` is ordinary target response data. It is not SOCKS
 authentication data, does not rotate, and does not create cooldown.
@@ -420,8 +439,9 @@ ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 (completed manual-route rotations that observed a changed egress IP), and
 redacted `pool` state. It additionally reports safe per-listener counters —
 `requests` and `failovers` (in-band route fallbacks, distinct from rotations) —
-each route's `kind` and `origin`, and each manual route's rotation view (see
-"Manual rotation routes"). Route identities are always `host:port`, never
+each route's `kind` and `origin`, each manual route's rotation view (see
+"Manual rotation routes"), and the active `balance` family split when one is
+configured. Route identities are always `host:port`, never
 userinfo; rotate-API headers, bodies, and URLs never appear anywhere in the
 output. Each route's `failures` and `lastDialError` cover endpoint dial and
 SOCKS handshake failures.
