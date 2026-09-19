@@ -246,9 +246,11 @@ func (s *Server) serveConn(conn net.Conn) {
 	defer s.untrackConn(conn)
 	defer conn.Close() //nolint:errcheck // relay shutdown handles write failure
 
-	// The deadline covers greeting, request, and reply framing; the success
-	// path clears it before relaying.
-	conn.SetDeadline(time.Now().Add(inboundHandshakeTimeout)) //nolint:errcheck // best-effort hardening
+	// The deadline covers greeting, request, and reply framing — the whole
+	// retry chain included; the success path re-arms it for the reply and
+	// clears it before relaying.
+	deadline := time.Now().Add(inboundHandshakeTimeout)
+	conn.SetDeadline(deadline) //nolint:errcheck // best-effort hardening
 
 	req, err := readSocksRequest(conn)
 	if err != nil {
@@ -263,14 +265,15 @@ func (s *Server) serveConn(conn net.Conn) {
 
 	requestID := s.requests.Add(1)
 	log := s.log.With().Int64("request_id", int64(requestID)).Logger()
-	s.serveTunnel(conn, req.target, log)
+	s.serveTunnel(conn, req.target, deadline, log)
 }
 
 // serveTunnel dials the target through the pool with the retry/exclude loop,
 // sends the success reply once, and relays until either side ends the stream.
 // It loads one generation for the whole session so route picks and health
-// reports stay consistent across reloads.
-func (s *Server) serveTunnel(clientConn net.Conn, target string, log zerolog.Logger) {
+// reports stay consistent across reloads. handshakeDeadline is the inbound
+// framing window serveConn armed; the retry chain must fit inside it.
+func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadline time.Time, log zerolog.Logger) {
 	gen := s.generation()
 	settings := generationSettings(gen)
 	start := time.Now()
@@ -282,11 +285,22 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, log zerolog.Log
 	var chosen *pool.Proxy
 	var attempts int
 	for attempt := 0; attempt < settings.maxRetries; attempt++ {
-		attempts = attempt + 1
+		// A retry dials again under the inbound handshake window. Once that
+		// window is gone — a slow retry chain, most plausibly a vanished
+		// client — further attempts would spend route health on a client
+		// that can no longer be answered.
+		if attempt > 0 && !time.Now().Before(handshakeDeadline) {
+			writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the client is gone either way
+			log.Warn().Str("target", logTarget).Int("attempts", attempts).
+				Str("error_kind", errorKindSetup).Str("duration", logDuration(time.Since(start))).
+				Msg("inbound handshake deadline expired before the next attempt")
+			return
+		}
 		p := s.pick(gen, exclude)
 		if p == nil {
 			break
 		}
+		attempts = attempt + 1
 		// The winning pick holds the route for the tunnel's whole lifetime;
 		// earlier excluded attempts release when the handler ends.
 		defer p.Release()
@@ -296,30 +310,24 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, log zerolog.Log
 			case isProxyDialError(err):
 				cooldown := gen.Pool.ReportFailure(p, err)
 				exclude[p] = true
-				s.failovers.Add(1)
 				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
 					Int("attempt", attempts).Str("error_kind", errorKindProxyConnect).
 					Str("error", logErrorValue(err)).Str("cooldown", cooldown.String()).
 					Msg("upstream dial failed")
-				continue
 			case isSocksHandshakeError(err):
 				cooldown := gen.Pool.ReportFailure(p, err)
 				exclude[p] = true
-				s.failovers.Add(1)
 				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
 					Int("attempt", attempts).Str("error_kind", errorKindSocksConnect).
 					Str("error", logErrorValue(err)).Str("cooldown", cooldown.String()).
 					Msg("upstream handshake failed")
-				continue
 			case isProxyAuthError(err):
 				gen.Pool.ReportAuthBlocked(p, err)
 				exclude[p] = true
-				s.failovers.Add(1)
 				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
 					Int("attempt", attempts).Str("error_kind", errorKindAuthRoute).
 					Str("error", logErrorValue(err)).
 					Msg("upstream auth failed")
-				continue
 			default:
 				writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the connection closes either way
 				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
@@ -328,6 +336,12 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, log zerolog.Log
 					Msg("upstream setup failed")
 				return
 			}
+			// A fallback is a real handoff to another attempt; the final
+			// attempt's failure is terminal, not a fallback.
+			if attempt+1 < settings.maxRetries {
+				s.failovers.Add(1)
+			}
+			continue
 		}
 		gen.Pool.ReportSuccess(p)
 		upstream, chosen = up, p
@@ -335,12 +349,16 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, log zerolog.Log
 	}
 	if upstream == nil {
 		writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the connection closes either way
-		log.Warn().Str("target", logTarget).Int("attempts", len(exclude)).
+		log.Warn().Str("target", logTarget).Int("attempts", attempts).
 			Str("error_kind", errorKindNoRoute).Str("duration", logDuration(time.Since(start))).
 			Msg("tunnel failed")
 		return
 	}
-	writeSocksReply(clientConn, socksReplySuccess) //nolint:errcheck // relay shutdown handles write failure
+	// Framing gets a fresh inbound window: the original deadline may be
+	// nearly spent after a retry chain, and the established tunnel must not
+	// inherit a deadline from its handshake.
+	clientConn.SetDeadline(time.Now().Add(inboundHandshakeTimeout)) //nolint:errcheck // best-effort hardening
+	writeSocksReply(clientConn, socksReplySuccess)                  //nolint:errcheck // relay shutdown handles write failure
 	// Established tunnels carry no timeouts.
 	clientConn.SetDeadline(time.Time{}) //nolint:errcheck // best-effort hardening
 	log.Info().Str("target", logTarget).Str("upstream", upstreamLogValue(chosen)).
@@ -527,17 +545,26 @@ const (
 // much each direction carried. An upstream-side error is a broken tunnel — the
 // client's stream died mid-flight — and logs at warn; every other close is
 // routine flow detail at debug. Tunnel closes never mutate route health.
+// recordTunnelClose classifies the tunnel's end. The direction that ended
+// first is the cause; the other direction's result is normally the artifact
+// of the teardown close. One artifact ordering lies: when the client side
+// failed first but the upstream direction also failed on its own — an error
+// that is not our close — an upstream reset killed the tunnel from the far
+// side, and it must be logged as broken (warn), not as a clean client end
+// (debug).
 func recordTunnelClose(log zerolog.Logger, target string, p *pool.Proxy, start time.Time, first, second relayResult) {
 	toClient, toUpstream := second, first
 	if first.direction == relayToClient {
 		toClient, toUpstream = first, second
 	}
-	msg, reason := "tunnel closed", "client_closed"
+	msg, reason, cause := "tunnel closed", "client_closed", first.err
 	switch {
 	case first.direction == relayToClient && first.err != nil:
 		msg, reason = "tunnel broken", "upstream_broken"
 	case first.direction == relayToClient:
 		reason = "upstream_closed"
+	case first.err != nil && second.err != nil && !errors.Is(second.err, net.ErrClosed):
+		msg, reason, cause = "tunnel broken", "upstream_broken", second.err
 	case first.err != nil:
 		reason = "client_aborted"
 	}
@@ -550,8 +577,8 @@ func recordTunnelClose(log zerolog.Logger, target string, p *pool.Proxy, start t
 		Int64("client_to_upstream_bytes", toUpstream.bytes).
 		Int64("upstream_to_client_bytes", toClient.bytes).
 		Str("close_reason", reason)
-	if first.err != nil {
-		ev = ev.Str("error", logErrorValue(first.err))
+	if cause != nil {
+		ev = ev.Str("error", logErrorValue(cause))
 	}
 	ev.Msg(msg)
 }
