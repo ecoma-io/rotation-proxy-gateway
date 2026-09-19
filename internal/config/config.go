@@ -116,11 +116,12 @@ func splitHostPortCreds(line string) (host, port, user, pass string, ok bool) {
 func CanonicalRouteID(u *url.URL) string {
 	var creds string
 	if u.User != nil {
-		if pw, has := u.User.Password(); has {
-			creds = u.User.Username() + ":" + pw
-		} else {
-			creds = u.User.Username()
-		}
+		// Re-encode rather than concatenate the decoded user and password:
+		// the raw form keeps separator characters escaped ("%3A", "%40"),
+		// so a no-password username "u:v" can never collapse onto the
+		// username/password pair "u"/"v" (or any similar pair) the way a
+		// plain user + ":" + password concatenation does.
+		creds = u.User.String()
 	}
 	return strings.ToLower(u.Scheme) + "://" + creds + "@" + strings.ToLower(u.Hostname()) + ":" + u.Port()
 }
