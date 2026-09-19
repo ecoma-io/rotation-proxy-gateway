@@ -487,7 +487,10 @@ Each request has a process-local `request_id`. Logs additionally include
 `listener=mixed|v4|v6`, host-only `target` and `upstream`, retry attempts,
 error category, and cooldown for endpoint dial and SOCKS handshake failures.
 They never log full URLs, headers, bodies, userinfo, or the rotate-API
-configuration.
+configuration. Logs are structured JSON lines on stdout (`zerolog`: fields such
+as `level`, `time`, `msg`, `listener`, `request_id`), sized for the compose
+`json-file` driver; set `log-level` in the runtime YAML to raise verbosity
+without a restart.
 
 Every established tunnel also logs a close record with its lifetime,
 per-direction byte counts, and which side ended the stream first

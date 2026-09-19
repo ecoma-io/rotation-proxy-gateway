@@ -3,11 +3,12 @@ package config
 import (
 	"context"
 	"crypto/sha256"
-	"log/slog"
 	"os"
 	"time"
 
 	"rotation-proxy-gateway/internal/sanitize"
+
+	"github.com/rs/zerolog"
 )
 
 // DefaultPollInterval is how often the runtime config file is re-read and
@@ -33,7 +34,7 @@ type Poller struct {
 // NewPoller seeds the baseline with the content present now, so the initial
 // load is never itself reported as a change and the first write after startup
 // is always seen.
-func NewPoller(path string, interval time.Duration, log *slog.Logger) *Poller {
+func NewPoller(path string, interval time.Duration, log zerolog.Logger) *Poller {
 	return &Poller{
 		path:     path,
 		interval: interval,
@@ -48,7 +49,7 @@ func (p *Poller) Changes() <-chan struct{} { return p.changes }
 // Run polls until ctx is canceled. Read failures are skipped without logging
 // at warn: a transient replace window must not spam, and the next successful
 // read with different content signals exactly once.
-func (p *Poller) Run(ctx context.Context, log *slog.Logger) {
+func (p *Poller) Run(ctx context.Context, log zerolog.Logger) {
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 	for {
@@ -69,10 +70,10 @@ func (p *Poller) Run(ctx context.Context, log *slog.Logger) {
 	}
 }
 
-func hashFile(path string, log *slog.Logger) [sha256.Size]byte {
+func hashFile(path string, log zerolog.Logger) [sha256.Size]byte {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		log.Debug("config poll read skipped", "error", sanitize.ErrorString(err))
+		log.Debug().Str("error", sanitize.ErrorString(err)).Msg("config poll read skipped")
 		return [sha256.Size]byte{}
 	}
 	return sha256.Sum256(data)

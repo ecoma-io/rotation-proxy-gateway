@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -118,7 +117,7 @@ func TestStatusAndLogsStayCleanAfterServingFailures(t *testing.T) {
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
-	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs))
 	s.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
 		if pu.Host == dead.Host {
 			return nil, &ProxyDialError{Err: errors.New("dial socks5://route-user:route-password@dead.test:1080: connect refused")}
@@ -143,7 +142,7 @@ func TestStatusAndLogsStayCleanAfterServingFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	output := waitForLog(t, &logs, "msg=tunnel")
+	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel"})
 	for name, view := range map[string]string{"logs": output, "/status": string(body)} {
 		for _, secret := range []string{"route-user", "route-password"} {
 			if strings.Contains(view, secret) {

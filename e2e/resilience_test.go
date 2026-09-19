@@ -72,10 +72,7 @@ func TestE2E_ExhaustedPoolNoRouteWithCooldownDoubling(t *testing.T) {
 		}
 	}
 
-	out := waitForLog(t, g, "error_kind=no_route", 5*time.Second)
-	if !strings.Contains(out, "attempts=2") {
-		t.Fatalf("no_route log missing attempts=2:\n%s", out)
-	}
+	waitForLogRecord(t, g, map[string]string{"msg": "tunnel failed", "error_kind": "no_route", "attempts": "2"}, 5*time.Second)
 }
 
 // A tunnel established before a reload must keep relaying on its original
@@ -152,16 +149,25 @@ func TestE2E_TunnelBreakDoesNotMutateHealth(t *testing.T) {
 
 	// The relay writes a close record naming the lifetime and both directions'
 	// byte counts, so mid-stream drops are attributable in production logs.
-	out := waitForLog(t, g, "close_reason=", 10*time.Second)
-	for _, want := range []string{
-		"target=" + target.Host,
-		"upstream=" + socks.Addr,
-		"client_to_upstream_bytes=",
-		"upstream_to_client_bytes=",
-		"duration=",
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("close record missing %q:\n%s", want, out)
+	// Which close_reason materializes is timing-dependent (a racing FIN reads
+	// as upstream_closed, a mid-stream RST as upstream_broken), so match any
+	// close record and assert its attribution fields.
+	var closeRec logRecord
+	g.WaitForCondition(10*time.Second, "tunnel close record", func(*Status) bool {
+		for _, rec := range decodeLogRecords(g.Logs()) {
+			if recordHasKey(rec, "close_reason") {
+				closeRec = rec
+				return true
+			}
+		}
+		return false
+	})
+	if closeRec["target"] != target.Host || closeRec["upstream"] != socks.Addr {
+		t.Fatalf("close record lost route identity: %v", closeRec)
+	}
+	for _, key := range []string{"client_to_upstream_bytes", "upstream_to_client_bytes", "duration"} {
+		if !recordHasKey(closeRec, key) {
+			t.Fatalf("close record missing %q: %v", key, closeRec)
 		}
 	}
 

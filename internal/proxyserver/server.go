@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,6 +20,8 @@ import (
 
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
+
+	"github.com/rs/zerolog"
 )
 
 // inboundHandshakeTimeout bounds the client-side greeting, request, and reply
@@ -47,7 +48,7 @@ const (
 // Server is the inbound SOCKS5 listener handler.
 type Server struct {
 	store    *pool.Store
-	log      *slog.Logger
+	log      zerolog.Logger
 	version  string
 	listener string
 	allow    func(*pool.Proxy) bool
@@ -81,7 +82,7 @@ func (s *Server) ListenerStatus() ListenerStatus {
 // atomic runtime generations. Every session loads its generation once so route
 // picks, health reports, and session settings stay within one snapshot even
 // when a reload publishes a new generation in parallel.
-func NewRuntime(store *pool.Store, log *slog.Logger, version, listener string, allowed ...config.EgressKind) *Server {
+func NewRuntime(store *pool.Store, log zerolog.Logger, version, listener string, allowed ...config.EgressKind) *Server {
 	allow := func(p *pool.Proxy) bool {
 		for _, kind := range allowed {
 			if p.Kind == kind {
@@ -92,7 +93,7 @@ func NewRuntime(store *pool.Store, log *slog.Logger, version, listener string, a
 	}
 	return &Server{
 		store:     store,
-		log:       log.With("listener", listener),
+		log:       log.With().Str("listener", listener).Logger(),
 		version:   version,
 		listener:  listener,
 		allow:     allow,
@@ -188,17 +189,17 @@ func (s *Server) serveConn(conn net.Conn) {
 
 	req, err := readSocksRequest(conn)
 	if err != nil {
-		s.log.Debug("socks request rejected", "error_kind", "bad_request", "error", socksRejectLogValue(err))
+		s.log.Debug().Str("error_kind", "bad_request").Str("error", socksRejectLogValue(err)).Msg("socks request rejected")
 		return
 	}
 	if req.cmd != socksCmdConnect {
 		writeSocksReply(conn, socksReplyCmdUnsupported) //nolint:errcheck // the connection closes either way
-		s.log.Debug("socks command not supported", "error_kind", "bad_request")
+		s.log.Debug().Str("error_kind", "bad_request").Msg("socks command not supported")
 		return
 	}
 
 	requestID := s.requests.Add(1)
-	log := s.log.With("request_id", requestID)
+	log := s.log.With().Int64("request_id", int64(requestID)).Logger()
 	s.serveTunnel(conn, req.target, log)
 }
 
@@ -206,12 +207,12 @@ func (s *Server) serveConn(conn net.Conn) {
 // sends the success reply once, and relays until either side ends the stream.
 // It loads one generation for the whole session so route picks and health
 // reports stay consistent across reloads.
-func (s *Server) serveTunnel(clientConn net.Conn, target string, log *slog.Logger) {
+func (s *Server) serveTunnel(clientConn net.Conn, target string, log zerolog.Logger) {
 	gen := s.generation()
 	settings := generationSettings(gen)
 	start := time.Now()
 	logTarget := socksTargetLogValue(target)
-	log.Debug("tunnel start", "target", logTarget)
+	log.Debug().Str("target", logTarget).Msg("tunnel start")
 
 	exclude := map[*pool.Proxy]bool{}
 	var upstream net.Conn
@@ -233,31 +234,35 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, log *slog.Logge
 				cooldown := gen.Pool.ReportFailure(p, err)
 				exclude[p] = true
 				s.failovers.Add(1)
-				log.Warn("upstream dial failed", "target", logTarget, "upstream", upstreamLogValue(p),
-					"attempt", attempts, "error_kind", errorKindProxyConnect,
-					"error", logErrorValue(err), "cooldown", cooldown.String())
+				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
+					Int("attempt", attempts).Str("error_kind", errorKindProxyConnect).
+					Str("error", logErrorValue(err)).Str("cooldown", cooldown.String()).
+					Msg("upstream dial failed")
 				continue
 			case isSocksHandshakeError(err):
 				cooldown := gen.Pool.ReportFailure(p, err)
 				exclude[p] = true
 				s.failovers.Add(1)
-				log.Warn("upstream handshake failed", "target", logTarget, "upstream", upstreamLogValue(p),
-					"attempt", attempts, "error_kind", errorKindSocksConnect,
-					"error", logErrorValue(err), "cooldown", cooldown.String())
+				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
+					Int("attempt", attempts).Str("error_kind", errorKindSocksConnect).
+					Str("error", logErrorValue(err)).Str("cooldown", cooldown.String()).
+					Msg("upstream handshake failed")
 				continue
 			case isProxyAuthError(err):
 				gen.Pool.ReportAuthBlocked(p, err)
 				exclude[p] = true
 				s.failovers.Add(1)
-				log.Warn("upstream auth failed", "target", logTarget, "upstream", upstreamLogValue(p),
-					"attempt", attempts, "error_kind", errorKindAuthRoute,
-					"error", logErrorValue(err))
+				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
+					Int("attempt", attempts).Str("error_kind", errorKindAuthRoute).
+					Str("error", logErrorValue(err)).
+					Msg("upstream auth failed")
 				continue
 			default:
 				writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the connection closes either way
-				log.Warn("upstream setup failed", "target", logTarget, "upstream", upstreamLogValue(p),
-					"attempt", attempts, "error_kind", logErrorKind(err), "error", logErrorValue(err),
-					"duration", logDuration(time.Since(start)))
+				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
+					Int("attempt", attempts).Str("error_kind", logErrorKind(err)).Str("error", logErrorValue(err)).
+					Str("duration", logDuration(time.Since(start))).
+					Msg("upstream setup failed")
 				return
 			}
 		}
@@ -267,15 +272,17 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, log *slog.Logge
 	}
 	if upstream == nil {
 		writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the connection closes either way
-		log.Warn("tunnel failed", "target", logTarget, "attempts", len(exclude),
-			"error_kind", errorKindNoRoute, "duration", logDuration(time.Since(start)))
+		log.Warn().Str("target", logTarget).Int("attempts", len(exclude)).
+			Str("error_kind", errorKindNoRoute).Str("duration", logDuration(time.Since(start))).
+			Msg("tunnel failed")
 		return
 	}
 	writeSocksReply(clientConn, socksReplySuccess) //nolint:errcheck // relay shutdown handles write failure
 	// Established tunnels carry no timeouts.
 	clientConn.SetDeadline(time.Time{}) //nolint:errcheck // best-effort hardening
-	log.Info("tunnel", "target", logTarget, "upstream", upstreamLogValue(chosen),
-		"attempts", attempts, "duration", logDuration(time.Since(start)))
+	log.Info().Str("target", logTarget).Str("upstream", upstreamLogValue(chosen)).
+		Int("attempts", attempts).Str("duration", logDuration(time.Since(start))).
+		Msg("tunnel")
 
 	// Relay until either side ends the stream. Established tunnels carry no
 	// health or retry semantics; the close record is the only trace of which
@@ -457,7 +464,7 @@ const (
 // much each direction carried. An upstream-side error is a broken tunnel — the
 // client's stream died mid-flight — and logs at warn; every other close is
 // routine flow detail at debug. Tunnel closes never mutate route health.
-func recordTunnelClose(log *slog.Logger, target string, p *pool.Proxy, start time.Time, first, second relayResult) {
+func recordTunnelClose(log zerolog.Logger, target string, p *pool.Proxy, start time.Time, first, second relayResult) {
 	toClient, toUpstream := second, first
 	if first.direction == relayToClient {
 		toClient, toUpstream = first, second
@@ -471,22 +478,19 @@ func recordTunnelClose(log *slog.Logger, target string, p *pool.Proxy, start tim
 	case first.err != nil:
 		reason = "client_aborted"
 	}
-	args := []any{
-		"target", target,
-		"upstream", upstreamLogValue(p),
-		"duration", logDuration(time.Since(start)),
-		"client_to_upstream_bytes", toUpstream.bytes,
-		"upstream_to_client_bytes", toClient.bytes,
-		"close_reason", reason,
-	}
-	if first.err != nil {
-		args = append(args, "error", logErrorValue(first.err))
-	}
+	ev := log.Debug()
 	if msg == "tunnel broken" {
-		log.Warn(msg, args...)
-		return
+		ev = log.Warn()
 	}
-	log.Debug(msg, args...)
+	ev.Str("target", target).Str("upstream", upstreamLogValue(p)).
+		Str("duration", logDuration(time.Since(start))).
+		Int64("client_to_upstream_bytes", toUpstream.bytes).
+		Int64("upstream_to_client_bytes", toClient.bytes).
+		Str("close_reason", reason)
+	if first.err != nil {
+		ev = ev.Str("error", logErrorValue(first.err))
+	}
+	ev.Msg(msg)
 }
 
 func (s *Server) trackConn(c net.Conn) {

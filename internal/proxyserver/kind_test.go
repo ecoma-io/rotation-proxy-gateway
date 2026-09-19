@@ -2,8 +2,6 @@ package proxyserver
 
 import (
 	"encoding/json"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -11,6 +9,7 @@ import (
 	"time"
 
 	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/logging"
 	"rotation-proxy-gateway/internal/pool"
 )
 
@@ -27,7 +26,7 @@ func TestSettingsFollowPublishedGeneration(t *testing.T) {
 		Routes:       []config.RouteSpec{{URL: a, Kind: config.EgressV4}},
 	}
 	store := pool.NewStore(initial, pool.NewRoutes(initial.Routes, time.Second, time.Minute, config.KindBalance{}))
-	server := NewRuntime(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "test", "mixed", config.EgressV4, config.EgressV6)
+	server := NewRuntime(store, logging.Nop(), "test", "mixed", config.EgressV4, config.EgressV6)
 
 	b, err := url.Parse("socks5://b.test:1080")
 	if err != nil {
@@ -72,7 +71,7 @@ func TestGenerationIsolatesInFlightWork(t *testing.T) {
 		Routes:       []config.RouteSpec{{URL: a, Kind: config.EgressV4}},
 	}
 	store := pool.NewStore(initial, pool.NewRoutes(initial.Routes, time.Second, time.Minute, config.KindBalance{}))
-	server := NewRuntime(store, slog.New(slog.NewTextHandler(io.Discard, nil)), "test", "mixed", config.EgressV4, config.EgressV6)
+	server := NewRuntime(store, logging.Nop(), "test", "mixed", config.EgressV4, config.EgressV6)
 
 	inFlight := server.generation()
 	inFlightSettings := generationSettings(inFlight)
@@ -157,14 +156,14 @@ func TestListenerLogsItsNameAndAdminAggregatesStatus(t *testing.T) {
 	pl := pool.NewRoutes([]config.RouteSpec{{URL: fs.URL, Kind: config.EgressV4}}, time.Second, time.Minute, config.KindBalance{})
 	runtime := pool.NewStore(&config.RuntimeConfig{MaxRetries: 1, DialTimeout: time.Second}, pl)
 	var logs safeLogBuffer
-	srv := NewRuntime(runtime, captureLogger(&logs, slog.LevelDebug), "test", "v4", config.EgressV4)
+	srv := NewRuntime(runtime, captureLogger(&logs), "test", "v4", config.EgressV4)
 	addr := startServer(t, srv)
 
 	conn := socksDialVia(t, addr, startRawEchoTarget(t))
 	readBanner(t, conn)
 	_ = conn.Close()
-	if got := waitForLog(t, &logs, "listener=v4"); got == "" {
-		t.Fatal("listener log missing")
+	if got := waitForRecord(t, &logs, map[string]string{"msg": "tunnel", "listener": "v4"}); got == "" {
+		t.Fatal("listener tunnel record missing")
 	}
 
 	admin := httptest.NewServer(AdminMux("test", time.Now(), runtime, map[string]*Server{"v4": srv}, nil))

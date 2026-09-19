@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -33,7 +32,7 @@ func TestE2E_ReloadAddsRoute(t *testing.T) {
 
 	cfg.Routes = append(cfg.Routes, RouteConfig{Proxy: second.RouteValue(), Kind: "v6"})
 	g.ReloadConfig(cfg, []string{first.Addr, second.Addr})
-	waitForLog(t, g, `source=poll`, reloadSettle)
+	waitForLogRecord(t, g, map[string]string{"msg": "configuration reloaded", "source": "poll"}, reloadSettle)
 
 	// Both families now serve through their dedicated listeners.
 	GetVia(t, ProxyClient(g.V4Addr), target.URL+"/", "e2e-echo:/")
@@ -154,7 +153,7 @@ proxies:
 			g.ReloadConfigRaw(raw)
 			// The poller must reject the file within one poll cycle and log the
 			// sanitized warning while the old generation keeps serving.
-			waitForLog(t, g, "reload failed", reloadSettle)
+			waitForLogRecord(t, g, map[string]string{"msg": "reload failed; keeping previous configuration"}, reloadSettle)
 			GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
 		})
 	}
@@ -290,17 +289,19 @@ func TestE2E_ReloadAppliesLogLevel(t *testing.T) {
 	g := NewGateway(t, cfg)
 
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
-	if out := g.Logs(); strings.Contains(out, `msg="tunnel start"`) {
-		t.Fatalf("debug line present at info level:\n%s", out)
+	for _, rec := range decodeLogRecords(g.Logs()) {
+		if rec["msg"] == "tunnel start" {
+			t.Fatalf("debug record present at info level: %v", rec)
+		}
 	}
 
 	cfg.LogLevel = "debug"
 	g.ReloadConfig(cfg, []string{socks.Addr})
 	// This reload leaves the pool unchanged, so ReloadConfig cannot wait for
 	// it to apply; wait for the reload log instead of the pool snapshot.
-	waitForLog(t, g, `msg="configuration reloaded"`, reloadSettle)
+	waitForLogRecord(t, g, map[string]string{"msg": "configuration reloaded"}, reloadSettle)
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
-	waitForLog(t, g, `msg="tunnel start"`, reloadSettle)
+	waitForLogRecord(t, g, map[string]string{"msg": "tunnel start"}, reloadSettle)
 }
 
 func TestE2E_ReloadDoesNotDropInFlight(t *testing.T) {

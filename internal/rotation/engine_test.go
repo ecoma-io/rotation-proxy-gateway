@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -17,7 +16,10 @@ import (
 	"time"
 
 	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/logging"
 	"rotation-proxy-gateway/internal/pool"
+
+	"github.com/rs/zerolog"
 )
 
 // fastSettings keeps procedure tests quick while staying internally valid.
@@ -108,13 +110,9 @@ func testEngine(t *testing.T, ips *ipServer, store *pool.Store, routeFail *atomi
 	return e
 }
 
-func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(discardWriter{}, nil))
+func discardLogger() zerolog.Logger {
+	return logging.Nop()
 }
-
-type discardWriter struct{}
-
-func (discardWriter) Write(p []byte) (int, error) { return len(p), nil }
 
 func testPool(t *testing.T, cfg *config.RuntimeConfig) *pool.Pool {
 	t.Helper()

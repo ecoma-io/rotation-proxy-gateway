@@ -14,17 +14,68 @@ import (
 	"time"
 )
 
-func waitForLog(t *testing.T, g *Gateway, want string, timeout time.Duration) string {
+// logRecord is one decoded JSON log line from the gateway process. The
+// gateway logs zerolog JSON on stdout, so assertions match fields, not text.
+type logRecord map[string]any
+
+func decodeLogRecords(output string) []logRecord {
+	var recs []logRecord
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var rec logRecord
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		recs = append(recs, rec)
+	}
+	return recs
+}
+
+// recordHas reports whether rec carries every wanted key with an equal string
+// rendering (JSON numbers decode as float64, which fmt.Sprint normalizes:
+// float64(2) renders "2").
+func recordHas(rec logRecord, want map[string]string) bool {
+	for k, v := range want {
+		got, ok := rec[k]
+		if !ok || fmt.Sprint(got) != v {
+			return false
+		}
+	}
+	return true
+}
+
+func recordHasKey(rec logRecord, key string) bool {
+	_, ok := rec[key]
+	return ok
+}
+
+func findLogRecord(recs []logRecord, want map[string]string) (logRecord, bool) {
+	for _, rec := range recs {
+		if recordHas(rec, want) {
+			return rec, true
+		}
+	}
+	return nil, false
+}
+
+// waitForLogRecord polls the gateway log until one record carries every
+// wanted key/value pair, then returns the whole decoded log for further
+// record-scoped assertions.
+func waitForLogRecord(t *testing.T, g *Gateway, want map[string]string, timeout time.Duration) []logRecord {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if out := g.Logs(); strings.Contains(out, want) {
-			return out
+		recs := decodeLogRecords(g.Logs())
+		if _, ok := findLogRecord(recs, want); ok {
+			return recs
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("logs missing %q:\n%s", want, g.Logs())
-	return ""
+	t.Fatalf("logs missing record %v:\n%s", want, g.Logs())
+	return nil
 }
 
 // isConnResetError reports connection-reset errors seen when the server closes
@@ -168,9 +219,9 @@ func TestE2E_DialFailureFallsBackWithCooldown(t *testing.T) {
 	if st.Pool[0].CooldownFor == "0s" {
 		t.Fatalf("dead route should cool down: %+v", st.Pool[0])
 	}
-	out := waitForLog(t, g, "error_kind=proxy_connect", 5*time.Second)
-	if !strings.Contains(out, "attempts=2") {
-		t.Fatalf("logs missing fallback attempts=2:\n%s", out)
+	recs := waitForLogRecord(t, g, map[string]string{"error_kind": "proxy_connect"}, 5*time.Second)
+	if _, ok := findLogRecord(recs, map[string]string{"msg": "tunnel", "attempts": "2"}); !ok {
+		t.Fatalf("logs missing the fallback tunnel record with attempts=2:\n%s", g.Logs())
 	}
 }
 
@@ -199,10 +250,13 @@ func TestE2E_AuthFailureFallsBackWithoutCooldown(t *testing.T) {
 	if st.Pool[0].CooldownFor != "0s" {
 		t.Fatalf("auth failure must not create cooldown: %+v", st.Pool[0])
 	}
-	out := waitForLog(t, g, "error_kind=auth_route", 5*time.Second)
-	if strings.Contains(out, "cooldown=") {
-		// auth lines never carry cooldown; the dial line is absent in this test.
-		t.Fatalf("auth fallback logged a cooldown:\n%s", out)
+	recs := waitForLogRecord(t, g, map[string]string{"error_kind": "auth_route"}, 5*time.Second)
+	for _, rec := range recs {
+		// No record in this test may carry a cooldown: the only failure is the
+		// auth block, which never creates dial cooldown.
+		if recordHasKey(rec, "cooldown") {
+			t.Fatalf("auth fallback logged a cooldown: %v", rec)
+		}
 	}
 }
 
@@ -229,9 +283,10 @@ func TestE2E_SocksHandshakeFailureExhaustsToNoRoute(t *testing.T) {
 	if st.Pool[0].CooldownFor == "0s" {
 		t.Fatalf("rejecting route should cool down: %+v", st.Pool[0])
 	}
-	out := waitForLog(t, g, "error_kind=socks_connect", 5*time.Second)
-	if !strings.Contains(out, "cooldown=") {
-		t.Fatalf("handshake failure line missing cooldown:\n%s", out)
+	recs := waitForLogRecord(t, g, map[string]string{"error_kind": "socks_connect"}, 5*time.Second)
+	rec, ok := findLogRecord(recs, map[string]string{"error_kind": "socks_connect"})
+	if !ok || !recordHasKey(rec, "cooldown") {
+		t.Fatalf("handshake failure record missing cooldown: %v", rec)
 	}
 }
 
@@ -258,9 +313,9 @@ func TestE2E_HandshakeFailureFallsBackWithCooldown(t *testing.T) {
 	if st.Pool[0].CooldownFor == "0s" {
 		t.Fatalf("rejecting route should cool down: %+v", st.Pool[0])
 	}
-	out := waitForLog(t, g, "error_kind=socks_connect", 5*time.Second)
-	if !strings.Contains(out, "attempts=2") {
-		t.Fatalf("logs missing fallback attempts=2:\n%s", out)
+	recs := waitForLogRecord(t, g, map[string]string{"error_kind": "socks_connect"}, 5*time.Second)
+	if _, ok := findLogRecord(recs, map[string]string{"msg": "tunnel", "attempts": "2"}); !ok {
+		t.Fatalf("logs missing the fallback tunnel record with attempts=2:\n%s", g.Logs())
 	}
 }
 
@@ -292,9 +347,9 @@ func TestE2E_ConnectTunnelHandshakeFailureFallsBack(t *testing.T) {
 	if st.Pool[0].CooldownFor == "0s" {
 		t.Fatalf("rejecting route should cool down: %+v", st.Pool[0])
 	}
-	out := waitForLog(t, g, "error_kind=socks_connect", 5*time.Second)
-	if !strings.Contains(out, "attempts=2") {
-		t.Fatalf("logs missing fallback attempts=2:\n%s", out)
+	recs := waitForLogRecord(t, g, map[string]string{"error_kind": "socks_connect"}, 5*time.Second)
+	if _, ok := findLogRecord(recs, map[string]string{"msg": "tunnel", "attempts": "2"}); !ok {
+		t.Fatalf("logs missing the fallback tunnel record with attempts=2:\n%s", g.Logs())
 	}
 }
 
@@ -348,7 +403,7 @@ func TestE2E_NoCredentialLeak(t *testing.T) {
 	}))
 
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
-	waitForLog(t, g, "msg=tunnel", 5*time.Second)
+	waitForLogRecord(t, g, map[string]string{"msg": "tunnel"}, 5*time.Second)
 
 	resp, err := http.Get("http://" + g.AdminAddr + "/status")
 	if err != nil {
@@ -407,7 +462,7 @@ func TestE2E_ManualRouteServesWithoutExposingSecrets(t *testing.T) {
 	// The pool's only route is the manual one, so a successful request
 	// proves manual routes serve.
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
-	waitForLog(t, g, "msg=tunnel", 5*time.Second)
+	waitForLogRecord(t, g, map[string]string{"msg": "tunnel"}, 5*time.Second)
 	// Wait out the boot baseline precheck so its logging is complete before
 	// the leak assertions below.
 	waitRotation(t, g, socks, "recorded its boot baseline", func(v *RotationView) bool {
@@ -554,5 +609,5 @@ func TestE2E_InboundGreetingReject(t *testing.T) {
 	if got := socks.Hits.Load(); got != 0 {
 		t.Fatalf("SOCKS attempts=%d, want 0 (no route dialed)", got)
 	}
-	waitForLog(t, g, "error_kind=bad_request", 5*time.Second)
+	waitForLogRecord(t, g, map[string]string{"error_kind": "bad_request"}, 5*time.Second)
 }

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,14 +17,23 @@ import (
 	"time"
 
 	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/logging"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/proxyserver"
 	"rotation-proxy-gateway/internal/rotation"
 	"rotation-proxy-gateway/internal/sanitize"
+
+	"github.com/rs/zerolog"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=...".
 var version = "0.1.0-dev"
+
+// fatalLog reports startup failures before any configuration is available.
+// It is deliberately ungated (no global level is set yet) and writes to the
+// same stdout stream as the runtime logger so all structured output stays on
+// one stream for the json-file log driver.
+var fatalLog = logging.New(os.Stdout)
 
 func main() {
 	if len(os.Args) > 1 {
@@ -38,7 +46,7 @@ func main() {
 		}
 	}
 	if err := run(); err != nil {
-		slog.Error("fatal", "err", sanitize.ErrorString(err))
+		fatalLog.Error().Str("err", sanitize.ErrorString(err)).Msg("fatal")
 		os.Exit(1)
 	}
 }
@@ -87,7 +95,7 @@ type runningListener struct {
 	ln     net.Listener
 }
 
-func warnUnavailableKindListeners(log *slog.Logger, cfg *config.RuntimeConfig, bootstrap *config.BootstrapConfig) {
+func warnUnavailableKindListeners(log zerolog.Logger, cfg *config.RuntimeConfig, bootstrap *config.BootstrapConfig) {
 	var v4, v6 int
 	for _, route := range cfg.AllRoutes() {
 		switch route.Kind {
@@ -98,10 +106,10 @@ func warnUnavailableKindListeners(log *slog.Logger, cfg *config.RuntimeConfig, b
 		}
 	}
 	if bootstrap.V4ListenAddr != "" && v4 == 0 {
-		log.Warn("listener has no eligible routes; replying a general SOCKS failure", "listener", "v4")
+		log.Warn().Str("listener", "v4").Msg("listener has no eligible routes; replying a general SOCKS failure")
 	}
 	if bootstrap.V6ListenAddr != "" && v6 == 0 {
-		log.Warn("listener has no eligible routes; replying a general SOCKS failure", "listener", "v6")
+		log.Warn().Str("listener", "v6").Msg("listener has no eligible routes; replying a general SOCKS failure")
 	}
 }
 
@@ -115,7 +123,7 @@ func run() error {
 		return err
 	}
 
-	log, level := setupDynamicLogger(runtimeCfg.LogLevel)
+	log := setupDynamicLogger(runtimeCfg.LogLevel)
 	warnUnavailableKindListeners(log, runtimeCfg, bootstrap)
 	// The store publishes one immutable generation (validated config + pool
 	// snapshot). Handlers load it once per operation; reload builds the next
@@ -167,7 +175,7 @@ func run() error {
 	for _, listener := range listeners {
 		listener := listener
 		go func() {
-			log.Info("proxy listening", "listener", listener.name, "addr", listener.ln.Addr().String(), "version", version)
+			log.Info().Str("listener", listener.name).Str("addr", listener.ln.Addr().String()).Str("version", version).Msg("proxy listening")
 			// Serve returns nil once shutdown closes the listener.
 			if err := listener.server.Serve(listener.ln); err != nil {
 				errCh <- fmt.Errorf("%s listener: %w", listener.name, err)
@@ -175,7 +183,7 @@ func run() error {
 		}()
 	}
 	go func() {
-		log.Info("admin listening", "addr", bootstrap.AdminAddr)
+		log.Info().Str("addr", bootstrap.AdminAddr).Msg("admin listening")
 		if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("admin listener: %w", err)
 		}
@@ -202,16 +210,18 @@ func run() error {
 	reload := func(source string) {
 		next, err := config.LoadRuntime(bootstrap.ConfigFile, bootstrap)
 		if err != nil {
-			log.Warn("reload failed; keeping previous configuration", "source", source, "error", sanitize.ErrorString(err))
+			log.Warn().Str("source", source).Str("error", sanitize.ErrorString(err)).Msg("reload failed; keeping previous configuration")
 			return
 		}
 		// LoadRuntime fully validates before Publish builds the next pool
 		// snapshot and swaps the whole generation. Invalid input keeps the
 		// previous generation (and its route health) serving untouched.
 		store.Publish(next)
-		level.Set(parseSlogLevel(next.LogLevel))
+		// Only this goroutine writes the global level, so the package-global
+		// atomic swap is race-free and every future event picks it up.
+		zerolog.SetGlobalLevel(parseZerologLevel(next.LogLevel))
 		warnUnavailableKindListeners(log, next, bootstrap)
-		log.Info("configuration reloaded", "source", source, "upstreams", len(next.AllRoutes()))
+		log.Info().Str("source", source).Int("upstreams", len(next.AllRoutes())).Msg("configuration reloaded")
 	}
 
 	for {
@@ -220,7 +230,7 @@ func run() error {
 			shutdownAll(engineCancel, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return err
 		case sig := <-sigCh:
-			log.Info("shutting down", "signal", sig.String(), "grace", bootstrap.ShutdownGrace.String())
+			log.Info().Str("signal", sig.String()).Str("grace", bootstrap.ShutdownGrace.String()).Msg("shutting down")
 			shutdownAll(engineCancel, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return nil
 		case <-poller.Changes():
@@ -252,27 +262,27 @@ func shutdownServer(server *http.Server, ctx context.Context) {
 	server.Shutdown(ctx) //nolint:errcheck // best-effort
 }
 
-func parseSlogLevel(level string) slog.Level {
+func parseZerologLevel(level string) zerolog.Level {
 	switch level {
 	case "debug":
-		return slog.LevelDebug
+		return zerolog.DebugLevel
 	case "warn":
-		return slog.LevelWarn
+		return zerolog.WarnLevel
 	case "error":
-		return slog.LevelError
+		return zerolog.ErrorLevel
 	default:
-		return slog.LevelInfo
+		return zerolog.InfoLevel
 	}
 }
 
-func setupDynamicLogger(level string) (*slog.Logger, *slog.LevelVar) {
-	var current slog.LevelVar
-	current.Set(parseSlogLevel(level))
-	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: &current})), &current
+// setupDynamicLogger installs the initial global level (the reload loop is
+// the only other writer) and returns the process logger.
+func setupDynamicLogger(level string) zerolog.Logger {
+	zerolog.SetGlobalLevel(parseZerologLevel(level))
+	return logging.New(os.Stdout)
 }
 
 // setupLogger remains available to callers that only need a fixed logger.
-func setupLogger(level string) *slog.Logger {
-	log, _ := setupDynamicLogger(level)
-	return log
+func setupLogger(level string) zerolog.Logger {
+	return setupDynamicLogger(level)
 }

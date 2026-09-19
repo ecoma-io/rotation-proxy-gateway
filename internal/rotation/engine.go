@@ -9,7 +9,6 @@ package rotation
 import (
 	"context"
 	"crypto/tls"
-	"log/slog"
 	"net"
 	"net/url"
 	"sync"
@@ -20,6 +19,8 @@ import (
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/sanitize"
 	"rotation-proxy-gateway/internal/socksdial"
+
+	"github.com/rs/zerolog"
 )
 
 const (
@@ -38,7 +39,7 @@ const (
 // one Engine; all methods are safe for concurrent use.
 type Engine struct {
 	store *pool.Store
-	log   *slog.Logger
+	log   zerolog.Logger
 	// Now is the clock used for scheduling; tests replace it.
 	Now func() time.Time
 
@@ -58,7 +59,7 @@ type Engine struct {
 }
 
 // New builds an Engine over a generation store.
-func New(store *pool.Store, log *slog.Logger) *Engine {
+func New(store *pool.Store, log zerolog.Logger) *Engine {
 	return &Engine{
 		store:  store,
 		log:    log,
@@ -132,8 +133,7 @@ func (e *Engine) bootPrecheck(ctx context.Context, gen *pool.Generation) {
 		}
 		first, ok := e.baselineProbe(ctx, gen, spec, gen.Config.Rotation.IPCheckTimeout)
 		if !ok {
-			e.log.Warn("boot baseline probe failed; the route starts unverified",
-				"route", p.URL.Host)
+			e.log.Warn().Str("route", p.URL.Host).Msg("boot baseline probe failed; the route starts unverified")
 			continue
 		}
 		second, ok := e.baselineProbe(ctx, gen, spec, gen.Config.Rotation.IPCheckTimeout)
@@ -142,8 +142,7 @@ func (e *Engine) bootPrecheck(ctx context.Context, gen *pool.Generation) {
 			continue
 		}
 		if first != second {
-			e.log.Warn("route egress IP changed between boot probes without a rotation; provider IPs are not sticky",
-				"route", p.URL.Host)
+			e.log.Warn().Str("route", p.URL.Host).Msg("route egress IP changed between boot probes without a rotation; provider IPs are not sticky")
 		}
 		p.SetBaselineIP(second)
 	}
@@ -218,10 +217,10 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	}
 
 	settings := gen.Config.Rotation
-	log := e.log.With("route", p.URL.Host, "kind", string(p.Kind))
+	log := e.log.With().Str("route", p.URL.Host).Str("kind", string(p.Kind)).Logger()
 
 	p.BeginRotation(pool.RotationDraining)
-	log.Debug("rotation procedure started", "phase", "draining")
+	log.Debug().Str("phase", "draining").Msg("rotation procedure started")
 
 	// 1. Drain in-flight work, bounded by rotation.drain-timeout. Expiry
 	// abandons the wait and rotates anyway: in-flight work keeps running
@@ -229,7 +228,7 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	drainDeadline := e.Now().Add(settings.DrainTimeout)
 	for p.InFlight() > 0 {
 		if !e.Now().Before(drainDeadline) {
-			log.Warn("drain timeout expired; forcing rotation")
+			log.Warn().Msg("drain timeout expired; forcing rotation")
 			break
 		}
 		if gone() {
@@ -255,7 +254,7 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 		return
 	}
 	if !verified {
-		log.Warn("baseline probe failed; rotating without IP comparison")
+		log.Warn().Msg("baseline probe failed; rotating without IP comparison")
 	}
 
 	// 3. Call the provider rotate API, directly — never through the pool.
@@ -271,7 +270,7 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 		return
 	}
 	if apiErr != nil {
-		log.Warn("rotate API call failed", "error", sanitize.ErrorString(apiErr))
+		log.Warn().Str("error", sanitize.ErrorString(apiErr)).Msg("rotate API call failed")
 	}
 	if !changed {
 		consecutive := e.bumpConsecutive(id)
@@ -281,8 +280,7 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 		}
 		gen.Pool.MarkStale(p, backoff, consecutive)
 		e.setDue(id, e.Now().Add(backoff))
-		log.Warn("rotation did not change the egress IP; retrying",
-			"consecutive_same_ip", consecutive, "retry_in", backoff.Truncate(time.Millisecond).String())
+		log.Warn().Int("consecutive_same_ip", consecutive).Str("retry_in", backoff.Truncate(time.Millisecond).String()).Msg("rotation did not change the egress IP; retrying")
 		return
 	}
 
@@ -293,8 +291,7 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	p.EndRotation(newIP, e.Now())
 	e.rotations.Add(1)
 	e.setDue(id, e.Now().Add(spec.RotateInterval))
-	log.Info("rotation complete", "egress_ip", newIP,
-		"next_in", spec.RotateInterval.Truncate(time.Millisecond).String())
+	log.Info().Str("egress_ip", newIP).Str("next_in", spec.RotateInterval.Truncate(time.Millisecond).String()).Msg("rotation complete")
 }
 
 // verify polls the route's egress IP until it differs from the baseline and

@@ -2,10 +2,8 @@ package main
 
 import (
 	"bytes"
-	"context"
+	"encoding/json"
 	"errors"
-	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,8 +14,11 @@ import (
 	"time"
 
 	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/logging"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/proxyserver"
+
+	"github.com/rs/zerolog"
 )
 
 func TestHealthcheckURL(t *testing.T) {
@@ -167,24 +168,30 @@ func warnTestBootstrap(v4, v6 string) *config.BootstrapConfig {
 func captureWarnOutput(t *testing.T, cfg *config.RuntimeConfig, bootstrap *config.BootstrapConfig) string {
 	t.Helper()
 	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	// Warn level on the logger itself keeps the capture hermetic even though
+	// the reload loop mutates the process-global level in production.
+	log := logging.New(&buf).Level(zerolog.WarnLevel)
 	warnUnavailableKindListeners(log, cfg, bootstrap)
 	return buf.String()
 }
 
+// warnUnavailableListenerMsg is the fixed message of the
+// warnUnavailableKindListeners records; the listener name rides in a field.
+const warnUnavailableListenerMsg = "listener has no eligible routes; replying a general SOCKS failure"
+
 func TestWarnUnavailableKindListeners(t *testing.T) {
 	v4only := warnTestConfig(t, config.EgressV4)
 	out := captureWarnOutput(t, v4only, warnTestBootstrap(":30122", ":30123"))
-	if !strings.Contains(out, "listener=v6") {
+	if !findWarnListener(out, "v6") {
 		t.Fatalf("v4-only pool did not warn for v6 listener:\n%s", out)
 	}
-	if strings.Contains(out, "listener=v4") {
+	if findWarnListener(out, "v4") {
 		t.Fatalf("v4-only pool warned for v4 listener:\n%s", out)
 	}
 
 	v6only := warnTestConfig(t, config.EgressV6)
 	out = captureWarnOutput(t, v6only, warnTestBootstrap(":30122", ":30123"))
-	if !strings.Contains(out, "listener=v4") {
+	if !findWarnListener(out, "v4") {
 		t.Fatalf("v6-only pool did not warn for v4 listener:\n%s", out)
 	}
 
@@ -238,10 +245,32 @@ func TestBootstrapShutdownGraceEnv(t *testing.T) {
 	})
 }
 
-func newTestLogger() *slog.Logger {
-	// Error level keeps the output clean: pre-greeting conns killed by the
-	// shutdown tests log at debug, and dropped tunnels at warn.
-	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+// findWarnListener reports whether output carries a
+// warnUnavailableKindListeners record for the named listener.
+func findWarnListener(output, listener string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var rec struct {
+			Msg      string `json:"msg"`
+			Listener string `json:"listener"`
+		}
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		if rec.Msg == warnUnavailableListenerMsg && rec.Listener == listener {
+			return true
+		}
+	}
+	return false
+}
+
+func newTestLogger() zerolog.Logger {
+	// Discard everything: pre-greeting conns killed by the shutdown tests log
+	// at debug, and dropped tunnels at warn.
+	return zerolog.Nop()
 }
 
 // newTestStore builds a pool store with no routes: the shutdown tests exercise
@@ -468,31 +497,22 @@ func TestShutdownAllDrainsCompletedSessionsImmediately(t *testing.T) {
 	}
 }
 
-func TestSetupLoggerLevels(t *testing.T) {
+func TestParseZerologLevel(t *testing.T) {
 	cases := []struct {
-		level                  string
-		debug, info, warn, err bool
+		level string
+		want  zerolog.Level
 	}{
-		{level: "debug", debug: true, info: true, warn: true, err: true},
-		{level: "info", debug: false, info: true, warn: true, err: true},
-		{level: "warn", debug: false, info: false, warn: true, err: true},
-		{level: "error", debug: false, info: false, warn: false, err: true},
+		{level: "debug", want: zerolog.DebugLevel},
+		{level: "info", want: zerolog.InfoLevel},
+		{level: "warn", want: zerolog.WarnLevel},
+		{level: "error", want: zerolog.ErrorLevel},
+		{level: "", want: zerolog.InfoLevel},
+		{level: "nonsense", want: zerolog.InfoLevel},
 	}
-	ctx := context.Background()
 	for _, tc := range cases {
 		t.Run(tc.level, func(t *testing.T) {
-			log := setupLogger(tc.level)
-			if got := log.Enabled(ctx, slog.LevelDebug); got != tc.debug {
-				t.Errorf("level %q debug enabled = %v, want %v", tc.level, got, tc.debug)
-			}
-			if got := log.Enabled(ctx, slog.LevelInfo); got != tc.info {
-				t.Errorf("level %q info enabled = %v, want %v", tc.level, got, tc.info)
-			}
-			if got := log.Enabled(ctx, slog.LevelWarn); got != tc.warn {
-				t.Errorf("level %q warn enabled = %v, want %v", tc.level, got, tc.warn)
-			}
-			if got := log.Enabled(ctx, slog.LevelError); got != tc.err {
-				t.Errorf("level %q error enabled = %v, want %v", tc.level, got, tc.err)
+			if got := parseZerologLevel(tc.level); got != tc.want {
+				t.Errorf("parseZerologLevel(%q) = %v, want %v", tc.level, got, tc.want)
 			}
 		})
 	}

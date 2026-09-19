@@ -2,12 +2,12 @@ package config
 
 import (
 	"context"
-	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"rotation-proxy-gateway/internal/logging"
 )
 
 func TestPollerDetectsContentChanges(t *testing.T) {
@@ -15,7 +15,7 @@ func TestPollerDetectsContentChanges(t *testing.T) {
 	if err := os.WriteFile(path, []byte("a: 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	log := logging.Nop()
 	p := NewPoller(path, 5*time.Millisecond, log)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,15 +18,18 @@ import (
 	"time"
 
 	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/logging"
 	"rotation-proxy-gateway/internal/pool"
+
+	"github.com/rs/zerolog"
 )
 
-func testLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+func testLogger() zerolog.Logger {
+	return logging.Nop()
 }
 
-func captureLogger(w io.Writer, level slog.Level) *slog.Logger {
-	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level}))
+func captureLogger(w io.Writer) zerolog.Logger {
+	return logging.New(w)
 }
 
 type safeLogBuffer struct {
@@ -47,16 +49,69 @@ func (b *safeLogBuffer) String() string {
 	return b.b.String()
 }
 
-func waitForLog(t *testing.T, logs *safeLogBuffer, want string) string {
+// record is one decoded JSON log line.
+type record map[string]any
+
+func decodeRecords(output string) []record {
+	var recs []record
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var rec record
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		recs = append(recs, rec)
+	}
+	return recs
+}
+
+// recordMatches reports whether rec carries every wanted key with an equal
+// string rendering (JSON numbers decode as float64, which fmt.Sprint
+// normalizes: float64(2) renders "2").
+func recordMatches(rec record, want map[string]string) bool {
+	for k, v := range want {
+		got, ok := rec[k]
+		if !ok || fmt.Sprint(got) != v {
+			return false
+		}
+	}
+	return true
+}
+
+func findRecord(output string, want map[string]string) (record, bool) {
+	for _, rec := range decodeRecords(output) {
+		if recordMatches(rec, want) {
+			return rec, true
+		}
+	}
+	return nil, false
+}
+
+func countRecords(output string, want map[string]string) int {
+	n := 0
+	for _, rec := range decodeRecords(output) {
+		if recordMatches(rec, want) {
+			n++
+		}
+	}
+	return n
+}
+
+// waitForRecord polls the captured log until one record carries every wanted
+// key/value pair, then returns the whole output for further checks.
+func waitForRecord(t *testing.T, logs *safeLogBuffer, want map[string]string) string {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
 	for {
 		output := logs.String()
-		if strings.Contains(output, want) {
+		if _, ok := findRecord(output, want); ok {
 			return output
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("logs missing %q:\n%s", want, output)
+			t.Fatalf("logs missing record %v:\n%s", want, output)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -79,7 +134,7 @@ func mixedRoutes(urls ...*url.URL) []config.RouteSpec {
 	return routes
 }
 
-func newRuntimeServer(pl *pool.Pool, runtime *config.RuntimeConfig, log *slog.Logger, allowed ...config.EgressKind) *Server {
+func newRuntimeServer(pl *pool.Pool, runtime *config.RuntimeConfig, log zerolog.Logger, allowed ...config.EgressKind) *Server {
 	// The store shares the test pool pointer so health assertions on pl keep
 	// observing the serving pool until a test publishes a new generation.
 	return NewRuntime(pool.NewStore(runtime, pl), log, "test", "mixed", allowed...)
@@ -111,7 +166,7 @@ func startServer(t *testing.T, srv *Server) string {
 	return ln.Addr().String()
 }
 
-func newSocksServer(t *testing.T, pl *pool.Pool, runtime *config.RuntimeConfig, log *slog.Logger, allowed ...config.EgressKind) (*Server, string) {
+func newSocksServer(t *testing.T, pl *pool.Pool, runtime *config.RuntimeConfig, log zerolog.Logger, allowed ...config.EgressKind) (*Server, string) {
 	t.Helper()
 	srv := newRuntimeServer(pl, runtime, log, allowed...)
 	return srv, startServer(t, srv)
@@ -119,7 +174,7 @@ func newSocksServer(t *testing.T, pl *pool.Pool, runtime *config.RuntimeConfig, 
 
 // newRunningServer builds the common fixture: one SOCKS server over a pool
 // holding the given upstream routes, already listening.
-func newRunningServer(t *testing.T, log *slog.Logger, socks ...*fakeSocks) (*Server, string, *pool.Pool) {
+func newRunningServer(t *testing.T, log zerolog.Logger, socks ...*fakeSocks) (*Server, string, *pool.Pool) {
 	t.Helper()
 	urls := make([]*url.URL, 0, len(socks))
 	for _, fs := range socks {
@@ -615,7 +670,7 @@ func TestProtocolRejectsNeverTouchPoolOrCounters(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
-	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
 	greeting := socksGreetingFrame(socksAuthNone)
 	cases := []socksRejectCase{
@@ -676,13 +731,13 @@ func TestProtocolRejectsNeverTouchPoolOrCounters(t *testing.T) {
 	}
 
 	output := logs.String()
-	if got := strings.Count(output, "error_kind=bad_request"); got != len(cases) {
-		t.Fatalf("bad_request log lines = %d, want %d:\n%s", got, len(cases), output)
+	if got := countRecords(output, map[string]string{"error_kind": "bad_request"}); got != len(cases) {
+		t.Fatalf("bad_request records = %d, want %d:\n%s", got, len(cases), output)
 	}
-	if !strings.Contains(output, "socks request rejected") {
+	if _, ok := findRecord(output, map[string]string{"msg": "socks request rejected", "error_kind": "bad_request"}); !ok {
 		t.Fatalf("parse rejects were not logged as rejections:\n%s", output)
 	}
-	if !strings.Contains(output, "socks command not supported") {
+	if _, ok := findRecord(output, map[string]string{"msg": "socks command not supported", "error_kind": "bad_request"}); !ok {
 		t.Fatalf("BIND/UDP rejects were not logged as unsupported commands:\n%s", output)
 	}
 }
@@ -696,7 +751,7 @@ func TestDialFailureCooldownsRouteExcludedAndFallsBack(t *testing.T) {
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
-	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs))
 	s.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
 		if pu.Host == dead.Host {
 			return nil, &ProxyDialError{Err: errors.New("connect refused")}
@@ -719,18 +774,15 @@ func TestDialFailureCooldownsRouteExcludedAndFallsBack(t *testing.T) {
 	if status := s.ListenerStatus(); status.Requests != 1 || status.Failovers != 1 {
 		t.Fatalf("listener status = %+v, want one request and one fallback", status)
 	}
-	output := waitForLog(t, &logs, "msg=tunnel")
-	for _, want := range []string{
-		"request_id=1",
-		"msg=\"upstream dial failed\"",
-		"error_kind=proxy_connect",
-		"cooldown=30s",
-		"msg=tunnel",
-		"attempts=2",
-	} {
-		if !strings.Contains(output, want) {
-			t.Errorf("logs missing %q:\n%s", want, output)
-		}
+	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel"})
+	if _, ok := findRecord(output, map[string]string{
+		"msg": "upstream dial failed", "request_id": "1",
+		"error_kind": "proxy_connect", "cooldown": "30s",
+	}); !ok {
+		t.Errorf("logs missing the dial-failure record:\n%s", output)
+	}
+	if _, ok := findRecord(output, map[string]string{"msg": "tunnel", "request_id": "1", "attempts": "2"}); !ok {
+		t.Errorf("logs missing the tunnel record with attempts=2:\n%s", output)
 	}
 	for _, secret := range []string{"route-user", "route-password"} {
 		if strings.Contains(output, secret) {
@@ -746,7 +798,7 @@ func TestHandshakeFailureFallsBackWithSocksConnectKind(t *testing.T) {
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(reject.URL, good.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
-	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
 	conn := socksDialVia(t, addr, startRawEchoTarget(t))
 	readBanner(t, conn)
@@ -756,18 +808,15 @@ func TestHandshakeFailureFallsBackWithSocksConnectKind(t *testing.T) {
 	if snap[0].Failures != 1 || snap[0].Available || snap[1].Successes != 1 {
 		t.Fatalf("pool state = %+v", snap)
 	}
-	output := waitForLog(t, &logs, "msg=tunnel")
-	for _, want := range []string{
-		"request_id=1",
-		"msg=\"upstream handshake failed\"",
-		"error_kind=socks_connect",
-		"cooldown=1s",
-		"msg=tunnel",
-		"attempts=2",
-	} {
-		if !strings.Contains(output, want) {
-			t.Errorf("logs missing %q:\n%s", want, output)
-		}
+	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel"})
+	if _, ok := findRecord(output, map[string]string{
+		"msg": "upstream handshake failed", "request_id": "1",
+		"error_kind": "socks_connect", "cooldown": "1s",
+	}); !ok {
+		t.Errorf("logs missing the handshake-failure record:\n%s", output)
+	}
+	if _, ok := findRecord(output, map[string]string{"msg": "tunnel", "request_id": "1", "attempts": "2"}); !ok {
+		t.Errorf("logs missing the tunnel record with attempts=2:\n%s", output)
 	}
 }
 
@@ -778,7 +827,7 @@ func TestAuthFailureFallsBackWithoutDialCooldown(t *testing.T) {
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(bad.URL, good.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
-	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
 	conn := socksDialVia(t, addr, startRawEchoTarget(t))
 	readBanner(t, conn)
@@ -791,21 +840,22 @@ func TestAuthFailureFallsBackWithoutDialCooldown(t *testing.T) {
 	if snap[1].Successes != 1 || snap[1].Failures != 0 {
 		t.Fatalf("fallback route state = %+v", snap[1])
 	}
-	output := waitForLog(t, &logs, "msg=tunnel")
-	for _, want := range []string{
-		"request_id=1",
-		"msg=\"upstream auth failed\"",
-		"error_kind=auth_route",
-		"msg=tunnel",
-		"attempts=2",
-		"endpoint accepted no offered authentication method",
-	} {
-		if !strings.Contains(output, want) {
-			t.Errorf("logs missing %q:\n%s", want, output)
+	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel"})
+	authRec, ok := findRecord(output, map[string]string{
+		"msg": "upstream auth failed", "request_id": "1", "error_kind": "auth_route",
+	})
+	if !ok {
+		t.Errorf("logs missing the auth-failure record:\n%s", output)
+	} else {
+		if !strings.Contains(fmt.Sprint(authRec["error"]), "endpoint accepted no offered authentication method") {
+			t.Errorf("auth record lost the reason: %v", authRec["error"])
+		}
+		if _, has := authRec["cooldown"]; has {
+			t.Errorf("auth fallback logged a cooldown: %v", authRec)
 		}
 	}
-	if strings.Contains(output, "cooldown=") {
-		t.Errorf("auth fallback logged a cooldown:\n%s", output)
+	if _, ok := findRecord(output, map[string]string{"msg": "tunnel", "request_id": "1", "attempts": "2"}); !ok {
+		t.Errorf("logs missing the tunnel record with attempts=2:\n%s", output)
 	}
 	for _, secret := range []string{"TEST-user", "TEST-pass"} {
 		if strings.Contains(output, secret) {
@@ -820,7 +870,7 @@ func TestSingleRejectingRouteExhaustsToGeneralFailure(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
-	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
 	conn, code := socksConnectReply(t, addr, "example.test:443", socksCmdConnect)
 	_ = conn.Close()
@@ -838,11 +888,11 @@ func TestSingleRejectingRouteExhaustsToGeneralFailure(t *testing.T) {
 	if status := s.ListenerStatus(); status.Requests != 1 || status.Failovers != 1 {
 		t.Fatalf("listener status = %+v", status)
 	}
-	output := waitForLog(t, &logs, `msg="tunnel failed"`)
-	for _, want := range []string{"error_kind=no_route", "attempts=1"} {
-		if !strings.Contains(output, want) {
-			t.Errorf("logs missing %q:\n%s", want, output)
-		}
+	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel failed"})
+	if _, ok := findRecord(output, map[string]string{
+		"msg": "tunnel failed", "error_kind": "no_route", "attempts": "1",
+	}); !ok {
+		t.Errorf("logs missing the no_route record:\n%s", output)
 	}
 }
 
@@ -852,7 +902,7 @@ func TestSetupErrorRepliesFailureWithoutPoolMutation(t *testing.T) {
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(good.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
-	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs))
 	dials := 0
 	s.dial = func(context.Context, *url.URL, string, time.Duration) (net.Conn, error) {
 		dials++
@@ -875,15 +925,12 @@ func TestSetupErrorRepliesFailureWithoutPoolMutation(t *testing.T) {
 	if status := s.ListenerStatus(); status.Requests != 1 || status.Failovers != 0 {
 		t.Fatalf("listener status = %+v", status)
 	}
-	output := waitForLog(t, &logs, `msg="upstream setup failed"`)
-	for _, want := range []string{
-		"request_id=1",
-		"error_kind=setup",
-		"upstream=" + good.URL.Host,
-	} {
-		if !strings.Contains(output, want) {
-			t.Errorf("logs missing %q:\n%s", want, output)
-		}
+	output := waitForRecord(t, &logs, map[string]string{"msg": "upstream setup failed"})
+	if _, ok := findRecord(output, map[string]string{
+		"msg": "upstream setup failed", "request_id": "1",
+		"error_kind": "setup", "upstream": good.URL.Host,
+	}); !ok {
+		t.Errorf("logs missing the setup-failure record:\n%s", output)
 	}
 }
 
@@ -895,7 +942,7 @@ func TestCloseRecordAfterClientCloses(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
-	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
 	conn := socksDialVia(t, addr, startRawEchoTarget(t))
 	if got := readBanner(t, conn); got != "banner\n" {
@@ -910,16 +957,17 @@ func TestCloseRecordAfterClientCloses(t *testing.T) {
 	}
 	_ = conn.Close()
 
-	output := waitForLog(t, &logs, `msg="tunnel closed"`)
-	for _, want := range []string{
-		"close_reason=client_closed",
-		"client_to_upstream_bytes=4",
-		"upstream_to_client_bytes=11", // banner plus echo
-		"duration=",
-	} {
-		if !strings.Contains(output, want) {
-			t.Errorf("close record missing %q:\n%s", want, output)
-		}
+	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel closed"})
+	rec, ok := findRecord(output, map[string]string{
+		"msg":                      "tunnel closed",
+		"close_reason":             "client_closed",
+		"client_to_upstream_bytes": "4",
+		"upstream_to_client_bytes": "11", // banner plus echo
+	})
+	if !ok {
+		t.Errorf("close record missing expected fields:\n%s", output)
+	} else if _, has := rec["duration"]; !has {
+		t.Errorf("close record missing duration: %v", rec)
 	}
 	snap := pl.Snapshot()[0]
 	if snap.Successes != 1 || snap.Failures != 0 || snap.AuthFailures != 0 {
@@ -936,7 +984,7 @@ func TestUpstreamBreakLogsBrokenCloseAndResetsClient(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
-	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs, slog.LevelDebug))
+	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
 	conn := socksDialVia(t, addr, startAbortTarget(t))
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -944,16 +992,17 @@ func TestUpstreamBreakLogsBrokenCloseAndResetsClient(t *testing.T) {
 		t.Fatal("tunnel stayed open after the target aborted the stream")
 	}
 
-	output := waitForLog(t, &logs, `msg="tunnel broken"`)
-	for _, want := range []string{
-		"close_reason=upstream_broken",
-		"client_to_upstream_bytes=",
-		"upstream_to_client_bytes=",
-		"duration=",
-		"error=",
-	} {
-		if !strings.Contains(output, want) {
-			t.Errorf("close record missing %q:\n%s", want, output)
+	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel broken"})
+	rec, ok := findRecord(output, map[string]string{
+		"msg": "tunnel broken", "close_reason": "upstream_broken",
+	})
+	if !ok {
+		t.Errorf("logs missing the broken close record:\n%s", output)
+	} else {
+		for _, key := range []string{"client_to_upstream_bytes", "upstream_to_client_bytes", "duration", "error"} {
+			if _, has := rec[key]; !has {
+				t.Errorf("broken close record missing %q: %v", key, rec)
+			}
 		}
 	}
 	snap := pl.Snapshot()[0]
