@@ -12,8 +12,20 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 )
+
+// handshakeBufPool lends the buffered readers that frame the outbound SOCKS5
+// exchange: method choice, auth reply, connect reply, and bound address — a
+// few dozen bytes, so one 512B fill covers the whole handshake. An upstream
+// that pipelines data behind its success reply front-runs at most one buffer
+// into the relay prefix and streams the rest from the socket.
+const handshakeBufSize = 512
+
+var handshakeBufPool = sync.Pool{
+	New: func() any { return bufio.NewReaderSize(nil, handshakeBufSize) },
+}
 
 // ProxyDialError means DNS resolution or TCP dialing of the configured SOCKS
 // endpoint failed. It is the only error category that changes dial health.
@@ -150,16 +162,26 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return failHandshake(conn, "set handshake deadline", err)
 	}
-	br := bufio.NewReader(conn)
+	br := handshakeBufPool.Get().(*bufio.Reader)
+	br.Reset(conn)
+	defer func() {
+		br.Reset(nil)
+		handshakeBufPool.Put(br)
+	}()
 
-	methods := []byte{0x00} // no auth
+	// VER NMETHODS METHODS...: no auth, plus username/password when the route
+	// carries credentials (RFC 1929). One exact-cap buffer, one write.
+	greet := make([]byte, 0, 4)
+	greet = append(greet, 0x05, 0x01, 0x00)
 	if wantAuth {
-		methods = []byte{0x00, 0x02}
+		greet[1] = 0x02
+		greet = append(greet, 0x02)
 	}
-	if _, err := conn.Write(append([]byte{0x05, byte(len(methods))}, methods...)); err != nil {
+	if _, err := conn.Write(greet); err != nil {
 		return failHandshake(conn, "send greeting", err)
 	}
-	choice := make([]byte, 2)
+	var hdr [4]byte
+	choice := hdr[:2]
 	if _, err := io.ReadFull(br, choice); err != nil {
 		return failHandshake(conn, "read greeting", err)
 	}
@@ -176,13 +198,17 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 		if len(user) > 255 || len(pass) > 255 {
 			return failSetup(conn, "encode credentials", fmt.Errorf("username or password exceeds SOCKS5 length limit"))
 		}
-		b := append([]byte{0x01, byte(len(user))}, user...)
+		// ULEN UNAME PLEN PASSWD, one exact-cap buffer: credentials are
+		// bounded by the 255-byte length checks above.
+		b := make([]byte, 0, 3+len(user)+len(pass))
+		b = append(b, 0x01, byte(len(user)))
+		b = append(b, user...)
 		b = append(b, byte(len(pass)))
 		b = append(b, pass...)
 		if _, err := conn.Write(b); err != nil {
 			return failHandshake(conn, "send authentication", err)
 		}
-		reply := make([]byte, 2)
+		reply := hdr[:2]
 		if _, err := io.ReadFull(br, reply); err != nil {
 			return failHandshake(conn, "read authentication", err)
 		}
@@ -215,7 +241,7 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 	if _, err := conn.Write(req); err != nil {
 		return failHandshake(conn, "send connect", err)
 	}
-	head := make([]byte, 4)
+	head := hdr[:4]
 	if _, err := io.ReadFull(br, head); err != nil {
 		return failHandshake(conn, "read connect", err)
 	}
@@ -236,7 +262,10 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 }
 
 func socksConnectRequest(host string, port uint16) ([]byte, error) {
-	req := []byte{0x05, 0x01, 0x00}
+	// VER CMD RSV ATYP DST.ADDR DST.PORT; the largest form carries a 255-byte
+	// domain name. One exact-cap buffer instead of an append-grown one.
+	req := make([]byte, 0, 4+1+255+2)
+	req = append(req, 0x05, 0x01, 0x00)
 	if ip := net.ParseIP(host); ip != nil {
 		if v4 := ip.To4(); v4 != nil {
 			req = append(req, 0x01)
