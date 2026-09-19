@@ -57,7 +57,7 @@ func healthcheck() int {
 		fmt.Fprintln(os.Stderr, "healthcheck:", sanitize.ErrorString(err))
 		return 1
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
 	if resp.StatusCode != http.StatusOK || string(body) != "ok\n" {
 		fmt.Fprintf(os.Stderr, "healthcheck: status %d, body %q\n", resp.StatusCode, body)

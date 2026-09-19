@@ -249,7 +249,7 @@ func serveTestListener(t *testing.T, handler http.Handler) (net.Listener, *http.
 	for {
 		conn, err := net.DialTimeout("tcp", ln.Addr().String(), 100*time.Millisecond)
 		if err == nil {
-			conn.Close()
+			_ = conn.Close()
 			return ln, srv
 		}
 		if time.Now().After(deadline) {
@@ -297,7 +297,7 @@ func TestShutdownAllClosesProxyListenersThenAdmin(t *testing.T) {
 	// address is closed so redialing must fail.
 	for _, ln := range []net.Listener{lnA, lnB, lnAdmin} {
 		if conn, err := net.DialTimeout("tcp", ln.Addr().String(), 200*time.Millisecond); err == nil {
-			conn.Close()
+			_ = conn.Close()
 			t.Fatalf("server %s still reachable after shutdownAll", ln.Addr())
 		}
 	}
@@ -345,7 +345,7 @@ func TestShutdownAllSharedBudget(t *testing.T) {
 		go func() {
 			resp, err := client.Get("http://" + ln.Addr().String() + "/held")
 			if err == nil {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 			}
 			results <- clientResult{err: err}
 		}()
@@ -373,7 +373,7 @@ func TestShutdownAllSharedBudget(t *testing.T) {
 	// shared budget expired before that listener's turn.
 	for _, ln := range []net.Listener{lnA, lnB, lnAdmin} {
 		if conn, err := net.DialTimeout("tcp", ln.Addr().String(), 200*time.Millisecond); err == nil {
-			conn.Close()
+			_ = conn.Close()
 			t.Fatalf("server %s still reachable after shutdownAll", ln.Addr())
 		}
 	}
