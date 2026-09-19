@@ -23,7 +23,7 @@ type TargetSim struct {
 func NewEchoTarget(t testing.TB) *TargetSim {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "e2e-echo:%s", r.URL.Path)
+		_, _ = fmt.Fprintf(w, "e2e-echo:%s", r.URL.Path)
 	}))
 	t.Cleanup(srv.Close)
 	return fromServer(srv)

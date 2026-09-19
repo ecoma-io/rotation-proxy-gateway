@@ -50,7 +50,7 @@ func TestE2E_ExhaustedPoolNoRouteWithCooldownDoubling(t *testing.T) {
 			t.Fatalf("request %d: %v", i, err)
 		}
 		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusBadGateway || string(body) != "no usable upstream SOCKS routes\n" {
 			t.Fatalf("request %d: status=%d body=%q, want terminal no-route 502", i, resp.StatusCode, body)
 		}
@@ -105,15 +105,15 @@ func TestE2E_TunnelSurvivesReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial mixed listener: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(60 * time.Second)) // covers reload settles
-	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target.Host, target.Host)
+	_, _ = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target.Host, target.Host)
 	br := bufio.NewReader(conn)
 	tunnelResp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
 		t.Fatalf("read CONNECT response: %v", err)
 	}
-	tunnelResp.Body.Close()
+	_ = tunnelResp.Body.Close()
 	if tunnelResp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status=%d, want 200", tunnelResp.StatusCode)
 	}
@@ -128,12 +128,12 @@ func TestE2E_TunnelSurvivesReload(t *testing.T) {
 	}), []string{socksA.Addr})
 
 	// The same tunnel must still relay after both generation swaps.
-	fmt.Fprintf(conn, "GET /after-reload HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", target.Host)
+	_, _ = fmt.Fprintf(conn, "GET /after-reload HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", target.Host)
 	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
 	if err != nil {
 		t.Fatalf("read in-tunnel response after reload: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || string(body) != "e2e-echo:/after-reload" {
 		t.Fatalf("in-tunnel status=%d body=%q, want the echo through the original tunnel", resp.StatusCode, body)
@@ -159,7 +159,7 @@ func TestE2E_TunnelBreakDoesNotMutateHealth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial mixed listener: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target.Host, target.Host) //nolint:errcheck // the read is the assertion
 	br := bufio.NewReader(conn)
@@ -167,7 +167,7 @@ func TestE2E_TunnelBreakDoesNotMutateHealth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read CONNECT response: %v", err)
 	}
-	tunnelResp.Body.Close()
+	_ = tunnelResp.Body.Close()
 	if tunnelResp.StatusCode != http.StatusOK {
 		t.Fatalf("CONNECT status=%d, want 200", tunnelResp.StatusCode)
 	}
@@ -264,7 +264,7 @@ func TestE2E_ShutdownDrainsInFlightRequest(t *testing.T) {
 			done <- result{err: err}
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		b, _ := io.ReadAll(resp.Body)
 		done <- result{status: resp.StatusCode, body: b}
 	}()
@@ -317,7 +317,7 @@ func TestE2E_ShutdownGraceBoundsDrain(t *testing.T) {
 			done <- result{err: err}
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		b, _ := io.ReadAll(resp.Body)
 		done <- result{status: resp.StatusCode, body: b}
 	}()

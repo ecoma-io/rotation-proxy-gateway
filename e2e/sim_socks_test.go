@@ -59,7 +59,7 @@ func NewSocksSim(t testing.TB, mode SocksMode, user, pass string) *SocksSim {
 			go s.handle(conn)
 		}
 	}()
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	return s
 }
 
@@ -72,7 +72,7 @@ func (s *SocksSim) RouteValue() string {
 }
 
 func (s *SocksSim) handle(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	s.Hits.Add(1)
 	if s.Down.Load() {
 		return
@@ -177,7 +177,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 		_, _ = conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
-	defer up.Close()
+	defer func() { _ = up.Close() }()
 	if _, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
 		return
 	}

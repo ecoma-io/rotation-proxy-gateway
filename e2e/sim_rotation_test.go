@@ -108,7 +108,7 @@ func (s *TraceSim) serve(w http.ResponseWriter, r *http.Request) {
 		ip = s.defalt
 	}
 	s.mu.Unlock()
-	fmt.Fprintf(w, "loc=XX\nip=%s\ntls=1.3\n", ip)
+	_, _ = fmt.Fprintf(w, "loc=XX\nip=%s\ntls=1.3\n", ip)
 }
 
 type mintedKey struct {

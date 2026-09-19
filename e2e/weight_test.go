@@ -59,7 +59,7 @@ func TestE2E_ReloadRetunesWeightKeepingCounters(t *testing.T) {
 	for range 4 {
 		GetVia(t, client, target.URL+"/w", "e2e-echo:/w")
 	}
-	st := g.WaitForCondition(5*time.Second, "equal-weight picks recorded", func(st *Status) bool {
+	g.WaitForCondition(5*time.Second, "equal-weight picks recorded", func(st *Status) bool {
 		return len(st.Pool) == 2 && st.Pool[0].Successes == 2 && st.Pool[1].Successes == 2
 	})
 
@@ -68,7 +68,7 @@ func TestE2E_ReloadRetunesWeightKeepingCounters(t *testing.T) {
 		{Proxy: heavy.RouteValue(), Kind: "v4", Weight: 3},
 	})
 	g.ReloadConfig(after, []string{light.Addr, heavy.Addr})
-	st = g.WaitForCondition(reloadSettle, "retuned weights published", func(st *Status) bool {
+	st := g.WaitForCondition(reloadSettle, "retuned weights published", func(st *Status) bool {
 		return len(st.Pool) == 2 && st.Pool[0].Weight == 1 && st.Pool[1].Weight == 3
 	})
 	if st.Pool[0].Successes != 2 || st.Pool[1].Successes != 2 {

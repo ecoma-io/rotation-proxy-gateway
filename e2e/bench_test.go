@@ -39,7 +39,7 @@ func BenchmarkDirect_SmallGET(b *testing.B) {
 			b.Fatal(err)
 		}
 		got, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK || string(got) != "e2e-echo:/bench" {
 			b.Fatalf("status=%d body=%q", resp.StatusCode, got)
 		}
@@ -62,7 +62,7 @@ func BenchmarkProxied_SmallGET(b *testing.B) {
 			b.Fatal(err)
 		}
 		_, _ = io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 }
 
@@ -84,7 +84,7 @@ func BenchmarkProxied_SmallGETParallel(b *testing.B) {
 				return
 			}
 			_, _ = io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 	})
 }
@@ -106,7 +106,7 @@ func BenchmarkProxied_ReplayablePOST_64KiB(b *testing.B) {
 			b.Fatal(err)
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 }
 
@@ -130,7 +130,7 @@ func BenchmarkProxied_StreamingPOST_2MiB(b *testing.B) {
 			b.Fatal(err)
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 }
 
@@ -151,6 +151,6 @@ func BenchmarkProxied_BulkGET_1MiB(b *testing.B) {
 			b.Fatal(err)
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 }

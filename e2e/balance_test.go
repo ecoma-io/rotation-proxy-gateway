@@ -73,7 +73,7 @@ func TestE2E_ReloadFlipsBalance(t *testing.T) {
 	for range 4 {
 		GetVia(t, client, target.URL+"/b", "e2e-echo:/b")
 	}
-	st := g.WaitForCondition(5*time.Second, "even-split picks recorded", func(st *Status) bool {
+	g.WaitForCondition(5*time.Second, "even-split picks recorded", func(st *Status) bool {
 		return len(st.Pool) == 2 && st.Pool[0].Successes == 2 && st.Pool[1].Successes == 2
 	})
 
@@ -83,7 +83,7 @@ func TestE2E_ReloadFlipsBalance(t *testing.T) {
 	})
 	heavy.Balance = &BalanceConfig{V4: 1, V6: 3}
 	g.ReloadConfig(heavy, []string{v4.Addr, v6.Addr})
-	st = g.WaitForCondition(reloadSettle, "retuned balance published", func(st *Status) bool {
+	st := g.WaitForCondition(reloadSettle, "retuned balance published", func(st *Status) bool {
 		return st.Balance != nil && st.Balance.V4 == 1 && st.Balance.V6 == 3
 	})
 	if st.Pool[0].Successes != 2 || st.Pool[1].Successes != 2 {

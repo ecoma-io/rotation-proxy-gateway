@@ -33,7 +33,7 @@ func deadRouteValue(t *testing.T) string {
 		t.Fatal(err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 	return "socks5://" + addr
 }
 
@@ -45,7 +45,7 @@ func postVia(t *testing.T, client *http.Client, targetURL string, payload []byte
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, body
 }
@@ -183,7 +183,7 @@ func TestE2E_MixedV4ForwardHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("v6 GET: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("v6 status=%d, want 502", resp.StatusCode)
@@ -221,7 +221,7 @@ func TestE2E_V6OnlyPool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("v4 GET: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("v4 status=%d, want 502", resp.StatusCode)
@@ -258,7 +258,7 @@ func TestE2E_CONNECTTunnelToTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET through tunnel: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || string(body) != "e2e-tls-echo" {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
@@ -346,7 +346,7 @@ func TestE2E_SocksHandshakeFailureExhaustsToNoRoute(t *testing.T) {
 		t.Fatalf("GET: %v", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway || string(body) != "no usable upstream SOCKS routes\n" {
 		t.Fatalf("status=%d body=%q, want sanitized no-route 502", resp.StatusCode, body)
 	}
@@ -411,7 +411,7 @@ func TestE2E_ConnectTunnelHandshakeFailureFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET through tunnel: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || string(body) != "e2e-tls-echo" {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
@@ -446,7 +446,7 @@ func TestE2E_TargetStatusesPassThrough(t *testing.T) {
 				t.Fatalf("GET: %v", err)
 			}
 			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode != status || string(body) != "e2e-status" {
 				t.Fatalf("status=%d body=%q", resp.StatusCode, body)
 			}
@@ -485,7 +485,7 @@ func TestE2E_HopByHopStrippedUpstream(t *testing.T) {
 		t.Fatalf("GET: %v", err)
 	}
 	_, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
@@ -531,7 +531,7 @@ func TestE2E_NoCredentialLeak(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	var decoded map[string]any
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatal(err)
@@ -608,7 +608,7 @@ func TestE2E_ManualRouteServesWithoutExposingSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	for _, secret := range []string{proxySecret, "manual-user", apiToken, apiHeader, "api/rotate"} {
 		if strings.Contains(string(raw), secret) {
 			t.Fatalf("/status exposed manual route secret %q: %s", secret, raw)
@@ -666,14 +666,14 @@ func TestE2E_InvalidAbsoluteFormRequestsAreRejected(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dial mixed listener: %v", err)
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 		fmt.Fprintf(conn, "%s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", requestLine, host) //nolint:errcheck // the response code is the assertion
 		resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
 		if err != nil {
 			t.Fatalf("read rejection response: %v", err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		body, _ := io.ReadAll(resp.Body)
 		return resp.StatusCode, string(body)
 	}

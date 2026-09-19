@@ -29,7 +29,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	out := filepath.Join(dir, "rpgw")
 	build := exec.Command("go", "build", "-o", out, "rotation-proxy-gateway/cmd/rotation-proxy-gateway")
 	if output, err := build.CombinedOutput(); err != nil {
