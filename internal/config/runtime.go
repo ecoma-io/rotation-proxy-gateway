@@ -194,7 +194,7 @@ type RuntimeConfig struct {
 
 type fileConfig struct {
 	LogLevel    string             `mapstructure:"log-level"`
-	MaxRetries  int                `mapstructure:"max-retries"`
+	MaxRetries  any                `mapstructure:"max-retries"`
 	Cooldown    cooldownFileConfig `mapstructure:"cooldown"`
 	DialTimeout string             `mapstructure:"dial-timeout"`
 	Rotation    rotationFileConfig `mapstructure:"rotation"`
@@ -364,7 +364,15 @@ func validListenerHostname(host string) bool {
 func listenersOverlap(left, right string) bool {
 	leftHost, leftPort, leftErr := net.SplitHostPort(left)
 	rightHost, rightPort, rightErr := net.SplitHostPort(right)
-	if leftErr != nil || rightErr != nil || leftPort != rightPort {
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	// Ports compare numerically: validation admits leading-zero spellings
+	// ("080"), which must still collide with ":80" — otherwise the bind
+	// discovers the overlap after validation called the addresses distinct.
+	leftN, leftErr := strconv.Atoi(leftPort)
+	rightN, rightErr := strconv.Atoi(rightPort)
+	if leftErr != nil || rightErr != nil || leftN != rightN {
 		return false
 	}
 	if isWildcardHost(leftHost) || isWildcardHost(rightHost) {
@@ -380,7 +388,7 @@ func isWildcardHost(host string) bool {
 // LoadRuntime reads and strictly validates the YAML runtime config at path.
 // It creates an isolated Viper instance for every load so test and reload state
 // cannot leak through Viper's package-global configuration.
-func LoadRuntime(path string, bootstrap *BootstrapConfig) (*RuntimeConfig, error) {
+func LoadRuntime(path string) (*RuntimeConfig, error) {
 	v, err := newViper(path)
 	if err != nil {
 		return nil, err
@@ -389,16 +397,7 @@ func LoadRuntime(path string, bootstrap *BootstrapConfig) (*RuntimeConfig, error
 	if err := v.UnmarshalExact(&raw); err != nil {
 		return nil, fmt.Errorf("decode runtime config: %w", err)
 	}
-	cfg, err := runtimeFromFile(raw)
-	if err != nil {
-		return nil, err
-	}
-	if bootstrap != nil {
-		if err := validateRouteEligibility(cfg, bootstrap); err != nil {
-			return nil, err
-		}
-	}
-	return cfg, nil
+	return runtimeFromFile(raw)
 }
 
 func newViper(path string) (*viper.Viper, error) {
@@ -416,6 +415,10 @@ func newViper(path string) (*viper.Viper, error) {
 
 func runtimeFromFile(raw fileConfig) (*RuntimeConfig, error) {
 	var errs []error
+	maxRetries, err := parseMaxRetries(raw.MaxRetries)
+	if err != nil {
+		errs = append(errs, err)
+	}
 	base, err := parseRuntimeDuration("cooldown.base", raw.Cooldown.Base)
 	if err != nil {
 		errs = append(errs, err)
@@ -442,7 +445,7 @@ func runtimeFromFile(raw fileConfig) (*RuntimeConfig, error) {
 	}
 
 	cfg := &RuntimeConfig{
-		MaxRetries:   raw.MaxRetries,
+		MaxRetries:   maxRetries,
 		CooldownBase: base,
 		CooldownMax:  max,
 		DialTimeout:  dialTimeout,
@@ -580,6 +583,21 @@ func parseMaxConcurrent(raw any) (*int, *int, error) {
 	default:
 		return nil, nil, errors.New("rotation.max-concurrent must be a count or a percent such as 25%")
 	}
+}
+
+// parseMaxRetries requires a whole YAML integer: viper's weak typing would
+// otherwise truncate 2.5 to 2 and quietly change the retry budget, the same
+// anti-coercion rule as parseRouteWeight. An absent value falls through to the
+// range check, which reports it.
+func parseMaxRetries(raw any) (int, error) {
+	if raw == nil {
+		return 0, nil
+	}
+	n, ok := raw.(int)
+	if !ok {
+		return 0, errors.New("max-retries must be a whole number >= 1")
+	}
+	return n, nil
 }
 
 func parseRuntimeDuration(name, value string) (time.Duration, error) {
@@ -844,14 +862,4 @@ func (c *RuntimeConfig) validate() error {
 		seen[id] = struct{}{}
 	}
 	return errors.Join(errs...)
-}
-
-// validateRouteEligibility retains the mixed-listener invariant. Dedicated
-// listeners intentionally may have no matching route: they remain available and
-// return the standard no-route 502 without crossing into the other kind.
-func validateRouteEligibility(cfg *RuntimeConfig, bootstrap *BootstrapConfig) error {
-	if bootstrap.MixedListenAddr != "" && len(cfg.Routes) == 0 && len(cfg.ManualRoutes) == 0 {
-		return errors.New("mixed listener requires at least one route")
-	}
-	return nil
 }

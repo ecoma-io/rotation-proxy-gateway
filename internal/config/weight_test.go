@@ -32,7 +32,7 @@ func TestLoadRuntimeRouteWeights(t *testing.T) {
       api:
         url: https://provider.example/rotate
 `
-	cfg, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+	cfg, err := LoadRuntime(writeRuntimeConfig(t, content))
 	if err != nil {
 		t.Fatalf("LoadRuntime() error = %v", err)
 	}
@@ -58,7 +58,7 @@ func TestLoadRuntimeAcceptsWeightBounds(t *testing.T) {
       kind: v4
       weight: ` + strconv.Itoa(w) + `
 `
-		cfg, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+		cfg, err := LoadRuntime(writeRuntimeConfig(t, content))
 		if err != nil {
 			t.Fatalf("weight %d: LoadRuntime() error = %v", w, err)
 		}
@@ -84,7 +84,7 @@ func TestLoadRuntimeRejectsInvalidRouteWeights(t *testing.T) {
       kind: v4
       ` + line + `
 `
-		_, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+		_, err := LoadRuntime(writeRuntimeConfig(t, content))
 		if err == nil {
 			t.Fatalf("%s: LoadRuntime() accepted invalid %s", name, line)
 		}

@@ -57,15 +57,71 @@ func TestPollerDetectsContentChanges(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	// A vanished file is one change (the reload attempt logs the sanitized
-	// warning and keeps serving); it must not signal every tick.
+	// A vanished file fabricates no change at all: the baseline keeps pointing
+	// at the content that is actually serving, so no signal fires while it is
+	// gone and no reload attempt is made for it.
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	waitChange("delete")
 	select {
 	case <-p.Changes():
-		t.Fatal("deleted file signaled more than once")
+		t.Fatal("deleted file produced a change signal")
 	case <-time.After(100 * time.Millisecond):
 	}
+}
+
+// A read failure must not corrupt the applied-content baseline: while the file
+// is unreadable no signal fires, and once it is readable again the comparison
+// resumes against the pre-failure content — restored unchanged stays quiet,
+// real new content signals exactly once.
+func TestPollerReadFailureKeepsBaseline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("a: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	log := logging.Nop()
+	p := NewPoller(path, 5*time.Millisecond, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go p.Run(ctx, log)
+
+	assertQuiet := func(what string, window time.Duration) {
+		t.Helper()
+		select {
+		case <-p.Changes():
+			t.Fatalf("unexpected change signal while %s", what)
+		case <-time.After(window):
+		}
+	}
+
+	// Put a directory where the file was: reads fail for any uid, simulating
+	// a hostile replace window lasting several ticks.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	assertQuiet("unreadable", 60*time.Millisecond)
+
+	// Restore the file with unchanged content. A poller that had clobbered
+	// its baseline on the read errors would signal this harmless state.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("a: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertQuiet("restored unchanged", 60*time.Millisecond)
+
+	// A real content change still signals, exactly once.
+	if err := os.WriteFile(path, []byte("a: 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-p.Changes():
+	case <-time.After(2 * time.Second):
+		t.Fatal("no change signal for the content change after the read failures")
+	}
+	assertQuiet("second tick after the change", 60*time.Millisecond)
 }

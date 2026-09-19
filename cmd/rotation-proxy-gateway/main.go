@@ -118,7 +118,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	runtimeCfg, err := config.LoadRuntime(bootstrap.ConfigFile, bootstrap)
+	runtimeCfg, err := config.LoadRuntime(bootstrap.ConfigFile)
 	if err != nil {
 		return err
 	}
@@ -213,7 +213,7 @@ func run() error {
 	// Reloads from the poller arrive on one channel and are handled by this
 	// serialized loop; the source label only records how it was reached.
 	reload := func(source string) {
-		next, err := config.LoadRuntime(bootstrap.ConfigFile, bootstrap)
+		next, err := config.LoadRuntime(bootstrap.ConfigFile)
 		if err != nil {
 			log.Warn().Str("source", source).Str("error", sanitize.ErrorString(err)).Msg("reload failed; keeping previous configuration")
 			return

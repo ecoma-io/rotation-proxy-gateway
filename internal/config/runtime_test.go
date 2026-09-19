@@ -9,17 +9,6 @@ import (
 	"time"
 )
 
-func runtimeBootstrap(t *testing.T) *BootstrapConfig {
-	t.Helper()
-	return &BootstrapConfig{
-		ConfigFile:      "ignored.yaml",
-		AdminAddr:       "127.0.0.1:30120",
-		MixedListenAddr: ":30121",
-		V4ListenAddr:    ":30122",
-		V6ListenAddr:    ":30123",
-	}
-}
-
 func writeRuntimeConfig(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -81,14 +70,14 @@ func assertNoSecretLeak(t *testing.T, err error) {
 }
 
 func TestLoadRuntimeMissingFileReportsSetupGuidance(t *testing.T) {
-	_, err := LoadRuntime(filepath.Join(t.TempDir(), "missing.yaml"), runtimeBootstrap(t))
+	_, err := LoadRuntime(filepath.Join(t.TempDir(), "missing.yaml"))
 	if err == nil || !strings.Contains(err.Error(), "copy config.example.yaml") {
 		t.Fatalf("error = %v", err)
 	}
 }
 
 func TestLoadRuntimeParsesManualRoutesAndRotation(t *testing.T) {
-	cfg, err := LoadRuntime(writeRuntimeConfig(t, validRuntimeConfig), runtimeBootstrap(t))
+	cfg, err := LoadRuntime(writeRuntimeConfig(t, validRuntimeConfig))
 	if err != nil {
 		t.Fatalf("LoadRuntime() error = %v", err)
 	}
@@ -141,7 +130,7 @@ func TestLoadRuntimeParsesManualRoutesAndRotation(t *testing.T) {
 
 func TestLoadRuntimeRotationDefaults(t *testing.T) {
 	content := strings.Replace(validRuntimeConfig, rotationBlock, "", 1)
-	cfg, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+	cfg, err := LoadRuntime(writeRuntimeConfig(t, content))
 	if err != nil {
 		t.Fatalf("LoadRuntime() error = %v", err)
 	}
@@ -160,7 +149,7 @@ func TestLoadRuntimeParsesPercentAndRotateOnStart(t *testing.T) {
 	content := strings.Replace(validRuntimeConfig,
 		"  max-concurrent: 1\n",
 		"  max-concurrent: 25%\n  rotate-on-start: true\n", 1)
-	cfg, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+	cfg, err := LoadRuntime(writeRuntimeConfig(t, content))
 	if err != nil {
 		t.Fatalf("LoadRuntime() error = %v", err)
 	}
@@ -214,7 +203,7 @@ func TestLoadRuntimeRejectsInvalidRotationSettings(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			content := strings.Replace(validRuntimeConfig, tc.old, tc.replacement, 1)
-			_, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+			_, err := LoadRuntime(writeRuntimeConfig(t, content))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error = %v, want %q", err, tc.want)
 			}
@@ -242,7 +231,7 @@ func TestLoadRuntimeStrictAndCredentialSafe(t *testing.T) {
 			default:
 				content += tc.mutate
 			}
-			_, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+			_, err := LoadRuntime(writeRuntimeConfig(t, content))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error = %v, want %q", err, tc.want)
 			}
@@ -253,7 +242,7 @@ func TestLoadRuntimeStrictAndCredentialSafe(t *testing.T) {
 
 func TestLoadRuntimeDurationErrorsDoNotLeakYAMLValue(t *testing.T) {
 	content := strings.Replace(validRuntimeConfig, "dial-timeout: 7s", "dial-timeout: secret-duration", 1)
-	_, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+	_, err := LoadRuntime(writeRuntimeConfig(t, content))
 	if err == nil || !strings.Contains(err.Error(), "dial-timeout must be a Go duration") {
 		t.Fatalf("error = %v", err)
 	}
@@ -268,13 +257,15 @@ func TestLoadRuntimeRejectsInvalidRuntimeValues(t *testing.T) {
 	}{
 		{"invalid log level", "log-level: debug", "log-level: DEBUG", "log-level must be one of"},
 		{"zero retries", "max-retries: 4", "max-retries: 0", "max-retries must be >= 1"},
+		{"float retries", "max-retries: 4", "max-retries: 2.5", "max-retries must be a whole number"},
+		{"string retries", "max-retries: 4", `max-retries: "3"`, "max-retries must be a whole number"},
 		{"cooldown ordering", "  base: 2s\n  max: 1m", "  base: 2m\n  max: 1s", "must not exceed"},
 		{"non-positive timeout", "dial-timeout: 7s", "dial-timeout: 0s", "dial-timeout must be positive"},
 		{"nested unknown key", "  base: 2s\n  max: 1m", "  base: 2s\n  max: 1m\n  unknown: value", "invalid keys"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			content := strings.Replace(validRuntimeConfig, tc.old, tc.replacement, 1)
-			_, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+			_, err := LoadRuntime(writeRuntimeConfig(t, content))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error = %v, want %q", err, tc.want)
 			}
@@ -287,7 +278,7 @@ func TestLoadRuntimeRejectsDuplicateRegardlessOfKind(t *testing.T) {
 	content := strings.Replace(validRuntimeConfig,
 		"    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6",
 		"    - proxy: socks5://alice:secret@V4.example:1080\n      kind: v6", 1)
-	_, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+	_, err := LoadRuntime(writeRuntimeConfig(t, content))
 	if err == nil || !strings.Contains(err.Error(), "duplicate route") {
 		t.Fatalf("error = %v, want duplicate route", err)
 	}
@@ -312,7 +303,7 @@ func TestLoadRuntimeAcceptsSingleFamilyRoutes(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			content := strings.Replace(validRuntimeConfig, tc.remove, "", 1)
-			cfg, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+			cfg, err := LoadRuntime(writeRuntimeConfig(t, content))
 			if err != nil {
 				t.Fatalf("LoadRuntime() error = %v", err)
 			}
@@ -326,7 +317,7 @@ func TestLoadRuntimeAcceptsSingleFamilyRoutes(t *testing.T) {
 func TestLoadRuntimeManualOnlyPoolIsValid(t *testing.T) {
 	content := strings.Replace(validRuntimeConfig,
 		"    - proxy: socks5://alice:secret@v4.example:1080\n      kind: v4\n    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6\n", "", 1)
-	cfg, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+	cfg, err := LoadRuntime(writeRuntimeConfig(t, content))
 	if err != nil {
 		t.Fatalf("LoadRuntime() error = %v", err)
 	}
@@ -341,7 +332,7 @@ func TestLoadRuntimeManualOnlyPoolIsValid(t *testing.T) {
 func TestLoadRuntimeRejectsEmptyPools(t *testing.T) {
 	content := strings.Replace(validRuntimeConfig,
 		"    - proxy: socks5://alice:secret@v4.example:1080\n      kind: v4\n    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6\n  manual:\n    - proxy: socks5://carol:manual-secret@manual.example:1080\n      kind: v6\n      rotate-interval: 90s\n      api:\n        url: https://provider.example/rotate\n        method: POST\n        headers:\n          Content-Type: application/json\n          X-Api-Token: rot-token\n        body: |\n          {\"proxy_id\": 7}\n        timeout: 4s\n", "", 1)
-	_, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+	_, err := LoadRuntime(writeRuntimeConfig(t, content))
 	if err == nil || !strings.Contains(err.Error(), "proxies must contain at least one route") {
 		t.Fatalf("error = %v", err)
 	}
@@ -364,7 +355,7 @@ func TestLoadRuntimeRejectsInvalidManualRoutes(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			content := strings.Replace(validRuntimeConfig, tc.old, tc.replacement, 1)
-			_, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+			_, err := LoadRuntime(writeRuntimeConfig(t, content))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error = %v, want %q", err, tc.want)
 			}
@@ -379,21 +370,11 @@ func TestLoadRuntimeRejectsDuplicateAcrossPools(t *testing.T) {
 	content := strings.Replace(validRuntimeConfig,
 		"    - proxy: socks5://carol:manual-secret@manual.example:1080\n      kind: v6\n",
 		"    - proxy: socks5://alice:secret@V4.example:1080\n      kind: v4\n", 1)
-	_, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+	_, err := LoadRuntime(writeRuntimeConfig(t, content))
 	if err == nil || !strings.Contains(err.Error(), "duplicate route") {
 		t.Fatalf("error = %v, want duplicate route", err)
 	}
 	assertNoSecretLeak(t, err)
-}
-
-func TestLoadRuntimeAllowsMissingKindWhenListenerDisabled(t *testing.T) {
-	content := strings.Replace(validRuntimeConfig,
-		"    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6\n", "", 1)
-	bootstrap := runtimeBootstrap(t)
-	bootstrap.V6ListenAddr = ""
-	if _, err := LoadRuntime(writeRuntimeConfig(t, content), bootstrap); err != nil {
-		t.Fatalf("disabled v6 LoadRuntime() error = %v", err)
-	}
 }
 
 func TestLoadBootstrapDefaultsAndConflicts(t *testing.T) {

@@ -33,22 +33,29 @@ type Poller struct {
 
 // NewPoller seeds the baseline with the content present now, so the initial
 // load is never itself reported as a change and the first write after startup
-// is always seen.
+// is always seen. The bootstrap load read this same file moments before, so a
+// seed failure is a narrow race: the zero baseline makes the first successful
+// read signal once, and that reload of identical content is harmless.
 func NewPoller(path string, interval time.Duration, log zerolog.Logger) *Poller {
+	last, err := hashFile(path)
+	if err != nil {
+		log.Debug().Str("error", sanitize.ErrorString(err)).Msg("config poll baseline seed skipped")
+	}
 	return &Poller{
 		path:     path,
 		interval: interval,
 		changes:  make(chan struct{}, 1),
-		last:     hashFile(path, log),
+		last:     last,
 	}
 }
 
 // Changes receives one coalesced signal per detected content change.
 func (p *Poller) Changes() <-chan struct{} { return p.changes }
 
-// Run polls until ctx is canceled. Read failures are skipped without logging
-// at warn: a transient replace window must not spam, and the next successful
-// read with different content signals exactly once.
+// Run polls until ctx is canceled. A read failure leaves both the baseline
+// and the change channel untouched — a vanished file or a transient replace
+// window must never fabricate a change — so the next successful read compares
+// against the content that is actually serving.
 func (p *Poller) Run(ctx context.Context, log zerolog.Logger) {
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
@@ -57,7 +64,11 @@ func (p *Poller) Run(ctx context.Context, log zerolog.Logger) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			sum := hashFile(p.path, log)
+			sum, err := hashFile(p.path)
+			if err != nil {
+				log.Debug().Str("error", sanitize.ErrorString(err)).Msg("config poll read skipped")
+				continue
+			}
 			if sum == p.last {
 				continue
 			}
@@ -70,11 +81,10 @@ func (p *Poller) Run(ctx context.Context, log zerolog.Logger) {
 	}
 }
 
-func hashFile(path string, log zerolog.Logger) [sha256.Size]byte {
+func hashFile(path string) ([sha256.Size]byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		log.Debug().Str("error", sanitize.ErrorString(err)).Msg("config poll read skipped")
-		return [sha256.Size]byte{}
+		return [sha256.Size]byte{}, err
 	}
-	return sha256.Sum256(data)
+	return sha256.Sum256(data), nil
 }

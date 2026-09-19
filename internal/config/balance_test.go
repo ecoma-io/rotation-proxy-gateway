@@ -37,7 +37,7 @@ func TestLoadRuntimeBalanceShares(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := LoadRuntime(writeRuntimeConfig(t, balancePrologue+tc.yaml), runtimeBootstrap(t))
+			cfg, err := LoadRuntime(writeRuntimeConfig(t, balancePrologue+tc.yaml))
 			if err != nil {
 				t.Fatalf("LoadRuntime() error = %v", err)
 			}
@@ -51,7 +51,7 @@ func TestLoadRuntimeBalanceShares(t *testing.T) {
 func TestLoadRuntimeAcceptsBalanceShareBounds(t *testing.T) {
 	for _, share := range []int{1, MaxBalanceShare} {
 		content := balancePrologue + "balance:\n  v4: " + strconv.Itoa(share) + "\n  v6: " + strconv.Itoa(share) + "\n"
-		cfg, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
+		cfg, err := LoadRuntime(writeRuntimeConfig(t, content))
 		if err != nil {
 			t.Fatalf("share %d: LoadRuntime() error = %v", share, err)
 		}
@@ -71,7 +71,7 @@ func TestLoadRuntimeRejectsInvalidBalanceShares(t *testing.T) {
 		"over max":   "balance:\n  v6: 1001\n",
 	}
 	for name, yaml := range cases {
-		_, err := LoadRuntime(writeRuntimeConfig(t, balancePrologue+yaml), runtimeBootstrap(t))
+		_, err := LoadRuntime(writeRuntimeConfig(t, balancePrologue+yaml))
 		if err == nil {
 			t.Fatalf("%s: LoadRuntime() accepted invalid balance block %q", name, yaml)
 		}

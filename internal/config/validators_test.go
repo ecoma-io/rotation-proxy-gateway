@@ -78,3 +78,26 @@ func TestLoadBootstrapRejectsBadShutdownGrace(t *testing.T) {
 		t.Fatalf("LoadBootstrap() error = %v, want SHUTDOWN_GRACE complaint", err)
 	}
 }
+
+// Overlap must compare ports numerically: validation admits leading-zero
+// spellings, and two spellings of one port must collide at validation time,
+// not as an "address already in use" bind failure afterwards.
+func TestListenersOverlapNumericPorts(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"0.0.0.0:80", "127.0.0.1:080"},
+		{"127.0.0.1:0080", "[::]:80"},
+		{"host.example:080", "HOST.example:80"},
+	} {
+		if !listenersOverlap(pair[0], pair[1]) {
+			t.Errorf("listenersOverlap(%q, %q) = false, want true", pair[0], pair[1])
+		}
+	}
+	for _, pair := range [][2]string{
+		{"127.0.0.1:80", "127.0.0.2:80"},
+		{"127.0.0.1:80", "127.0.0.1:81"},
+	} {
+		if listenersOverlap(pair[0], pair[1]) {
+			t.Errorf("listenersOverlap(%q, %q) = true, want false", pair[0], pair[1])
+		}
+	}
+}

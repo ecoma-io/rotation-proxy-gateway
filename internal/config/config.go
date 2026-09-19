@@ -111,8 +111,8 @@ func splitHostPortCreds(line string) (host, port, user, pass string, ok bool) {
 
 // CanonicalRouteID identifies a configured route for duplicate detection and
 // reload state preservation. It preserves credentials so distinct credentials
-// remain distinct, while normalizing scheme and host case (including IPv6) so
-// equivalent spellings collapse to one identity.
+// remain distinct, while normalizing scheme, host case (including IPv6), and
+// the port's decimal form so equivalent spellings collapse to one identity.
 func CanonicalRouteID(u *url.URL) string {
 	var creds string
 	if u.User != nil {
@@ -123,7 +123,17 @@ func CanonicalRouteID(u *url.URL) string {
 		// plain user + ":" + password concatenation does.
 		creds = u.User.String()
 	}
-	return strings.ToLower(u.Scheme) + "://" + creds + "@" + strings.ToLower(u.Hostname()) + ":" + u.Port()
+	return strings.ToLower(u.Scheme) + "://" + creds + "@" + strings.ToLower(u.Hostname()) + ":" + normalizePort(u.Port())
+}
+
+// normalizePort canonicalizes a port to its decimal form, so "0080" and "80"
+// are one identity. An unparseable port is returned unchanged; validated
+// routes never reach that path.
+func normalizePort(port string) string {
+	if n, err := strconv.Atoi(port); err == nil {
+		return strconv.Itoa(n)
+	}
+	return port
 }
 
 // checkPort validates a proxy port is numeric and in range without including a
