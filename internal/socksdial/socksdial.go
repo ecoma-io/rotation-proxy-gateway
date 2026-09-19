@@ -278,9 +278,9 @@ func withBufferedPrefix(conn net.Conn, br *bufio.Reader) net.Conn {
 		return conn
 	}
 	prefix := make([]byte, br.Buffered())
-	if _, err := io.ReadFull(br, prefix); err != nil {
-		return conn
-	}
+	// Buffered reports the bytes available to read immediately, so this exact
+	// read cannot block or truncate the prefix.
+	_, _ = io.ReadFull(br, prefix)
 	return &prefixConn{Conn: conn, prefix: prefix}
 }
 
