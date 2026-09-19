@@ -730,9 +730,20 @@ func TestProtocolRejectsNeverTouchPoolOrCounters(t *testing.T) {
 		})
 	}
 
-	output := logs.String()
-	if got := countRecords(output, map[string]string{"error_kind": "bad_request"}); got != len(cases) {
-		t.Fatalf("bad_request records = %d, want %d:\n%s", got, len(cases), output)
+	// Rejects are handled in per-connection goroutines, so the final record
+	// can land after the last client exchange returns; poll for the full set.
+	var output string
+	deadline := time.Now().Add(time.Second)
+	for {
+		output = logs.String()
+		if countRecords(output, map[string]string{"error_kind": "bad_request"}) == len(cases) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bad_request records = %d, want %d:\n%s",
+				countRecords(output, map[string]string{"error_kind": "bad_request"}), len(cases), output)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if _, ok := findRecord(output, map[string]string{"msg": "socks request rejected", "error_kind": "bad_request"}); !ok {
 		t.Fatalf("parse rejects were not logged as rejections:\n%s", output)
