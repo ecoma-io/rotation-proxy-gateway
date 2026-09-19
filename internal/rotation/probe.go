@@ -46,7 +46,7 @@ func (e *Engine) probeIP(ctx context.Context, gen *pool.Generation, spec config.
 	if err != nil {
 		return "", err // socksdial errors are already host-only and sanitized
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// The probe budget bounds the connection even when the caller's context
 	// carries a later deadline: the timeout parameter is the contract.
@@ -54,7 +54,9 @@ func (e *Engine) probeIP(ctx context.Context, gen *pool.Generation, spec config.
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
 		deadline = dl
 	}
-	conn.SetDeadline(deadline)
+	if err := conn.SetDeadline(deadline); err != nil {
+		return "", &errProbe{"setting ip-check deadline failed"}
+	}
 
 	tlsConn := tls.Client(conn, e.probeTLS(checkURL.Hostname()))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
@@ -75,7 +77,7 @@ func (e *Engine) probeIP(ctx context.Context, gen *pool.Generation, spec config.
 	if err != nil {
 		return "", &errProbe{"reading ip-check response failed"}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if err != nil {
 		return "", &errProbe{"reading ip-check body failed"}
@@ -158,8 +160,8 @@ func (e *Engine) callRotateAPI(ctx context.Context, api config.RotateAPI) (time.
 		}
 		return 0, errors.New("rotate API call failed")
 	}
-	defer resp.Body.Close()
-	io.CopyN(io.Discard, resp.Body, 4<<10) //nolint:errcheck // body size is uninteresting
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.CopyN(io.Discard, resp.Body, 4<<10) // response body is intentionally discarded
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:

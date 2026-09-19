@@ -75,10 +75,10 @@ func newIPServer(t *testing.T, initial string) *ipServer {
 		}
 		if s.unique.Load() {
 			n := int(s.counter.Add(1))
-			fmt.Fprintf(w, "loc=XX\nip=10.%d.%d.%d\n", (n>>16)&255, (n>>8)&255, n&255)
+			_, _ = fmt.Fprintf(w, "loc=XX\nip=10.%d.%d.%d\n", (n>>16)&255, (n>>8)&255, n&255)
 			return
 		}
-		fmt.Fprintf(w, "loc=XX\nip=%s\ntls=1.3\n", s.static.Load())
+		_, _ = fmt.Fprintf(w, "loc=XX\nip=%s\ntls=1.3\n", s.static.Load())
 	}))
 	t.Cleanup(s.srv.Close)
 	s.rootCAs = x509.NewCertPool()
