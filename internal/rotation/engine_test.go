@@ -205,6 +205,10 @@ func TestParseIPLine(t *testing.T) {
 		{"  ip=198.51.100.4  \n", "198.51.100.4"},
 		{"no ip here\nloc=ZZ\n", ""},
 		{"", ""},
+		// Non-literal values must fail the probe, never become route state.
+		{"ip=not-an-address\n", ""},
+		{"ip=999.1.1.1\n", ""},
+		{"ip=provider.example\n", ""},
 	} {
 		if got := parseIPLine(tc.body); got != tc.want {
 			t.Fatalf("parseIPLine(%q) = %q, want %q", tc.body, got, tc.want)
@@ -232,11 +236,12 @@ func TestParseRetryAfter(t *testing.T) {
 
 // apiServer records concurrent calls; its behavior is switched per test.
 type apiServer struct {
-	srv      *httptest.Server
-	calls    atomic.Int64
-	maxFast  atomic.Int64 // max simultaneously in-flight calls
-	inFlight atomic.Int64
-	status   atomic.Int64 // 0 means 200
+	srv               *httptest.Server
+	calls             atomic.Int64
+	maxFast           atomic.Int64 // max simultaneously in-flight calls
+	inFlight          atomic.Int64
+	status            atomic.Int64 // 0 means 200
+	retryAfterSeconds atomic.Int64 // sent as Retry-After when status is set
 }
 
 func newAPIServer(t *testing.T) *apiServer {
@@ -253,6 +258,9 @@ func newAPIServer(t *testing.T) *apiServer {
 			}
 		}
 		if st := a.status.Load(); st != 0 {
+			if ra := a.retryAfterSeconds.Load(); ra > 0 {
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", ra))
+			}
 			w.WriteHeader(int(st))
 			return
 		}
@@ -476,6 +484,143 @@ func TestProcedureSameIPGoesStaleThenRecovers(t *testing.T) {
 	if st.Rotation.State != "idle" || st.Rotation.ConsecutiveSameIP != 0 || st.Rotation.LastIP != "198.51.100.9" {
 		t.Fatalf("recovered status = %+v", st.Rotation)
 	}
+}
+
+// A provider Retry-After hint extends the same-IP backoff when it sits under
+// rotation.retry-backoff-max, but is clamped to that ceiling: an unbounded
+// hint must not let one response silence a route's rotation retries for days.
+func TestProcedureRetryAfterClampedToBackoffMax(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	api := newAPIServer(t)
+	api.status.Store(http.StatusTooManyRequests)
+	spec := manualRoute(t, "m1.test", time.Second, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+
+	scheduledIn := func() time.Duration {
+		t.Helper()
+		s.e.mu.Lock()
+		due := s.e.due[routeID(spec.RouteSpec)]
+		s.e.mu.Unlock()
+		return time.Until(due)
+	}
+
+	t.Run("hint under the ceiling is honored", func(t *testing.T) {
+		api.retryAfterSeconds.Store(30)
+		s.runOne(spec)
+		if got := s.e.Rotations(); got != 0 {
+			t.Fatalf("Rotations = %d, want 0", got)
+		}
+		if wait := scheduledIn(); wait < 25*time.Second || wait > 35*time.Second {
+			t.Fatalf("retry scheduled in %s, want the 30s hint", wait)
+		}
+	})
+
+	t.Run("hint above the ceiling is clamped", func(t *testing.T) {
+		api.retryAfterSeconds.Store(172800) // 48h, far past any sane wait
+		s.runOne(spec)
+		if wait := scheduledIn(); wait < 55*time.Second || wait > 61*time.Second {
+			t.Fatalf("retry scheduled in %s, want the 1m configured ceiling, not the 48h hint", wait)
+		}
+	})
+}
+
+// An unverified rotation must not count the route's own current address as a
+// changed IP: with the baseline unknown, a provider that hands back the
+// address the route already serves is declining to rotate, and counting it
+// would inflate the rotations metric.
+func TestProcedureUnverifiedDoesNotCountCurrentIP(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	api := newAPIServer(t)
+	spec := manualRoute(t, "m1.test", time.Minute, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+
+	// First procedure: the provider rotates on the API call, and the new
+	// address 198.51.100.9 is verified.
+	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		ips.set("198.51.100.9")
+		w.WriteHeader(http.StatusOK)
+	})
+	s.runOne(spec)
+	if got := s.e.Rotations(); got != 1 {
+		t.Fatalf("Rotations after first procedure = %d, want 1", got)
+	}
+	if st := snapshotHost(t, s.pl, "m1.test"); st.Rotation.LastIP != "198.51.100.9" {
+		t.Fatalf("first procedure LastIP = %q, want 198.51.100.9", st.Rotation.LastIP)
+	}
+
+	// Second procedure: the baseline probes fail (route dead), the API call
+	// succeeds, and the route serves the SAME address it already had. No
+	// baseline exists, but the outcome is still not a rotation.
+	var dials atomic.Int64
+	s.e.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+		if dials.Add(1) <= 3 {
+			return nil, errors.New("route endpoint unreachable (TEST)")
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", ips.srv.Listener.Addr().String())
+	}
+	s.runOne(spec)
+
+	if got := s.e.Rotations(); got != 1 {
+		t.Fatalf("Rotations = %d, want the same-IP answer not counted", got)
+	}
+	st := snapshotHost(t, s.pl, "m1.test")
+	if st.Rotation.State != "stale" || st.Rotation.ConsecutiveSameIP != 1 || st.Rotation.LastIP != "198.51.100.9" {
+		t.Fatalf("unverified same-IP status = %+v", st.Rotation)
+	}
+}
+
+// The probe budget is measured from the moment the probe starts, not from
+// whenever its dial finishes: a slow dial eats into the caller's window
+// instead of extending the attempt past it.
+func TestProbeIPBudgetMeasuredFromEntry(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	cfg := &config.RuntimeConfig{Rotation: fastSettings()}
+	s := newSetup(t, cfg, nil, ips)
+
+	const timeout = 300 * time.Millisecond
+	deadlineSeen := make(chan time.Time, 1)
+	start := time.Now()
+	s.e.dial = func(ctx context.Context, _ *url.URL, _ string, _ time.Duration) (net.Conn, error) {
+		time.Sleep(200 * time.Millisecond) // the slow dial under test
+		conn, err := net.Dial("tcp", ips.srv.Listener.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		return &deadlineRecorder{Conn: conn, seen: deadlineSeen}, nil
+	}
+	spec := manualRoute(t, "m1.test", time.Minute, config.RotateAPI{})
+	ip, err := s.e.probeIP(context.Background(), s.gen, spec, timeout)
+	if err != nil {
+		t.Fatalf("probeIP: %v", err)
+	}
+	if ip != "203.0.113.7" {
+		t.Fatalf("ip = %q, want the served address", ip)
+	}
+	select {
+	case dl := <-deadlineSeen:
+		if budget := dl.Sub(start); budget <= 0 || budget > timeout+50*time.Millisecond {
+			t.Fatalf("conn deadline %s after probe start, want the %s budget measured from entry", budget, timeout)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("probe never armed a conn deadline")
+	}
+}
+
+// deadlineRecorder captures the deadline the probe arms on the connection.
+type deadlineRecorder struct {
+	net.Conn
+	seen chan<- time.Time
+}
+
+func (d *deadlineRecorder) SetDeadline(t time.Time) error {
+	select {
+	case d.seen <- t:
+	default:
+	}
+	return d.Conn.SetDeadline(t)
 }
 
 func TestProcedureDeadRouteRotatesUnverified(t *testing.T) {

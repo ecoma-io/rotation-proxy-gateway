@@ -22,12 +22,13 @@ func (p *Proxy) BeginRotation(phase RotationState) {
 }
 
 // SetRotationPhase advances the displayed phase (draining → rotating →
-// verifying) of a rotation already begun. It is a no-op once the route left
-// the rotating set, so a stale procedure can never resurrect the flag.
+// verifying) of a rotation already begun. The rotating flag and the state
+// write are guarded by the same lock that the terminal transitions
+// (EndRotation, MarkStale, AbandonRotation) use to clear the flag, so a
+// procedure finishing concurrently can never have its terminal state
+// overwritten by a late phase write — checking the flag outside the lock
+// would race exactly that window.
 func (p *Proxy) SetRotationPhase(phase RotationState) {
-	if !p.rotating.Load() {
-		return
-	}
 	p.mu.Lock()
 	if p.rotating.Load() {
 		p.rotationState = phase
@@ -38,7 +39,8 @@ func (p *Proxy) SetRotationPhase(phase RotationState) {
 // EndRotation records a rotation that observed a changed egress IP and returns
 // the route to serving. The recency pass is not advanced, so the freshly
 // verified route is the least recently used and absorbs traffic first. Dial
-// health is left to MarkRotated.
+// health is left to MarkRotated. The flag clears under p.mu so SetRotationPhase's
+// guarded check cannot slip between the state write and the flag clear.
 func (p *Proxy) EndRotation(ip string, at time.Time) {
 	p.mu.Lock()
 	p.rotationState = RotationIdle
@@ -46,22 +48,23 @@ func (p *Proxy) EndRotation(ip string, at time.Time) {
 	p.lastRotationAt = at
 	p.nextRetryIn = 0
 	p.consecutiveSameIP = 0
-	p.mu.Unlock()
 	p.rotating.Store(false)
+	p.mu.Unlock()
 }
 
 // MarkStale returns a route to serving after a rotation that did not change
 // its egress IP. It records the retry wait and the run of same-IP rotations,
 // and jumps the route to the weighted recency back so picks prefer fresher
-// routes until the next rotation attempt.
+// routes until the next rotation attempt. The flag clears under p.mu, as in
+// EndRotation.
 func (pl *Pool) MarkStale(p *Proxy, nextRetryIn time.Duration, consecutiveSameIP int) {
 	p.mu.Lock()
 	p.rotationState = RotationStale
 	p.nextRetryIn = nextRetryIn
 	p.consecutiveSameIP = consecutiveSameIP
+	p.rotating.Store(false)
 	p.mu.Unlock()
 	pl.jumpToBack(p)
-	p.rotating.Store(false)
 }
 
 // MarkRotated clears dial-failure health accumulated against the previous
@@ -91,8 +94,8 @@ func (p *Proxy) AbandonRotation() {
 		}
 	}
 	p.nextRetryIn = 0
-	p.mu.Unlock()
 	p.rotating.Store(false)
+	p.mu.Unlock()
 }
 
 // LastIPs returns the last verified egress IP of every manual route other than
@@ -116,12 +119,24 @@ func (pl *Pool) LastIPs(exclude *Proxy) map[string]bool {
 	return out
 }
 
+// LastIP returns the route's last verified egress IP, or "" before the first
+// verified observation.
+func (p *Proxy) LastIP() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastIP
+}
+
 // SetBaselineIP records an observed egress IP before any rotation has run —
 // the boot precheck uses it so cross-route collision checks and the status
-// view have a starting point. Unlike EndRotation it records no rotation time.
+// view have a starting point. Unlike EndRotation it records no rotation time,
+// and it never overwrites a known IP: a slow boot probe must not clobber the
+// baseline a rotation recorded while the probe was in flight.
 func (p *Proxy) SetBaselineIP(ip string) {
 	p.mu.Lock()
-	p.lastIP = ip
+	if p.lastIP == "" {
+		p.lastIP = ip
+	}
 	p.mu.Unlock()
 }
 

@@ -42,18 +42,22 @@ func (e *Engine) probeIP(ctx context.Context, gen *pool.Generation, spec config.
 		hostPort = net.JoinHostPort(checkURL.Hostname(), "443")
 	}
 
+	// The probe budget bounds the whole attempt — dial through body — and is
+	// measured from entry, not from whenever the dial happens to finish: the
+	// caller's verify loop hands over the remaining slice of its own
+	// deadline, and a slow dial must eat into that slice rather than extend
+	// the attempt. The context's deadline still wins when it is sooner.
+	start := time.Now()
+	deadline := start.Add(timeout)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+
 	conn, err := e.dial(ctx, spec.URL, hostPort, timeout)
 	if err != nil {
 		return "", err // socksdial errors are already host-only and sanitized
 	}
 	defer func() { _ = conn.Close() }()
-
-	// The probe budget bounds the connection even when the caller's context
-	// carries a later deadline: the timeout parameter is the contract.
-	deadline := time.Now().Add(timeout)
-	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
-		deadline = dl
-	}
 	if err := conn.SetDeadline(deadline); err != nil {
 		return "", &errProbe{"setting ip-check deadline failed"}
 	}
@@ -87,18 +91,25 @@ func (e *Engine) probeIP(ctx context.Context, gen *pool.Generation, spec config.
 	}
 	ip := parseIPLine(string(body))
 	if ip == "" {
-		return "", &errProbe{"ip-check response has no ip= entry"}
+		return "", &errProbe{"ip-check response has no usable ip= entry"}
 	}
 	return ip, nil
 }
 
 // parseIPLine extracts the value of the first ip= line (key=value format, as
-// served by the cloudflare trace endpoint and compatible services).
+// served by the cloudflare trace endpoint and compatible services). The value
+// must parse as an address literal: a broken or hostile endpoint serving
+// junk must fail the probe, not flow into rotation state where it would
+// defeat collision checks by never matching a real address.
 func parseIPLine(body string) string {
 	for _, line := range strings.Split(body, "\n") {
 		line = strings.TrimSpace(line)
 		if value, ok := strings.CutPrefix(line, "ip="); ok {
-			return strings.TrimSpace(value)
+			value = strings.TrimSpace(value)
+			if net.ParseIP(value) == nil {
+				return ""
+			}
+			return value
 		}
 	}
 	return ""

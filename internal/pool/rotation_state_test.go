@@ -260,3 +260,52 @@ func TestAbandonRotationReturnsRouteToServing(t *testing.T) {
 		t.Fatalf("abandon must keep stale phase: %+v", s.Rotation)
 	}
 }
+
+// SetBaselineIP exists so the boot precheck can record a starting point; it
+// must never overwrite an IP a rotation already recorded, or a slow probe
+// would clobber a fresh baseline with a stale observation.
+func TestSetBaselineIPDoesNotClobberKnownIP(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := newManualPool(t, c, "socks5://m1:1")
+	p := pl.entries[0]
+
+	p.SetBaselineIP("203.0.113.7")
+	if got := p.LastIP(); got != "203.0.113.7" {
+		t.Fatalf("LastIP = %q after the first baseline", got)
+	}
+	p.SetBaselineIP("198.51.100.9")
+	if got := p.LastIP(); got != "203.0.113.7" {
+		t.Fatalf("LastIP = %q, want the first observation kept", got)
+	}
+	// EndRotation, by contrast, always records what it verified.
+	p.EndRotation("198.51.100.9", c.now)
+	if got := p.LastIP(); got != "198.51.100.9" {
+		t.Fatalf("LastIP = %q after EndRotation, want the verified IP", got)
+	}
+}
+
+// The rotating flag and the rotation state live under one lock: once a
+// terminal transition ran, a late phase write — even one a stale procedure
+// issues after its route finished — must not resurrect a rotating phase in
+// the status view.
+func TestSetRotationPhaseAfterTerminalTransitionIsInert(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := newManualPool(t, c, "socks5://m1:1")
+	p := pl.entries[0]
+
+	p.BeginRotation(RotationDraining)
+	p.SetRotationPhase(RotationRotating)
+	p.SetRotationPhase(RotationVerifying)
+	p.EndRotation("203.0.113.7", c.now)
+	p.SetRotationPhase(RotationVerifying) // the stale procedure's late write
+	if st := findStatus(t, pl.Snapshot(), "m1:1"); st.Rotation.State != "idle" {
+		t.Fatalf("state = %q after EndRotation + late phase write, want idle", st.Rotation.State)
+	}
+
+	p.BeginRotation(RotationDraining)
+	pl.MarkStale(p, time.Second, 1)
+	p.SetRotationPhase(RotationRotating)
+	if st := findStatus(t, pl.Snapshot(), "m1:1"); st.Rotation.State != "stale" {
+		t.Fatalf("state = %q after MarkStale + late phase write, want stale", st.Rotation.State)
+	}
+}

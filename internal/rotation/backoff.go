@@ -19,7 +19,9 @@ func BackoffFor(interval time.Duration, consecutive int, max time.Duration) time
 	}
 	base := interval
 	for range consecutive - 1 {
-		if base >= max || base > time.Duration(1<<62) {
+		// Saturating doubling: base only ever doubles while it still fits
+		// under max, so no intermediate value can overflow a duration.
+		if base >= max || base > max/2 {
 			base = max
 			break
 		}

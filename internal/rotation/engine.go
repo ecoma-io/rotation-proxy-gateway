@@ -275,10 +275,14 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	if !changed {
 		consecutive := e.bumpConsecutive(id)
 		backoff := BackoffFor(spec.RotateInterval, consecutive, settings.RetryBackoffMax)
-		if retryAfter > backoff {
-			backoff = retryAfter
-		}
-		gen.Pool.MarkStale(p, backoff, consecutive)
+		// A provider Retry-After hint may extend the wait, but never past the
+		// configured ceiling: an unbounded hint would let one response silence
+		// the route's rotation retries for days.
+		backoff = min(max(retryAfter, backoff), settings.RetryBackoffMax)
+		// Mark the pool that is serving now: a reload may have swapped the
+		// generation between the gone() check and here, and jumpToBack must
+		// land on the route the live pool actually picks from.
+		e.store.Load().Pool.MarkStale(p, backoff, consecutive)
 		e.setDue(id, e.Now().Add(backoff))
 		log.Warn().Int("consecutive_same_ip", consecutive).Str("retry_in", backoff.Truncate(time.Millisecond).String()).Msg("rotation did not change the egress IP; retrying")
 		return
@@ -325,6 +329,12 @@ func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.M
 			continue
 		}
 		if verified && ip == baseline {
+			continue
+		}
+		if !verified && ip == p.LastIP() {
+			// Without a baseline, an address identical to the route's last
+			// verified one is the provider declining to rotate, not a change;
+			// counting it would inflate the rotations metric.
 			continue
 		}
 		// The collision set comes from the live pool so a reload that added
