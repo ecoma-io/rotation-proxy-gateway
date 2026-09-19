@@ -36,7 +36,13 @@ func needsSanitizing(s string) bool {
 			return true // stripANSI consumes ESC; cleanControls rewrites controls
 		}
 	}
-	return strings.Contains(s, "://") // redactUserinfo only rewrites URL tokens
+	if strings.Contains(s, "://") {
+		return true // a scheme token may carry userinfo
+	}
+	// Bare userinfo: only the user:pass@ shape matters, approximated here by
+	// any '@' with a ':' somewhere before it; redactUserinfo decides per token.
+	at := strings.LastIndexByte(s, '@')
+	return at >= 0 && strings.IndexByte(s[:at], ':') >= 0
 }
 
 // ErrorString sanitizes err.Error(), returning "" for nil.
@@ -47,44 +53,54 @@ func ErrorString(err error) string {
 	return Sanitize(err.Error())
 }
 
-// redactUserinfo replaces scheme://userinfo@ with scheme://[redacted]@.
-// It uses the last '@' within the URL token so synthetic passwords
-// containing '/', '?', or '@' are still fully redacted while the
-// host:port identity after the final '@' is preserved.
+// redactUserinfo replaces scheme://userinfo@ and bare user:pass@ with
+// [redacted]@, preserving the host:port identity after the final '@' so
+// synthetic passwords containing '/', '?', or '@' are still fully redacted.
+// Bare tokens redact only when the segment before their '@' carries ':', the
+// user:pass shape accepted in configuration, leaving mentions like an email
+// address untouched.
 func redactUserinfo(value string) string {
-	for searchFrom := 0; ; {
-		idx := strings.Index(value[searchFrom:], "://")
-		if idx < 0 {
+	if !strings.Contains(value, "://") {
+		if at := strings.LastIndexByte(value, '@'); at < 0 || strings.IndexByte(value[:at], ':') < 0 {
 			return value
 		}
-		schemeAt := searchFrom + idx
-		userinfoStart := schemeAt + len("://")
-		tokenEnd := tokenEndIndex(value, userinfoStart)
-		token := value[userinfoStart:tokenEnd]
-		at := strings.LastIndexByte(token, '@')
-		if at < 0 {
-			searchFrom = tokenEnd
-			if searchFrom >= len(value) {
-				return value
-			}
+	}
+	var b strings.Builder
+	b.Grow(len(value))
+	for i := 0; i < len(value); {
+		if isTokenBoundary(value[i]) {
+			b.WriteByte(value[i])
+			i++
 			continue
 		}
-		at += userinfoStart
-		value = value[:userinfoStart] + redacted + value[at+1:]
-		searchFrom = userinfoStart + len(redacted)
+		start := i
+		for i < len(value) && !isTokenBoundary(value[i]) {
+			i++
+		}
+		b.WriteString(redactToken(value[start:i]))
 	}
+	return b.String()
 }
 
-func tokenEndIndex(s string, from int) int {
-	for i := from; i < len(s); {
-		c := s[i]
-		// End tokens on whitespace, controls, quotes, angle brackets, backtick.
-		if c <= 0x20 || c == 0x7f || c == '"' || c == '\'' || c == '<' || c == '>' || c == '`' || c == 0x1b {
-			return i
+// redactToken redacts the userinfo of one boundary-delimited token, if any.
+func redactToken(token string) string {
+	if scheme := strings.Index(token, "://"); scheme >= 0 {
+		rest := token[scheme+len("://"):]
+		if at := strings.LastIndexByte(rest, '@'); at >= 0 {
+			return token[:scheme+len("://")] + redacted + rest[at+1:]
 		}
-		i++
+		return token
 	}
-	return len(s)
+	if at := strings.LastIndexByte(token, '@'); at > 0 && strings.IndexByte(token[:at], ':') >= 0 {
+		return redacted + token[at+1:]
+	}
+	return token
+}
+
+// isTokenBoundary reports whether c ends a diagnostic token: whitespace,
+// controls, quotes, angle brackets, or backtick.
+func isTokenBoundary(c byte) bool {
+	return c <= 0x20 || c == 0x7f || c == '"' || c == '\'' || c == '<' || c == '>' || c == '`'
 }
 
 // cleanControls strips ANSI escape sequences and neutralizes remaining

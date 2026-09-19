@@ -33,6 +33,33 @@ func TestRedactsMultipleURLs(t *testing.T) {
 	}
 }
 
+// The bare user:pass@host spelling accepted in configuration must redact too,
+// while ordinary user@host mentions (an email address) pass through untouched.
+func TestRedactsBareUserinfo(t *testing.T) {
+	for _, tc := range []struct{ name, in, want string }{
+		{"plain bare form", "user:pass@host.test:1080", "[redacted]@host.test:1080"},
+		{"inside an error", "invalid proxy user:pass@10.0.0.1:1080 (TEST)", "invalid proxy [redacted]@10.0.0.1:1080 (TEST)"},
+		{"bracketed ipv6 host", "bob:pw@[2001:db8::1]:1080", "[redacted]@[2001:db8::1]:1080"},
+		{"alongside a scheme URL", "from socks5://TESTU:TESTP@a.test:1 to TESTU2:TESTP2@b.test:2", "from socks5://[redacted]@a.test:1 to [redacted]@b.test:2"},
+		{"two bare tokens", "a:b@c.test:1 d:e@f.test:2", "[redacted]@c.test:1 [redacted]@f.test:2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Sanitize(tc.in); got != tc.want {
+				t.Fatalf("Sanitize(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+	for _, keep := range []string{
+		"alice@example.com",
+		"admin@host.test:9090",         // the port colon sits after the '@'
+		"route a:b:c:d has no at-sign", // colon-separated shape without userinfo
+	} {
+		if got := Sanitize(keep); got != keep {
+			t.Fatalf("Sanitize(%q) = %q, want unchanged", keep, got)
+		}
+	}
+}
+
 func TestNeutralizesANSIAndControls(t *testing.T) {
 	in := "fail\x1b[31mred\x1b[0m\nsecond\tline\rend\x07"
 	got := Sanitize(in)
