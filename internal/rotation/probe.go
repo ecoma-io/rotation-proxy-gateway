@@ -20,6 +20,8 @@ import (
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/sanitize"
+
+	"github.com/rs/zerolog"
 )
 
 // errProbe describes one failed egress-IP probe. Only fixed labels and
@@ -118,7 +120,8 @@ func parseIPLine(body string) string {
 // baselineProbe tries to learn the route's egress IP before rotating. After
 // baselineAttempts failures the rotation proceeds unverified: the first
 // observed non-colliding IP after the rotate API call counts as the new IP.
-func (e *Engine) baselineProbe(ctx context.Context, gen *pool.Generation, spec config.ManualRouteSpec, timeout time.Duration) (string, bool) {
+// Each failed attempt is logged at debug — sanitized, fixed labels only.
+func (e *Engine) baselineProbe(ctx context.Context, gen *pool.Generation, spec config.ManualRouteSpec, timeout time.Duration, log zerolog.Logger) (string, bool) {
 	for attempt := range baselineAttempts {
 		if ctx.Err() != nil {
 			return "", false
@@ -127,6 +130,7 @@ func (e *Engine) baselineProbe(ctx context.Context, gen *pool.Generation, spec c
 		if err == nil {
 			return ip, true
 		}
+		log.Debug().Int("attempt", attempt+1).Str("error", sanitize.ErrorString(err)).Msg("baseline probe attempt failed")
 		if attempt < baselineAttempts-1 {
 			if !sleepCtx(ctx, probeRetryPause) {
 				return "", false

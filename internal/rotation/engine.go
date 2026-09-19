@@ -35,6 +35,10 @@ const (
 	probeRetryPause  = time.Second
 )
 
+// dlog renders a duration for log fields at millisecond precision, matching
+// the proxy server's duration fields.
+func dlog(d time.Duration) string { return d.Truncate(time.Millisecond).String() }
+
 // Engine schedules and runs rotation procedures for manual routes. Run drives
 // one Engine; all methods are safe for concurrent use.
 type Engine struct {
@@ -131,20 +135,23 @@ func (e *Engine) bootPrecheck(ctx context.Context, gen *pool.Generation) {
 		if p == nil || !e.store.Load().Pool.Contains(p) {
 			continue
 		}
-		first, ok := e.baselineProbe(ctx, gen, spec, gen.Config.Rotation.IPCheckTimeout)
+		log := e.log.With().Str("route", p.URL.Host).Str("kind", string(p.Kind)).Logger()
+		first, ok := e.baselineProbe(ctx, gen, spec, gen.Config.Rotation.IPCheckTimeout, log)
 		if !ok {
-			e.log.Warn().Str("route", p.URL.Host).Msg("boot baseline probe failed; the route starts unverified")
+			log.Warn().Msg("boot baseline probe failed; the route starts unverified")
 			continue
 		}
-		second, ok := e.baselineProbe(ctx, gen, spec, gen.Config.Rotation.IPCheckTimeout)
+		second, ok := e.baselineProbe(ctx, gen, spec, gen.Config.Rotation.IPCheckTimeout, log)
 		if !ok {
 			p.SetBaselineIP(first)
+			log.Debug().Msg("second boot probe failed; keeping the first baseline")
 			continue
 		}
 		if first != second {
-			e.log.Warn().Str("route", p.URL.Host).Msg("route egress IP changed between boot probes without a rotation; provider IPs are not sticky")
+			log.Warn().Msg("route egress IP changed between boot probes without a rotation; provider IPs are not sticky")
 		}
 		p.SetBaselineIP(second)
+		log.Debug().Str("egress_ip", second).Msg("boot baseline set")
 	}
 }
 
@@ -165,6 +172,7 @@ func (e *Engine) evaluate(ctx context.Context) {
 		if _, scheduled := e.due[id]; !scheduled {
 			// A route added by a reload rotates on the next cycle.
 			e.due[id] = now
+			e.log.Debug().Str("route", spec.RouteSpec.URL.Host).Msg("route added by reload; due immediately")
 		}
 	}
 	for id := range e.due {
@@ -193,10 +201,15 @@ func (e *Engine) evaluate(ctx context.Context) {
 			continue
 		}
 		if active >= cap {
+			// The routine not-due and already-active skips stay silent — they
+			// are the common case and would log every tick. A due route held
+			// back by the cap is the diagnosable anomaly.
+			e.log.Debug().Str("route", spec.RouteSpec.URL.Host).Msg("rotation due but the concurrency cap is reached")
 			return
 		}
 		p := gen.Pool.Lookup(id)
 		if p == nil {
+			e.log.Debug().Str("route", spec.RouteSpec.URL.Host).Msg("rotation due but the route is not in the live pool")
 			continue
 		}
 		e.active[id] = p
@@ -219,8 +232,24 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	settings := gen.Config.Rotation
 	log := e.log.With().Str("route", p.URL.Host).Str("kind", string(p.Kind)).Logger()
 
+	// Phase transitions carry how long the previous phase took and how far
+	// the procedure is from its start: together they answer "where did the
+	// rotation spend its time" without cross-referencing timestamps.
+	started, phaseStart, phase := e.Now(), e.Now(), "draining"
+	enterPhase := func(name string) {
+		log.Debug().Str("phase", name).Str("previous", phase).
+			Str("in_previous", dlog(e.Now().Sub(phaseStart))).
+			Str("since_start", dlog(e.Now().Sub(started))).
+			Msg("rotation phase entered")
+		phase, phaseStart = name, e.Now()
+	}
+
 	p.BeginRotation(pool.RotationDraining)
-	log.Debug().Str("phase", "draining").Msg("rotation procedure started")
+	drainEv := log.Debug().Str("phase", "draining").Str("drain_timeout", dlog(settings.DrainTimeout))
+	if n := p.InFlight(); n > 0 {
+		drainEv = drainEv.Int("in_flight", n)
+	}
+	drainEv.Msg("rotation procedure started")
 
 	// 1. Drain in-flight work, bounded by rotation.drain-timeout. Expiry
 	// abandons the wait and rotates anyway: in-flight work keeps running
@@ -228,7 +257,7 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	drainDeadline := e.Now().Add(settings.DrainTimeout)
 	for p.InFlight() > 0 {
 		if !e.Now().Before(drainDeadline) {
-			log.Warn().Msg("drain timeout expired; forcing rotation")
+			log.Warn().Int("in_flight", p.InFlight()).Msg("drain timeout expired; forcing rotation")
 			break
 		}
 		if gone() {
@@ -248,7 +277,8 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	// 2. Baseline: what the egress IP is before rotating. Without it the
 	// rotation can only be verified as "not colliding with other routes".
 	p.SetRotationPhase(pool.RotationRotating)
-	baseline, verified := e.baselineProbe(ctx, gen, spec, settings.IPCheckTimeout)
+	enterPhase("rotating")
+	baseline, verified := e.baselineProbe(ctx, gen, spec, settings.IPCheckTimeout, log)
 	if gone() {
 		p.AbandonRotation()
 		return
@@ -263,7 +293,8 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	// 4. Verify: the egress IP must actually have changed. Carriers can hand
 	// back the same address, which does not count as a rotation.
 	p.SetRotationPhase(pool.RotationVerifying)
-	newIP, changed := e.verify(ctx, gen, spec, p, baseline, verified, settings, apiErr != nil)
+	enterPhase("verifying")
+	newIP, changed := e.verify(ctx, gen, spec, p, baseline, verified, settings, apiErr != nil, log)
 
 	if gone() {
 		p.AbandonRotation()
@@ -284,7 +315,13 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 		// land on the route the live pool actually picks from.
 		e.store.Load().Pool.MarkStale(p, backoff, consecutive)
 		e.setDue(id, e.Now().Add(backoff))
-		log.Warn().Int("consecutive_same_ip", consecutive).Str("retry_in", backoff.Truncate(time.Millisecond).String()).Msg("rotation did not change the egress IP; retrying")
+		warnEv := log.Warn().Int("consecutive_same_ip", consecutive).Str("retry_in", dlog(backoff))
+		if retryAfter > 0 {
+			// The provider's raw hint, before the ceiling clamp: the gap
+			// between it and retry_in is the clamp at work.
+			warnEv = warnEv.Str("retry_after_hint", dlog(retryAfter))
+		}
+		warnEv.Msg("rotation did not change the egress IP; retrying")
 		return
 	}
 
@@ -295,14 +332,16 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	p.EndRotation(newIP, e.Now())
 	e.rotations.Add(1)
 	e.setDue(id, e.Now().Add(spec.RotateInterval))
-	log.Info().Str("egress_ip", newIP).Str("next_in", spec.RotateInterval.Truncate(time.Millisecond).String()).Msg("rotation complete")
+	log.Info().Str("egress_ip", newIP).Str("next_in", dlog(spec.RotateInterval)).Msg("rotation complete")
 }
 
 // verify polls the route's egress IP until it differs from the baseline and
 // no other manual route reports it. With an unknown baseline any
 // non-colliding IP counts. apiFailed shortens the window to a single probe:
-// the call failed, but the provider may have rotated anyway.
-func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.ManualRouteSpec, p *pool.Proxy, baseline string, verified bool, settings config.RotationSettings, apiFailed bool) (string, bool) {
+// the call failed, but the provider may have rotated anyway. Each rejected
+// candidate is logged at debug — when verification fails, these lines are
+// the only record of why.
+func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.ManualRouteSpec, p *pool.Proxy, baseline string, verified bool, settings config.RotationSettings, apiFailed bool, log zerolog.Logger) (string, bool) {
 	deadline := e.Now().Add(settings.IPCheckTimeout)
 	for attempt := 0; ; attempt++ {
 		if ctx.Err() != nil {
@@ -326,15 +365,18 @@ func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.M
 		}
 		ip, err := e.probeIP(ctx, gen, spec, remaining)
 		if err != nil {
+			log.Debug().Int("attempt", attempt+1).Str("error", sanitize.ErrorString(err)).Msg("ip check probe failed")
 			continue
 		}
 		if verified && ip == baseline {
+			log.Debug().Int("attempt", attempt+1).Str("egress_ip", ip).Msg("ip unchanged since the baseline")
 			continue
 		}
 		if !verified && ip == p.LastIP() {
 			// Without a baseline, an address identical to the route's last
 			// verified one is the provider declining to rotate, not a change;
 			// counting it would inflate the rotations metric.
+			log.Debug().Int("attempt", attempt+1).Str("egress_ip", ip).Msg("ip matches the route's last verified address")
 			continue
 		}
 		// The collision set comes from the live pool so a reload that added
@@ -342,6 +384,7 @@ func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.M
 		if e.store.Load().Pool.LastIPs(p)[ip] {
 			// The "new" IP is another manual route's current address; that
 			// defeats rotating either route. Keep waiting for a distinct one.
+			log.Debug().Int("attempt", attempt+1).Str("egress_ip", ip).Msg("ip collides with another manual route")
 			continue
 		}
 		return ip, true

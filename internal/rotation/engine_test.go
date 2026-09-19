@@ -1,9 +1,11 @@
 package rotation
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -11,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1166,5 +1169,89 @@ func TestRunCancelAbandonsActiveProcedure(t *testing.T) {
 	case <-handlerDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("rotate API handler never finished")
+	}
+}
+
+// logBuf is a mutex-guarded capture buffer for engine log records.
+type logBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *logBuf) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (w *logBuf) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.String()
+}
+
+// logRecords decodes the captured JSON lines; undecodable lines are skipped.
+func logRecords(output string) []map[string]any {
+	var recs []map[string]any
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		recs = append(recs, rec)
+	}
+	return recs
+}
+
+func findLogRecord(recs []map[string]any, want map[string]string) map[string]any {
+	for _, rec := range recs {
+		ok := true
+		for k, v := range want {
+			if fmt.Sprint(rec[k]) != v {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return rec
+		}
+	}
+	return nil
+}
+
+// A completed procedure must leave a phase trail: entering rotating and
+// verifying records how long the previous phase took and how far the
+// procedure is from its start, so a slow rotation is attributable to a phase
+// without cross-referencing timestamps.
+func TestProcedureLogsPhaseTransitions(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	ips.unique.Store(true) // every probe observes a fresh IP, so verify succeeds
+	api := newAPIServer(t)
+	spec := manualRoute(t, "m1.test", 90*time.Second, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+	var buf logBuf
+	s.e.log = logging.New(&buf)
+
+	s.runOne(cfg.ManualRoutes[0])
+
+	recs := logRecords(buf.String())
+	for _, phase := range []string{"rotating", "verifying"} {
+		rec := findLogRecord(recs, map[string]string{"msg": "rotation phase entered", "phase": phase})
+		if rec == nil {
+			t.Fatalf("no phase-entered record for %q:\n%s", phase, buf.String())
+		}
+		for _, key := range []string{"previous", "in_previous", "since_start"} {
+			if _, has := rec[key]; !has {
+				t.Errorf("phase %q record missing %q: %v", phase, key, rec)
+			}
+		}
+	}
+	if rec := findLogRecord(recs, map[string]string{"msg": "rotation complete"}); rec == nil {
+		t.Errorf("no completion record:\n%s", buf.String())
 	}
 }
