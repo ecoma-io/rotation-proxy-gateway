@@ -78,7 +78,14 @@ timed loop entirely (the tunnel is established once, before `ResetTimer`).
 - `B/op` and `allocs/op` cover **the test process only** (client + SOCKS sim +
   HTTP target server, which are in-process). The gateway is a separate OS
   process; its memory is invisible to these counters, though its cost is
-  included in ns/op.
+  included in ns/op. Gateway-internal allocation or pick-path work therefore
+  needs the in-process micro-benches instead: `internal/socksdial`
+  (`BenchmarkDial`, `BenchmarkDialAuthenticated` — full outbound handshake per
+  iteration) and `internal/pool` (`BenchmarkPickFor`, `BenchmarkPickForBalanced`
+  — pick, report, release under full parallelism). Loopback e2e `ns/op` is
+  handshake-RTT-dominated and routinely cannot resolve a real few-percent
+  gateway win; a pinned unit test (for example the inbound framing read
+  budget) can prove a deterministic improvement the benchmark cannot see.
 - The echo/bulk body target (a prebuilt `[]byte` written per request) and the
   in-process SOCKS sim contribute their own allocations to proxied benchmarks;
   same-target before/after comparisons cancel them out, absolute values do not.
