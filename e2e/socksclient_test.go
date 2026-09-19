@@ -43,43 +43,43 @@ func dialSocksTunnel(ctx context.Context, proxyAddr, targetAddr string) (net.Con
 		return nil, fmt.Errorf("dial gateway: %w", err)
 	}
 	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("send greeting: %w", err)
 	}
 	choice := make([]byte, 2)
 	if _, err := io.ReadFull(conn, choice); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("read method selection: %w", err)
 	}
 	if choice[0] != 0x05 || choice[1] != 0x00 {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("unexpected method selection 0x%02x 0x%02x", choice[0], choice[1])
 	}
 	req, err := socksConnectRequestBytes(targetAddr)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	if _, err := conn.Write(req); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("send connect: %w", err)
 	}
 	head := make([]byte, 4)
 	if _, err := io.ReadFull(conn, head); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("read connect reply: %w", err)
 	}
 	if head[0] != 0x05 {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("unexpected reply version 0x%02x", head[0])
 	}
 	if head[1] != 0x00 {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("gateway rejected CONNECT with reply 0x%02x", head[1])
 	}
 	// BND.ADDR/PORT must be ignored, but the frame must still be consumed.
 	if err := discardSocksBND(conn, head[3]); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	return conn, nil

@@ -174,19 +174,6 @@ func newSocksServer(t *testing.T, pl *pool.Pool, runtime *config.RuntimeConfig, 
 	return srv, startServer(t, srv)
 }
 
-// newRunningServer builds the common fixture: one SOCKS server over a pool
-// holding the given upstream routes, already listening.
-func newRunningServer(t *testing.T, log zerolog.Logger, socks ...*fakeSocks) (*Server, string, *pool.Pool) {
-	t.Helper()
-	urls := make([]*url.URL, 0, len(socks))
-	for _, fs := range socks {
-		urls = append(urls, fs.URL)
-	}
-	pl := pool.NewRoutes(mixedRoutes(urls...), 30*time.Second, time.Minute, config.KindBalance{})
-	s, addr := newSocksServer(t, pl, defaultRuntime(), log)
-	return s, addr, pl
-}
-
 // --- SOCKS5 client helpers -------------------------------------------------
 
 // socksGreetingFrame encodes VER NMETHODS METHODS...

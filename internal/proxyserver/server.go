@@ -287,7 +287,7 @@ func (s *Server) serveConn(conn net.Conn) {
 	// A client that pipelined payload behind the CONNECT frame must have
 	// those bytes relayed, not dropped: they ride a prefix wrapper ahead of
 	// the socket reads.
-	var client net.Conn = conn
+	client := conn
 	if n := br.Buffered(); n > 0 {
 		prefix := make([]byte, n)
 		if _, err := io.ReadFull(br, prefix); err != nil {
@@ -421,11 +421,13 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 			// A broken upstream must not masquerade as a clean end of stream:
 			// reset the client side so a truncated stream stays truncated.
 			if tc, ok := clientConn.(*net.TCPConn); ok {
-				tc.SetLinger(0)
+				// Best-effort: a failed SO_LINGER still leaves the close to
+				// end the stream, just with a FIN instead of a RST.
+				_ = tc.SetLinger(0)
 				log.Debug().Msg("upstream broke the tunnel; client side set to reset on close")
 			}
 		}
-		clientConn.Close() // unblocks the client-to-upstream direction
+		_ = clientConn.Close() // unblocks the client-to-upstream direction
 	}()
 	n, err := copyWithPooledBuffer(upstream, clientConn)
 	closes <- relayResult{direction: relayToUpstream, bytes: n, err: err}
@@ -697,7 +699,7 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		io.WriteString(w, "ok\n")
+		_, _ = io.WriteString(w, "ok\n")
 	})
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -727,7 +729,7 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 		if rotations != nil {
 			status["rotations"] = rotations()
 		}
-		json.NewEncoder(w).Encode(status)
+		_ = json.NewEncoder(w).Encode(status)
 	})
 	return mux
 }

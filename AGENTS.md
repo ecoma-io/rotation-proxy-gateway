@@ -21,8 +21,9 @@ go build -ldflags "-X main.version=0.1.0-dev" -o bin/rpgw ./cmd/rotation-proxy-g
 
 The source supports Go ≥ 1.25; Docker builds with Go 1.27. Viper is used for
 runtime YAML loading and validation; hot reload is a self-contained 1s
-content-hash poller (`internal/config.Poller`). Style rules: use
-`math/rand/v2` (never `math/rand`) and `for range n` loops.
+content-hash poller (`internal/config.Poller`). Style rules: source randomness from `crypto/rand` (the semgrep
+security gate rejects every `math/rand` variant, v2 included) and use
+`for range n` loops.
 
 ## Configure and run
 
