@@ -198,10 +198,10 @@ func TestLastAttemptFailureIsNotAFailover(t *testing.T) {
 	if status := s.ListenerStatus(); status.Requests != 1 || status.Failovers != 0 {
 		t.Fatalf("listener status = %+v, want the single failed attempt not counted as a fallback", status)
 	}
-	if _, ok := findRecord(logs.String(), map[string]string{"msg": "tunnel failed", "error_kind": "no_route", "attempts": "1",
-		"pool_size": "1", "kind_routes": "1", "excluded": "1"}); !ok {
-		t.Fatalf("no_route record missing or wrong:\n%s", logs.String())
-	}
+	// The reply can reach the client before the session goroutine flushes its
+	// closing log record, so poll instead of asserting immediately.
+	waitForRecord(t, &logs, map[string]string{"msg": "tunnel failed", "error_kind": "no_route", "attempts": "1",
+		"pool_size": "1", "kind_routes": "1", "excluded": "1"})
 }
 
 // A retry chain that outlives the inbound handshake window must stop before

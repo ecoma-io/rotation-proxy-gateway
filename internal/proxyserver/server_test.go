@@ -1,6 +1,7 @@
 package proxyserver
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -471,7 +473,7 @@ func TestReadSocksRequestAcceptsConnectTargets(t *testing.T) {
 			}
 			results := make(chan outcome, 1)
 			go func() {
-				req, err := readSocksRequest(serverSide)
+				req, err := readSocksRequest(bufio.NewReader(serverSide), serverSide)
 				results <- outcome{req: req, err: err}
 			}()
 			if _, err := clientSide.Write(socksGreetingFrame(socksAuthNone)); err != nil {
@@ -503,6 +505,134 @@ func TestReadSocksRequestAcceptsConnectTargets(t *testing.T) {
 				t.Fatal("readSocksRequest did not finish")
 			}
 		})
+	}
+}
+
+// A client may pipeline payload behind the CONNECT frame in one write. The
+// framing reader captures those bytes, so they must reach the upstream relay
+// rather than being dropped with the handshake buffers.
+func TestPipelinedBytesAfterConnectReachRelay(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute, config.KindBalance{})
+	_, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
+	target := startRawEchoTarget(t)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	frame, err := socksRequestFrame(socksCmdConnect, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("pipelined-payload")
+	// One write: greeting, CONNECT frame, and payload together — a single
+	// socket segment is exactly the case a field-by-field reader would break.
+	burst := append(socksGreetingFrame(socksAuthNone), frame...)
+	burst = append(burst, payload...)
+	if _, err := conn.Write(burst); err != nil {
+		t.Fatalf("write burst: %v", err)
+	}
+	method := make([]byte, 2)
+	if _, err := io.ReadFull(conn, method); err != nil {
+		t.Fatalf("read method selection: %v", err)
+	}
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatalf("read SOCKS reply: %v", err)
+	}
+	if reply[1] != socksReplySuccess {
+		t.Fatalf("CONNECT reply = 0x%02x, want success", reply[1])
+	}
+	// The echo target's banner crosses the tunnel first; the payload follows.
+	banner := make([]byte, len("banner\n"))
+	if _, err := io.ReadFull(conn, banner); err != nil {
+		t.Fatalf("read banner: %v", err)
+	}
+	echo := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, echo); err != nil {
+		t.Fatalf("read echoed payload: %v", err)
+	}
+	if !bytes.Equal(echo, payload) {
+		t.Fatalf("echoed payload = %q, want %q", echo, payload)
+	}
+}
+
+// countingConn counts how many reads the server's framing performed on the
+// client socket.
+type countingConn struct {
+	net.Conn
+	reads atomic.Int64
+}
+
+func (c *countingConn) Read(b []byte) (int, error) {
+	c.reads.Add(1)
+	return c.Conn.Read(b)
+}
+
+// A complete greeting+CONNECT burst must be framed with at most two client
+// reads: the buffered framing reader captures the whole exchange in one fill,
+// and one extra read is the split-burst allowance for real TCP fragmentation.
+// The field-by-field framing this replaced needed four reads (greeting head,
+// methods, request head, target) for the same burst.
+func TestInboundFramingReadBudget(t *testing.T) {
+	pl := pool.NewRoutes(nil, 30*time.Second, time.Minute, config.KindBalance{})
+	s := newRuntimeServer(pl, defaultRuntime(), testLogger())
+
+	// A real TCP socket, not net.Pipe: the pipe is synchronous, so a burst
+	// write would deadlock against the server's method-selection reply. TCP
+	// buffers decouple the directions and keep the server-side read count
+	// exact — each framing read is one syscall however the segments land.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	accepted := make(chan *countingConn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		cc := &countingConn{Conn: c}
+		if s.beginSession(cc) {
+			s.serveConn(cc)
+		}
+		accepted <- cc
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	frame, err := socksRequestFrame(socksCmdConnect, "127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	burst := append(socksGreetingFrame(socksAuthNone), frame...)
+	if _, err := conn.Write(burst); err != nil {
+		t.Fatalf("write burst: %v", err)
+	}
+	// No routes exist, so the framing ends in the no_route reply.
+	method := make([]byte, 2)
+	if _, err := io.ReadFull(conn, method); err != nil {
+		t.Fatalf("read method selection: %v", err)
+	}
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatalf("read no_route reply: %v", err)
+	}
+	if reply[1] != socksReplyGeneral {
+		t.Fatalf("reply code = 0x%02x, want general failure", reply[1])
+	}
+	cc := <-accepted
+	if n := cc.reads.Load(); n == 0 || n > 2 {
+		t.Fatalf("framing used %d reads for one burst, want 1-2", n)
 	}
 }
 

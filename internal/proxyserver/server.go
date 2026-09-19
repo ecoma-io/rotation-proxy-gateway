@@ -4,6 +4,7 @@
 package proxyserver
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -259,7 +260,18 @@ func (s *Server) serveConn(conn net.Conn) {
 	deadline := time.Now().Add(inboundHandshakeTimeout)
 	conn.SetDeadline(deadline) //nolint:errcheck // best-effort hardening
 
-	req, err := readSocksRequest(conn)
+	// One pooled reader frames the whole inbound exchange: the greeting and
+	// CONNECT frame then cost one or two socket reads instead of one per
+	// field, and bytes the client pipelined behind the frame stay available
+	// for the relay instead of being dropped.
+	br := inboundBufPool.Get().(*bufio.Reader)
+	br.Reset(conn)
+	defer func() {
+		br.Reset(nil)
+		inboundBufPool.Put(br)
+	}()
+
+	req, err := readSocksRequest(br, conn)
 	if err != nil {
 		s.log.Debug().Str("error_kind", "bad_request").Str("error", socksRejectLogValue(err)).Msg("socks request rejected")
 		return
@@ -272,7 +284,19 @@ func (s *Server) serveConn(conn net.Conn) {
 
 	requestID := s.requests.Add(1)
 	log := s.log.With().Int64("request_id", int64(requestID)).Logger()
-	s.serveTunnel(conn, req.target, deadline, log)
+	// A client that pipelined payload behind the CONNECT frame must have
+	// those bytes relayed, not dropped: they ride a prefix wrapper ahead of
+	// the socket reads.
+	var client net.Conn = conn
+	if n := br.Buffered(); n > 0 {
+		prefix := make([]byte, n)
+		if _, err := io.ReadFull(br, prefix); err != nil {
+			// The framing socket just failed; there is nothing to serve.
+			return
+		}
+		client = &prefixConn{Conn: conn, prefix: prefix}
+	}
+	s.serveTunnel(client, req.target, deadline, log)
 }
 
 // serveTunnel dials the target through the pool with the retry/exclude loop,
@@ -420,15 +444,17 @@ type socksRequest struct {
 }
 
 // readSocksRequest performs the RFC 1928 greeting (version 5, NO
-// AUTHENTICATION REQUIRED only) and reads one request. Parse failures return
-// an error and the connection must simply close: the RFC defines no reply for
-// a request the server could not parse, and an unknown address type makes the
-// frame length unknowable. Parseable but unsupported commands (BIND, UDP
-// ASSOCIATE) return with the command so the caller can answer 0x07.
-func readSocksRequest(conn net.Conn) (socksRequest, error) {
+// AUTHENTICATION REQUIRED only) and reads one request. Reads come from br so
+// a buffered framing captures the whole exchange in as few socket reads as
+// possible; protocol replies are written to w. Parse failures return an error
+// and the connection must simply close: the RFC defines no reply for a request
+// the server could not parse, and an unknown address type makes the frame
+// length unknowable. Parseable but unsupported commands (BIND, UDP ASSOCIATE)
+// return with the command so the caller can answer 0x07.
+func readSocksRequest(br *bufio.Reader, w io.Writer) (socksRequest, error) {
 	// Greeting: VER NMETHODS METHODS...
 	head := make([]byte, 2)
-	if _, err := io.ReadFull(conn, head); err != nil {
+	if _, err := io.ReadFull(br, head); err != nil {
 		return socksRequest{}, fmt.Errorf("read greeting: %w", err)
 	}
 	if head[0] != socksVersion {
@@ -438,7 +464,7 @@ func readSocksRequest(conn net.Conn) (socksRequest, error) {
 		return socksRequest{}, errors.New("empty method list")
 	}
 	methods := make([]byte, head[1])
-	if _, err := io.ReadFull(conn, methods); err != nil {
+	if _, err := io.ReadFull(br, methods); err != nil {
 		return socksRequest{}, fmt.Errorf("read methods: %w", err)
 	}
 	offered := false
@@ -449,16 +475,16 @@ func readSocksRequest(conn net.Conn) (socksRequest, error) {
 		}
 	}
 	if !offered {
-		conn.Write([]byte{socksVersion, socksAuthUnaccepted}) //nolint:errcheck // the connection closes either way
+		w.Write([]byte{socksVersion, socksAuthUnaccepted}) //nolint:errcheck // the connection closes either way
 		return socksRequest{}, errors.New("no acceptable authentication method")
 	}
-	if _, err := conn.Write([]byte{socksVersion, socksAuthNone}); err != nil {
+	if _, err := w.Write([]byte{socksVersion, socksAuthNone}); err != nil {
 		return socksRequest{}, fmt.Errorf("write method selection: %w", err)
 	}
 
 	// Request: VER CMD RSV ATYP DST.ADDR DST.PORT
 	req := make([]byte, 4)
-	if _, err := io.ReadFull(conn, req); err != nil {
+	if _, err := io.ReadFull(br, req); err != nil {
 		return socksRequest{}, fmt.Errorf("read request: %w", err)
 	}
 	if req[0] != socksVersion {
@@ -470,7 +496,7 @@ func readSocksRequest(conn net.Conn) (socksRequest, error) {
 	switch atyp := req[3]; atyp {
 	case socksAtypIPv4:
 		addr := make([]byte, 6)
-		if _, err := io.ReadFull(conn, addr); err != nil {
+		if _, err := io.ReadFull(br, addr); err != nil {
 			return socksRequest{}, fmt.Errorf("read IPv4 target: %w", err)
 		}
 		target, err := joinSocksTarget(net.IP(addr[:4]).String(), addr[4:])
@@ -480,18 +506,18 @@ func readSocksRequest(conn net.Conn) (socksRequest, error) {
 		return socksRequest{target: target, cmd: req[1]}, nil
 	case socksAtypDomain:
 		lenByte := make([]byte, 1)
-		if _, err := io.ReadFull(conn, lenByte); err != nil {
+		if _, err := io.ReadFull(br, lenByte); err != nil {
 			return socksRequest{}, fmt.Errorf("read domain length: %w", err)
 		}
 		if lenByte[0] == 0 {
 			return socksRequest{}, errors.New("empty domain name")
 		}
 		name := make([]byte, lenByte[0])
-		if _, err := io.ReadFull(conn, name); err != nil {
+		if _, err := io.ReadFull(br, name); err != nil {
 			return socksRequest{}, fmt.Errorf("read domain target: %w", err)
 		}
 		portBytes := make([]byte, 2)
-		if _, err := io.ReadFull(conn, portBytes); err != nil {
+		if _, err := io.ReadFull(br, portBytes); err != nil {
 			return socksRequest{}, fmt.Errorf("read domain port: %w", err)
 		}
 		target, err := joinSocksTarget(string(name), portBytes)
@@ -501,7 +527,7 @@ func readSocksRequest(conn net.Conn) (socksRequest, error) {
 		return socksRequest{target: target, cmd: req[1]}, nil
 	case socksAtypIPv6:
 		addr := make([]byte, 18)
-		if _, err := io.ReadFull(conn, addr); err != nil {
+		if _, err := io.ReadFull(br, addr); err != nil {
 			return socksRequest{}, fmt.Errorf("read IPv6 target: %w", err)
 		}
 		target, err := joinSocksTarget(net.IP(addr[:16]).String(), addr[16:])
@@ -547,6 +573,34 @@ func copyWithPooledBuffer(dst io.Writer, src io.Reader) (int64, error) {
 	n, err := io.CopyBuffer(dst, src, *bufp)
 	copyBufPool.Put(bufp)
 	return n, err
+}
+
+// inboundBufPool lends the buffered readers that frame inbound SOCKS5
+// exchanges. Greeting and CONNECT frame together stay under 300 bytes, so
+// one 4KiB fill usually captures the whole exchange in a single socket read
+// where field-by-field ReadFulls cost four to six.
+const inboundBufSize = 4 << 10
+
+var inboundBufPool = sync.Pool{
+	New: func() any { return bufio.NewReaderSize(nil, inboundBufSize) },
+}
+
+// prefixConn serves the bytes a client pipelined behind its CONNECT frame —
+// already pulled into the framing reader — before falling through to the
+// socket. It is the inbound mirror of socksdial's upstream-side prefix
+// handling: a pipelining client's bytes must be relayed, not dropped.
+type prefixConn struct {
+	net.Conn
+	prefix []byte
+}
+
+func (c *prefixConn) Read(b []byte) (int, error) {
+	if len(c.prefix) > 0 {
+		n := copy(b, c.prefix)
+		c.prefix = c.prefix[n:]
+		return n, nil
+	}
+	return c.Conn.Read(b)
 }
 
 // relayResult is the outcome of one direction of an established tunnel relay.
