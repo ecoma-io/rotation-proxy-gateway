@@ -236,11 +236,12 @@ func TestLoadRuntimeStrictAndCredentialSafe(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			content := validRuntimeConfig
-			if tc.name == "invalid kind" {
+			switch tc.name {
+			case "invalid kind":
 				content = strings.Replace(content, "      kind: v4\n", tc.mutate, 1)
-			} else if tc.name == "per route override" {
+			case "per route override":
 				content = strings.Replace(content, "      kind: v4\n", "      kind: v4\n"+tc.mutate, 1)
-			} else {
+			default:
 				content += tc.mutate
 			}
 			_, err := LoadRuntime(writeRuntimeConfig(t, content), runtimeBootstrap(t))
