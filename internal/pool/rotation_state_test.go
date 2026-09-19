@@ -159,7 +159,7 @@ func TestMarkStaleRecordsRetryAndDeprioritizes(t *testing.T) {
 	pl := newManualPool(t, c, "socks5://m1:1", "socks5://m2:2")
 	stale := pl.entries[1]
 
-	// Without the stale bump, m2 (usedSeq 0) would win this LRU pick.
+	// Without the stale bump, m2 (pass 0) would win this LRU pick.
 	pl.PickFor(nil, nil) // m1
 	stale.BeginRotation(RotationVerifying)
 	pl.MarkStale(stale, 90*time.Second, 2)
@@ -224,7 +224,7 @@ func TestReconfigureKeepsRotationStateForUnchangedIdentity(t *testing.T) {
 func TestLastIPsExcludesRouteAndAutoOrigin(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newManualPool(t, c, "socks5://m1:1", "socks5://m2:2")
-	pl.entries = append(pl.entries, newProxy(config.RouteSpec{URL: mustURL(t, "socks5://a1:1"), Kind: config.EgressV4, Origin: config.RouteOriginAuto}))
+	pl.entries = append(pl.entries, newProxy(config.RouteSpec{URL: mustURL(t, "socks5://a1:1"), Kind: config.EgressV4, Origin: config.RouteOriginAuto}, 0))
 
 	pl.entries[0].EndRotation("203.0.113.1", c.now)
 	pl.entries[1].EndRotation("203.0.113.2", c.now)

@@ -26,6 +26,11 @@ const (
 	// 60s docker stop_grace_period and a 90s systemd TimeoutStopSec.
 	DefaultShutdownGrace = 55 * time.Second
 
+	// Route selection weight defaults and bounds. Weight shapes how often a
+	// route is picked relative to its peers; 1 makes every route equal.
+	DefaultRouteWeight = 1
+	MaxRouteWeight     = 1000
+
 	// Rotation defaults. These bound how manual routes rotate their egress IP
 	// through their provider API; every one is overridable in the rotation
 	// block of the runtime YAML.
@@ -58,10 +63,15 @@ const (
 )
 
 // RouteSpec is one validated static SOCKS route from the runtime config.
+// Weight is the route's selection weight in [DefaultRouteWeight, MaxRouteWeight]:
+// a route is picked proportionally to its weight against its eligible peers.
+// It is deliberately not part of the route identity — a reload that only
+// retunes weights keeps the route's health state.
 type RouteSpec struct {
 	URL    *url.URL
 	Kind   EgressKind
 	Origin RouteOrigin
+	Weight int
 }
 
 // ManualRouteSpec is one validated API-rotated SOCKS route. Besides the SOCKS
@@ -199,13 +209,15 @@ type proxiesFileConfig struct {
 }
 
 type autoProxyFileConfig struct {
-	Proxy string `mapstructure:"proxy"`
-	Kind  string `mapstructure:"kind"`
+	Proxy  string `mapstructure:"proxy"`
+	Kind   string `mapstructure:"kind"`
+	Weight any    `mapstructure:"weight"`
 }
 
 type manualProxyFileConfig struct {
 	Proxy          string        `mapstructure:"proxy"`
 	Kind           string        `mapstructure:"kind"`
+	Weight         any           `mapstructure:"weight"`
 	RotateInterval string        `mapstructure:"rotate-interval"`
 	API            apiFileConfig `mapstructure:"api"`
 }
@@ -560,7 +572,27 @@ func parseRouteSpec(raw autoProxyFileConfig) (RouteSpec, error) {
 		return RouteSpec{}, err
 	}
 	spec.Origin = RouteOriginAuto
+	if spec.Weight, err = parseRouteWeight(raw.Weight); err != nil {
+		return RouteSpec{}, err
+	}
 	return spec, nil
+}
+
+// parseRouteWeight applies the default weight, then validates the override.
+// Only whole YAML integers are accepted: viper's weak typing would otherwise
+// silently truncate 2.5 to 2 and turn a config typo into a quiet share change.
+func parseRouteWeight(raw any) (int, error) {
+	if raw == nil {
+		return DefaultRouteWeight, nil
+	}
+	n, ok := raw.(int)
+	if !ok {
+		return 0, fmt.Errorf("weight must be a whole number between %d and %d", DefaultRouteWeight, MaxRouteWeight)
+	}
+	if n < DefaultRouteWeight || n > MaxRouteWeight {
+		return 0, fmt.Errorf("weight must be between %d and %d, got %d", DefaultRouteWeight, MaxRouteWeight, n)
+	}
+	return n, nil
 }
 
 // parseManualRouteSpec validates one manual entry: the same SOCKS endpoint
@@ -572,6 +604,9 @@ func parseManualRouteSpec(raw manualProxyFileConfig) (ManualRouteSpec, error) {
 	}
 	manual := ManualRouteSpec{RouteSpec: spec}
 	manual.Origin = RouteOriginManual
+	if manual.Weight, err = parseRouteWeight(raw.Weight); err != nil {
+		return ManualRouteSpec{}, err
+	}
 	if raw.RotateInterval == "" {
 		return ManualRouteSpec{}, errors.New("rotate-interval is required (Go duration, e.g. 90s)")
 	}

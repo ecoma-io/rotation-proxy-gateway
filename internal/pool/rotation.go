@@ -36,9 +36,9 @@ func (p *Proxy) SetRotationPhase(phase RotationState) {
 }
 
 // EndRotation records a rotation that observed a changed egress IP and returns
-// the route to serving. The usedSeq is not bumped, so the freshly verified
-// route is the least recently used and absorbs traffic first. Dial health is
-// left to MarkRotated.
+// the route to serving. The recency pass is not advanced, so the freshly
+// verified route is the least recently used and absorbs traffic first. Dial
+// health is left to MarkRotated.
 func (p *Proxy) EndRotation(ip string, at time.Time) {
 	p.mu.Lock()
 	p.rotationState = RotationIdle
@@ -52,15 +52,15 @@ func (p *Proxy) EndRotation(ip string, at time.Time) {
 
 // MarkStale returns a route to serving after a rotation that did not change
 // its egress IP. It records the retry wait and the run of same-IP rotations,
-// and pushes the route to the LRU back so picks prefer fresher routes until
-// the next rotation attempt.
+// and jumps the route to the weighted recency back so picks prefer fresher
+// routes until the next rotation attempt.
 func (pl *Pool) MarkStale(p *Proxy, nextRetryIn time.Duration, consecutiveSameIP int) {
 	p.mu.Lock()
 	p.rotationState = RotationStale
 	p.nextRetryIn = nextRetryIn
 	p.consecutiveSameIP = consecutiveSameIP
 	p.mu.Unlock()
-	p.usedSeq.Store(pl.nextSeq())
+	pl.jumpToBack(p)
 	p.rotating.Store(false)
 }
 

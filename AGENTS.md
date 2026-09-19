@@ -76,9 +76,11 @@ address families. Do not infer kind by resolving a hostname.
 
 Read [`README.md`](README.md) before changing failure classification.
 
-- The pool selects the usable **eligible** route least recently used by pick
-  sequence. It is a single shared pool: cooldown/auth state is visible through
-  both dedicated and mixed listeners.
+- The pool selects the usable **eligible** route with the smallest weighted
+  recency pass: picks distribute proportionally to each route's `weight`
+  (default 1; all-equal weights are true round-robin). It is a single shared
+  pool: cooldown/auth state is visible through both dedicated and mixed
+  listeners.
 - Endpoint DNS/TCP failure is `proxy_connect`: cooldown then a distinct
   eligible fallback. SOCKS auth failure is `auth_route`, blocks the route, and
   may fall back, but never creates dial cooldown. A SOCKS handshake failure

@@ -68,6 +68,10 @@ proxies:
   auto:
     - proxy: socks5://username:password@v4-provider.example:1080
       kind: v4
+      # Optional selection weight (whole number, 1-1000, default 1): picks
+      # distribute proportionally, so weight 3 serves about three times the
+      # traffic of a weight-1 peer. Equal or absent weights give round-robin.
+      weight: 3
     - proxy: socks5://username:password@[2001:db8::1]:1080
       kind: v6
 
@@ -78,6 +82,8 @@ proxies:
   manual:
     - proxy: socks5://username:password@v6-provider.example:1080
       kind: v6
+      # Selection weight, same meaning as on auto routes.
+      weight: 1
       # Minimum time between two rotations of this route. It is also the
       # first backoff step when a rotation did not change the IP.
       rotate-interval: 90s

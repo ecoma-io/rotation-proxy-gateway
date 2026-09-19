@@ -36,11 +36,20 @@ type Proxy struct {
 
 	// Pick-path state is lock-free. PickFor scans every route on every
 	// request, so these fields are atomics; the pool mutex only serializes
-	// the choose-and-mark step that keeps LRU order exact. Drain-critical
-	// pairing lives here too: markPicked raises inFlight before it publishes
-	// the pick sequence, so once a pick is visible at all, its in-flight
-	// holder is already counted.
-	usedSeq       atomic.Uint64
+	// the choose-and-mark step that keeps selection order exact. Drain-critical
+	// pairing lives here too: serving raises inFlight before it advances the
+	// pass, so once a pick is visible at all, its in-flight holder is already
+	// counted.
+	//
+	// pass is the weighted recency clock: every serving event advances it by
+	// the cached stride below, so heavier routes drift back more slowly and
+	// are re-picked proportionally more often. Equal weights reproduce plain
+	// least-recently-used round-robin exactly. The stride is precomputed from
+	// the weight (strideUnits/weight) whenever the weight changes, keeping the
+	// pick path free of both a division and a second atomic load.
+	pass          atomic.Uint64
+	strideStep    atomic.Uint64
+	weight        atomic.Uint64
 	inFlight      atomic.Int64
 	cooldownUntil atomic.Int64 // dial cooldown deadline, UnixNano; 0 = none
 	authBlocked   atomic.Bool
@@ -64,9 +73,26 @@ type Proxy struct {
 	consecutiveSameIP int
 }
 
-func newProxy(route config.RouteSpec) *Proxy {
+// strideUnits scales the weighted recency clock. One serving event advances a
+// route's pass by strideUnits/weight: at the MaxRouteWeight ceiling the stride
+// still keeps ~4 decimal digits of resolution, and the uint64 pass only
+// overflows past ~2^40 serving events — unreachable in practice.
+const strideUnits = uint64(1) << 24
+
+// normalizeWeight guards hand-built specs that bypass YAML validation: a
+// weight below the default behaves as the default.
+func normalizeWeight(w int) uint64 {
+	if w < config.DefaultRouteWeight {
+		return config.DefaultRouteWeight
+	}
+	return uint64(w)
+}
+
+func newProxy(route config.RouteSpec, anchor uint64) *Proxy {
 	origin := effectiveOrigin(route.Origin)
 	p := &Proxy{URL: route.URL, Kind: route.Kind, Origin: origin}
+	p.setWeight(route.Weight)
+	p.pass.Store(anchor)
 	if origin == config.RouteOriginManual {
 		p.rotationState = RotationIdle
 	}
@@ -94,15 +120,21 @@ func (p *Proxy) cooldownNano() int64 { return p.cooldownUntil.Load() }
 
 func (p *Proxy) authBlockedNow() bool { return p.authBlocked.Load() }
 
-func (p *Proxy) lastUsedSequence() uint64 { return p.usedSeq.Load() }
+func (p *Proxy) recencyPass() uint64 { return p.pass.Load() }
 
-// markPicked records the pick sequence and one in-flight holder. The
-// in-flight increment lands before the sequence store: any observer that can
-// already see the route as picked (a bumped usedSeq) therefore also sees the
-// in-flight count, so a rotation drain can never miss its holder.
-func (p *Proxy) markPicked(seq uint64) {
-	p.inFlight.Add(1)
-	p.usedSeq.Store(seq)
+// stride is how far one serving event pushes the route back on the weighted
+// recency clock: heavier routes drift more slowly and absorb proportionally
+// more picks. The division happens once per weight change, not per pick.
+func (p *Proxy) stride() uint64 { return p.strideStep.Load() }
+
+// setWeight applies a reloaded configuration weight in place. Weight is not
+// route identity: retuning it must never reset cooldown, authentication, or
+// rotation state, so Reconfigure updates kept entries instead of rebuilding
+// them.
+func (p *Proxy) setWeight(w int) {
+	weight := normalizeWeight(w)
+	p.weight.Store(weight)
+	p.strideStep.Store(strideUnits / weight)
 }
 
 func (p *Proxy) rotatingNow() bool { return p.rotating.Load() }
@@ -113,6 +145,7 @@ type Status struct {
 	Proxy               string            `json:"proxy"`
 	Kind                config.EgressKind `json:"kind"`
 	Origin              string            `json:"origin"`
+	Weight              uint64            `json:"weight"`
 	Available           bool              `json:"available"`
 	InFlight            int               `json:"inFlight"`
 	ConsecutiveFailures int               `json:"consecutiveFailures"`
@@ -137,7 +170,7 @@ type RotationStatus struct {
 	ConsecutiveSameIP int    `json:"consecutiveSameIP"`
 }
 
-// Pool is a set of upstream SOCKS routes with least-recently-used round-robin
+// Pool is a set of upstream SOCKS routes with weighted least-recently-used
 // rotation, endpoint dial cooldowns, and authentication blocks. All methods
 // are safe for concurrent use.
 type Pool struct {
@@ -145,7 +178,6 @@ type Pool struct {
 	entries []*Proxy
 	base    time.Duration
 	max     time.Duration
-	seq     *atomic.Uint64 // shared pick sequence across immutable generations
 
 	// Now is the clock used for cooldowns; tests replace it.
 	Now func() time.Time
@@ -155,27 +187,33 @@ type Pool struct {
 func NewRoutes(routes []config.RouteSpec, base, max time.Duration) *Pool {
 	entries := make([]*Proxy, 0, len(routes))
 	for _, route := range routes {
-		entries = append(entries, newProxy(route))
+		entries = append(entries, newProxy(route, 0))
 	}
-	return &Pool{
-		entries: entries,
-		base:    base,
-		max:     max,
-		seq:     &atomic.Uint64{},
-		Now:     time.Now,
-	}
+	return &Pool{entries: entries, base: base, max: max, Now: time.Now}
 }
 
 // Reconfigure returns a new immutable route-list snapshot. Route state is
 // retained only for canonical URL+kind+origin matches; moving a route between
 // proxies.auto and proxies.manual rebuilds it because its role changed.
-// Existing in-flight operations may safely keep using the original pool.
+// Retained entries pick up a changed configured weight in place — weight is
+// not identity, so retuning it keeps their health state. Existing in-flight
+// operations may safely keep using the original pool.
 func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration) *Pool {
 	pl.mu.Lock()
 	entries := append([]*Proxy(nil), pl.entries...)
 	now := pl.Now
-	seq := pl.seq
 	pl.mu.Unlock()
+
+	// New routes join at the pool's recency front: anchoring at the smallest
+	// existing pass reproduces the fresh-route-is-picked-next behavior without
+	// a catch-up burst against accumulated passes.
+	minPass := uint64(0)
+	for i, entry := range entries {
+		p := entry.pass.Load()
+		if i == 0 || p < minPass {
+			minPass = p
+		}
+	}
 
 	kept := make(map[string]*Proxy, len(entries))
 	for _, entry := range entries {
@@ -184,27 +222,55 @@ func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration) 
 	next := make([]*Proxy, 0, len(routes))
 	for _, route := range routes {
 		if prior, ok := kept[routeKey(route.URL, route.Kind, route.Origin)]; ok {
+			prior.setWeight(route.Weight)
 			next = append(next, prior)
 		} else {
-			next = append(next, newProxy(route))
+			next = append(next, newProxy(route, minPass))
 		}
 	}
-	return &Pool{entries: next, base: base, max: max, seq: seq, Now: now}
+	return &Pool{entries: next, base: base, max: max, Now: now}
 }
 
 func routeKey(u *url.URL, kind config.EgressKind, origin config.RouteOrigin) string {
 	return config.CanonicalRouteID(u) + "|" + string(kind) + "|" + string(effectiveOrigin(origin))
 }
 
-func (pl *Pool) nextSeq() uint64 {
-	return pl.seq.Add(1)
+// serve records one serving step for p: an in-flight hold plus one weighted
+// step back on the recency clock. The in-flight increment lands before the
+// pass advance: any observer that can already see the route as picked (an
+// advanced pass) therefore also sees the in-flight count, so a rotation drain
+// can never miss its holder.
+func (pl *Pool) serve(p *Proxy) {
+	p.inFlight.Add(1)
+	p.pass.Add(p.stride())
+}
+
+// jumpToBack pushes a route behind the whole pool by its own weighted step —
+// the weighted generalization of storing a fresh global sequence. Rare by
+// design (rotation stale returns): per-pick demotion uses serve so the pass
+// differentials that encode the weights survive. The scan stays off the pick
+// hot path by living only here.
+func (pl *Pool) jumpToBack(p *Proxy) {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	base := p.pass.Load()
+	for _, e := range pl.entries {
+		if v := e.pass.Load(); v > base {
+			base = v
+		}
+	}
+	p.pass.Store(base + p.stride())
 }
 
 // PickFor returns the next allowed proxy, excluding entries already tried for
-// the current request. It picks the least recently used available entry (stable
-// order on ties). When every allowed, non-excluded, non-auth-blocked entry is
-// cooling down it returns the allowed route that recovers soonest. Routes held
-// by an in-progress rotation are skipped on both paths. It returns nil when no
+// the current request. Among available entries it picks the smallest weighted
+// recency pass (stable order on ties): every serving event advances a route's
+// pass by strideUnits/weight, so picks distribute proportionally to the
+// configured weights and equal weights give true round-robin. When every
+// allowed, non-excluded, non-auth-blocked entry is cooling down it returns the
+// allowed route that recovers soonest — weight-independent, because soonest
+// recovery is the only criterion that matters there. Routes held by an
+// in-progress rotation are skipped on both paths. It returns nil when no
 // allowed entry remains. The filter is applied equally to both paths so a
 // dedicated v4/v6 listener never crosses into another egress kind.
 //
@@ -235,19 +301,19 @@ func (pl *Pool) PickFor(exclude map[*Proxy]bool, allow func(*Proxy) bool) *Proxy
 			}
 		}
 		if best != nil {
-			best.markPicked(pl.nextSeq())
+			pl.serve(best)
 		}
 		return best
 	}
 
 	chosen := avail[0]
-	chosenSeq := chosen.lastUsedSequence()
+	chosenPass := chosen.recencyPass()
 	for _, e := range avail[1:] {
-		if s := e.lastUsedSequence(); s < chosenSeq {
-			chosen, chosenSeq = e, s
+		if s := e.recencyPass(); s < chosenPass {
+			chosen, chosenPass = e, s
 		}
 	}
-	chosen.markPicked(pl.nextSeq())
+	pl.serve(chosen)
 	return chosen
 }
 
@@ -272,16 +338,18 @@ func (p *Proxy) InFlight() int { return int(p.inFlight.Load()) }
 
 // ReportSuccess records a successful use and clears any endpoint dial cooldown.
 // It does not clear an authentication block: unchanged credentials cannot be
-// expected to recover without a reload that replaces the route.
+// expected to recover without a reload that replaces the route. The completed
+// request advances the route one extra weighted step, so a route that just
+// served lets its peers absorb the next picks — the weighted form of the old
+// fresh-sequence bump.
 func (pl *Pool) ReportSuccess(p *Proxy) {
-	seq := pl.nextSeq()
 	p.mu.Lock()
 	p.consecutiveFailures = 0
 	p.lastDialError = ""
 	p.successes++
 	p.mu.Unlock()
 	p.cooldownUntil.Store(0)
-	p.usedSeq.Store(seq)
+	p.pass.Add(p.stride())
 }
 
 // ReportFailure records an upstream endpoint TCP dial failure and puts the
@@ -389,6 +457,7 @@ func (pl *Pool) Snapshot() []Status {
 			Proxy:               e.URL.Host,
 			Kind:                e.Kind,
 			Origin:              string(e.Origin),
+			Weight:              e.weight.Load(),
 			Available:           !e.authBlocked.Load() && !e.rotating.Load() && !cooling,
 			InFlight:            int(e.inFlight.Load()),
 			ConsecutiveFailures: e.consecutiveFailures,

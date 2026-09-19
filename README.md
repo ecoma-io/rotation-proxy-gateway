@@ -88,6 +88,7 @@ proxies:
   auto:
     - proxy: socks5://username:password@provider.example:1080
       kind: v4
+      weight: 3
     - proxy: socks5://username:password@[2001:db8::1]:1080
       kind: v6
   manual: []
@@ -110,6 +111,14 @@ URL paths, queries, fragments, unknown active YAML fields, duplicate route
 identities, and non-lowercase/missing `kind` are rejected. A duplicate remains
 a duplicate even if it claims another kind. Credentials never appear in errors,
 logs, or `/status`.
+
+Every route accepts an optional selection `weight` (whole number, default 1, at
+most 1000): picks distribute across eligible routes proportionally to their
+weights, so `weight: 3` serves about three times the traffic of a `weight: 1`
+peer. Equal weights — or no `weight` key at all — give true round-robin. The
+key exists on both `proxies.auto` and `proxies.manual` routes and is not part
+of route identity: a reload that only retunes weights keeps the route's health
+state.
 
 `global.target-tls-insecure` and `global.max-body-buffer` are global settings;
 per-route overrides are rejected. `target-tls-insecure` defaults to `false` and
@@ -148,6 +157,9 @@ proxies:
   rotation attempts of this route. After a verified rotation the next attempt is
   scheduled one interval out; after an unchanged-IP outcome it is scheduled by
   the retry backoff instead.
+- `weight` (optional, whole number 1–1000, default 1): selection weight,
+  identical to the `proxies.auto` route key. Higher-weight manual routes absorb
+  proportionally more traffic between rotations.
 - `api` (required): the provider call that requests a new egress IP.
   `url` is required (http or https). `method` defaults to `POST`. `timeout`
   defaults to `10s` and bounds one call. `headers` and `body` are sent verbatim.
@@ -217,7 +229,7 @@ immediately in the `stale` state, and the gateway retries forever — the next
 attempt waits one `rotate-interval`, doubling per consecutive unchanged result
 (`interval`, `2×`, `4×`, …) with ±10% jitter, capped at `retry-backoff-max`, and
 floored by any `Retry-After`. Stale routes are pushed to the back of the
-least-recently-used order so fresher routes absorb traffic first, but they keep
+weighted recency order so fresher routes absorb traffic first, but they keep
 serving normally.
 
 A route whose provider hands out non-sticky addresses cannot be rotated
@@ -322,10 +334,11 @@ The following settings apply to new client operations without restart:
 - every `rotation.*` setting (the scheduler reads them per cycle; a procedure
   already running keeps its own `drain-timeout` and probe settings)
 
-Unchanged URL+kind routes preserve their LRU, cooldown, authentication-block,
-rotation state (last verified IP, stale history), and counters. Changing
-userinfo, kind, or moving a route between `proxies.auto` and `proxies.manual`
-creates a fresh route state.
+Unchanged URL+kind routes preserve their recency pass, cooldown,
+authentication-block, rotation state (last verified IP, stale history), and
+counters. A changed `weight` applies to the retained route without resetting
+any of it. Changing userinfo, kind, or moving a route between `proxies.auto`
+and `proxies.manual` creates a fresh route state.
 
 ## Failure and route-health contract
 
@@ -357,11 +370,15 @@ creates a fresh route state.
 | Client cancellation/disconnect | No health mutation and no retry | End operation |
 | Established tunnel breaks | No health mutation | Close tunnel |
 
-The pool is least-recently-used by pick sequence (true round-robin). A request
-never tries the same route twice. Cooling routes are skipped when a usable
-eligible route exists; when all eligible non-auth-blocked routes cool down, the
-one recovering soonest is tried. Authentication blocks remain until the route
-identity changes on reload.
+The pool serves the eligible route with the smallest weighted recency pass:
+every pick, completed request, and stale return advances the route's pass by
+one step inversely proportional to its `weight`, so picks distribute
+proportionally to the configured weights and equal weights give true
+round-robin. A request never tries the same route twice. Cooling routes are
+skipped when a usable eligible route exists; when all eligible non-auth-blocked
+routes cool down, the one recovering soonest is tried — weight-blind, because
+soonest recovery is the only criterion that matters there. Authentication
+blocks remain until the route identity changes on reload.
 
 A target HTTP `407` is ordinary target response data. It is not SOCKS
 authentication data, does not rotate, and does not create cooldown.

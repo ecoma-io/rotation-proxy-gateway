@@ -40,14 +40,16 @@ func (b *lockedBuffer) String() string {
 
 // RouteConfig is one static SOCKS route in the generated gateway config.
 type RouteConfig struct {
-	Proxy string
-	Kind  string
+	Proxy  string
+	Kind   string
+	Weight int // 0 omits the weight key; the gateway defaults to 1
 }
 
 // ManualRouteConfig is one API-driven rotation route in the generated config.
 type ManualRouteConfig struct {
 	Proxy          string
 	Kind           string
+	Weight         int // 0 omits the weight key; the gateway defaults to 1
 	RotateInterval string
 	API            ManualAPIConfig
 }
@@ -104,6 +106,7 @@ type PoolEntry struct {
 	Proxy               string        `json:"proxy"`
 	Kind                string        `json:"kind"`
 	Origin              string        `json:"origin"`
+	Weight              uint64        `json:"weight"`
 	Available           bool          `json:"available"`
 	InFlight            int           `json:"inFlight"`
 	ConsecutiveFailures int           `json:"consecutiveFailures"`
@@ -209,6 +212,9 @@ func renderConfig(cfg GatewayConfig) string {
 	sb.WriteString("proxies:\n  auto:\n")
 	for _, r := range cfg.Routes {
 		fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n", yamlQuote(r.Proxy), r.Kind)
+		if r.Weight > 0 {
+			fmt.Fprintf(&sb, "      weight: %d\n", r.Weight)
+		}
 	}
 	if len(cfg.Manual) == 0 {
 		sb.WriteString("  manual: []\n")
@@ -216,8 +222,11 @@ func renderConfig(cfg GatewayConfig) string {
 	}
 	sb.WriteString("  manual:\n")
 	for _, m := range cfg.Manual {
-		fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n      rotate-interval: %s\n",
-			yamlQuote(m.Proxy), m.Kind, m.RotateInterval)
+		fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n", yamlQuote(m.Proxy), m.Kind)
+		if m.Weight > 0 {
+			fmt.Fprintf(&sb, "      weight: %d\n", m.Weight)
+		}
+		fmt.Fprintf(&sb, "      rotate-interval: %s\n", m.RotateInterval)
 		fmt.Fprintf(&sb, "      api:\n        url: %s\n", m.API.URL)
 		if m.API.Method != "" {
 			fmt.Fprintf(&sb, "        method: %s\n", m.API.Method)

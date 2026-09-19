@@ -48,14 +48,14 @@ func TestHardeningAllCoolingFallbackMarksUsed(t *testing.T) {
 	pl.ReportFailure(pl.entries[1], nil)
 	pl.ReportFailure(pl.entries[1], nil) // b: until +60s
 
-	seqBeforeA := pl.entries[0].lastUsedSequence()
-	seqBeforeB := pl.entries[1].lastUsedSequence()
+	seqBeforeA := pl.entries[0].recencyPass()
+	seqBeforeB := pl.entries[1].recencyPass()
 	got := pl.PickFor(nil, nil)
 	if got == nil || got.URL.Host != "a.test:1080" {
 		t.Fatalf("pick with all cooling = %v, want a.test:1080 (soonest recovery)", got)
 	}
-	if seqAfter := got.lastUsedSequence(); seqAfter <= seqBeforeA && seqAfter <= seqBeforeB {
-		t.Fatalf("fallback pick did not advance usedSeq: before a=%d b=%d after=%d", seqBeforeA, seqBeforeB, seqAfter)
+	if seqAfter := got.recencyPass(); seqAfter <= seqBeforeA && seqAfter <= seqBeforeB {
+		t.Fatalf("fallback pick did not advance the recency pass: before a=%d b=%d after=%d", seqBeforeA, seqBeforeB, seqAfter)
 	}
 	// Second fallback pick with both still cooling must rotate to the other route
 	// now that the first fallback choice is marked most-recently used... but both
