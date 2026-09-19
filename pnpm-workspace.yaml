@@ -1,0 +1,6 @@
+# pnpm 12 places package build-script policy here rather than in package.json.
+# lefthook's postinstall selects its platform binary; allow precisely that
+# package so `pnpm install --frozen-lockfile` works on a clean GitHub runner.
+# No other dependency gets permission to execute an install-time script.
+allowBuilds:
+  lefthook: true
