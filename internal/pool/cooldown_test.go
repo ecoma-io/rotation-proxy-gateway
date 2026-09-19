@@ -182,3 +182,55 @@ func TestSaturatingCooldownMath(t *testing.T) {
 		})
 	}
 }
+
+// CoolingFor mirrors the availableAt arithmetic the pick path uses: the full
+// remaining cooldown right after a failure, zero for healthy and recovered
+// routes. The proxy server logs it when the all-cooling fallback serves.
+func TestCoolingForReportsRemainingCooldown(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2")
+
+	a := pl.PickFor(nil, nil)
+	if a == nil || a.URL.Host != "a:1" {
+		t.Fatalf("pick = %v, want a:1", a)
+	}
+	if got := pl.CoolingFor(a); got != 0 {
+		t.Fatalf("CoolingFor(healthy) = %s, want 0", got)
+	}
+	pl.ReportFailure(a, errors.New("dial refused (TEST)"))
+	if got := pl.CoolingFor(a); got != 30*time.Second {
+		t.Fatalf("CoolingFor right after failure = %s, want the 30s base", got)
+	}
+	c.advance(31 * time.Second)
+	if got := pl.CoolingFor(a); got != 0 {
+		t.Fatalf("CoolingFor after expiry = %s, want 0", got)
+	}
+}
+
+// Size counts every route; CountAllowed applies only the listener's kind
+// filter, health notwithstanding.
+func TestPoolSizeAndCountAllowed(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2", "socks5://c:3")
+	v4Only := func(p *Proxy) bool { return p.Kind == config.EgressV4 }
+	v6Only := func(p *Proxy) bool { return p.Kind == config.EgressV6 }
+
+	if got := pl.Size(); got != 3 {
+		t.Fatalf("Size() = %d, want 3", got)
+	}
+	if got := pl.CountAllowed(v4Only); got != 3 {
+		t.Fatalf("CountAllowed(v4) = %d, want 3", got)
+	}
+	if got := pl.CountAllowed(v6Only); got != 0 {
+		t.Fatalf("CountAllowed(v6) over a v4 pool = %d, want 0", got)
+	}
+
+	pl6 := NewRoutes([]config.RouteSpec{{URL: mustURL(t, "socks5://v6:1"), Kind: config.EgressV6}},
+		30*time.Second, time.Minute, config.KindBalance{})
+	if got := pl6.CountAllowed(v6Only); got != 1 {
+		t.Fatalf("CountAllowed(v6) = %d, want 1", got)
+	}
+	if got := pl6.CountAllowed(v4Only); got != 0 {
+		t.Fatalf("CountAllowed(v4) over a v6 pool = %d, want 0", got)
+	}
+}

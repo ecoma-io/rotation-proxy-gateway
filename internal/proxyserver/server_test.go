@@ -996,6 +996,11 @@ func TestUpstreamBreakLogsBrokenCloseAndResetsClient(t *testing.T) {
 	rec, ok := findRecord(output, map[string]string{
 		"msg": "tunnel broken", "close_reason": "upstream_broken",
 	})
+	if _, ok := findRecord(output, map[string]string{
+		"msg": "upstream broke the tunnel; client side set to reset on close",
+	}); !ok {
+		t.Errorf("logs missing the SetLinger debug record:\n%s", output)
+	}
 	if !ok {
 		t.Errorf("logs missing the broken close record:\n%s", output)
 	} else {

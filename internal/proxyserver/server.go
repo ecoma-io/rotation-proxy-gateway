@@ -20,6 +20,7 @@ import (
 
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
+	"rotation-proxy-gateway/internal/sanitize"
 
 	"github.com/rs/zerolog"
 )
@@ -125,6 +126,7 @@ func (s *Server) Serve(ln net.Listener) error {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
+			s.log.Warn().Str("error", sanitize.ErrorString(err)).Msg("listener accept failed; stopping")
 			return err
 		}
 		if !s.beginSession(conn) {
@@ -181,6 +183,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		s.log.Debug().Msg("listener drained; all sessions finished")
 		return nil
 	case <-ctx.Done():
 		// Cancel upstream dials first so sessions blocked in their TCP
@@ -189,10 +192,14 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.cancelBase()
 		if n := s.CloseConns(); n > 0 {
 			s.log.Warn().Int("connections", n).Msg("grace budget expired; force-closing client connections")
+		} else {
+			s.log.Debug().Msg("grace budget expired with no tracked client connections")
 		}
 		select {
 		case <-done:
+			s.log.Debug().Msg("sessions finished after force-close")
 		case <-time.After(forceCloseWait):
+			s.log.Warn().Msg("sessions still running after the force-close tail")
 		}
 		return ctx.Err()
 	}
@@ -304,6 +311,16 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 		// The winning pick holds the route for the tunnel's whole lifetime;
 		// earlier excluded attempts release when the handler ends.
 		defer p.Release()
+		if log.Debug().Enabled() {
+			ev := log.Debug().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
+				Int("attempt", attempts).Int("excluded", len(exclude))
+			// A pick from the all-cooling fallback arrives with cooldown left;
+			// the size of that bet is the whole point of the line.
+			if cd := gen.Pool.CoolingFor(p); cd > 0 {
+				ev = ev.Str("cooldown_remaining", logDuration(cd))
+			}
+			ev.Msg("route selected")
+		}
 		up, err := s.dial(s.baseCtx, p.URL, target, settings.dialTimeout)
 		if err != nil {
 			switch {
@@ -350,6 +367,8 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 	if upstream == nil {
 		writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the connection closes either way
 		log.Warn().Str("target", logTarget).Int("attempts", attempts).
+			Int("pool_size", gen.Pool.Size()).Int("kind_routes", gen.Pool.CountAllowed(s.allow)).
+			Int("excluded", len(exclude)).
 			Str("error_kind", errorKindNoRoute).Str("duration", logDuration(time.Since(start))).
 			Msg("tunnel failed")
 		return
@@ -379,6 +398,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 			// reset the client side so a truncated stream stays truncated.
 			if tc, ok := clientConn.(*net.TCPConn); ok {
 				tc.SetLinger(0)
+				log.Debug().Msg("upstream broke the tunnel; client side set to reset on close")
 			}
 		}
 		clientConn.Close() // unblocks the client-to-upstream direction

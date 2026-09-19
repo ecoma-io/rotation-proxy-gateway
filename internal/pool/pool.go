@@ -469,6 +469,43 @@ func (pl *Pool) pick(exclude map[*Proxy]bool, allow func(*Proxy) bool, mixed boo
 	return chosen
 }
 
+// CoolingFor reports the route's remaining cooldown on this pool's clock, or 0
+// when the route is not cooling. The proxy server logs it at debug when the
+// all-cooling fallback hands out a route that has not recovered yet.
+func (pl *Pool) CoolingFor(p *Proxy) time.Duration {
+	cu := p.cooldownNano()
+	if cu == 0 {
+		return 0
+	}
+	nowNano := relNanos(pl.Now())
+	if nowNano >= cu {
+		return 0
+	}
+	return time.Duration(cu - nowNano)
+}
+
+// Size reports the total number of routes in the pool, health notwithstanding.
+func (pl *Pool) Size() int {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	return len(pl.entries)
+}
+
+// CountAllowed reports how many routes pass the allow filter — the asking
+// listener's kind view — regardless of health. Error diagnostics use it to
+// show how much of the pool the listener could ever serve.
+func (pl *Pool) CountAllowed(allow func(*Proxy) bool) int {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	n := 0
+	for _, e := range pl.entries {
+		if allow == nil || allow(e) {
+			n++
+		}
+	}
+	return n
+}
+
 // Release drops one in-flight hold taken by PickFor. Each successful pick is
 // released exactly once when its request or tunnel finishes; releasing a route
 // that holds nothing is harmless.
