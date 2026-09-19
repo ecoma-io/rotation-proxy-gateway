@@ -2,6 +2,7 @@ package pool
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -86,6 +87,53 @@ func TestCooldownRealClockLifecycle(t *testing.T) {
 	}
 	if got := pl.PickFor(nil, nil); got != p {
 		t.Fatalf("pick = %v, want the recovered route", got)
+	}
+}
+
+// Cooldown writes are last-writer-wins under p.mu: whatever report lands
+// last, the cooldown and the failure streak must agree. The concurrent storm
+// before the final report is deliberately unordered — the assertions hold
+// only because each report writes both fields as one critical section.
+func TestCooldownAndStreakWriteAsOneUnit(t *testing.T) {
+	pl := NewRoutes([]config.RouteSpec{{URL: mustURL(t, "socks5://a:1"), Kind: config.EgressV4}},
+		30*time.Second, time.Minute, config.KindBalance{})
+	p := pl.PickFor(nil, nil)
+	if p == nil {
+		t.Fatal("pick = nil, want the single route")
+	}
+
+	const workers, rounds = 8, 50
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for range rounds {
+				pl.ReportFailure(p, errors.New("dial refused (TEST)"))
+				pl.ReportSuccess(p)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// A final success must leave no cooldown and no failure streak...
+	pl.ReportSuccess(p)
+	snap := pl.Snapshot()[0]
+	if !snap.Available || snap.CooldownFor != "0s" || snap.ConsecutiveFailures != 0 {
+		t.Fatalf("post-success state = %+v, want available, no cooldown, no streak", snap)
+	}
+	if snap.Failures != workers*rounds || snap.Successes != workers*rounds+1 {
+		t.Fatalf("counters = (%d failures, %d successes), want (%d, %d)",
+			snap.Failures, snap.Successes, workers*rounds, workers*rounds+1)
+	}
+
+	// ...and a final failure must leave a live cooldown with the streak at 1.
+	if cd := pl.ReportFailure(p, errors.New("dial refused (TEST)")); cd != 30*time.Second {
+		t.Fatalf("applied cooldown = %s, want the 30s base after the success reset", cd)
+	}
+	snap = pl.Snapshot()[0]
+	if snap.Available || snap.CooldownFor == "0s" || snap.ConsecutiveFailures != 1 {
+		t.Fatalf("post-failure state = %+v, want cooling with streak 1", snap)
 	}
 }
 

@@ -464,36 +464,39 @@ func (p *Proxy) InFlight() int { return int(p.inFlight.Load()) }
 // expected to recover without a reload that replaces the route. The completed
 // request advances the route one extra weighted step, so a route that just
 // served lets its peers absorb the next picks — the weighted form of the old
-// fresh-sequence bump.
+// fresh-sequence bump. The cooldown clear happens under p.mu together with
+// the counter reset: cooldownUntil is last-writer-wins, and the two writes
+// must land as one unit so a concurrent failure cannot leave a live cooldown
+// over a zeroed failure streak (or the reverse).
 func (pl *Pool) ReportSuccess(p *Proxy) {
 	p.mu.Lock()
 	p.consecutiveFailures = 0
 	p.lastDialError = ""
 	p.successes++
-	p.mu.Unlock()
 	p.cooldownUntil.Store(0)
+	p.mu.Unlock()
 	p.pass.Add(p.stride())
 }
 
 // ReportFailure records an upstream endpoint TCP dial failure and puts the
 // proxy into an exponentially growing cooldown: base doubled per consecutive
-// dial failure, capped at max. It returns the applied cooldown.
+// dial failure, capped at max. It returns the applied cooldown. The cooldown
+// store lands under p.mu with the streak increment for the same
+// last-writer-wins reason as ReportSuccess.
 func (pl *Pool) ReportFailure(p *Proxy, err error) time.Duration {
 	pl.mu.Lock()
 	base, max := pl.base, pl.max
 	nowFunc := pl.Now
 	pl.mu.Unlock()
 	now := nowFunc()
-	cd := func() time.Duration {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		p.consecutiveFailures++
-		p.failures++
-		if err != nil {
-			p.lastDialError = sanitize.ErrorString(err)
-		}
-		return saturatingCooldown(base, max, p.consecutiveFailures)
-	}()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.consecutiveFailures++
+	p.failures++
+	if err != nil {
+		p.lastDialError = sanitize.ErrorString(err)
+	}
+	cd := saturatingCooldown(base, max, p.consecutiveFailures)
 	p.cooldownUntil.Store(relNanos(now.Add(cd)))
 	return cd
 }
