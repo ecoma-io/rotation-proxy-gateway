@@ -125,6 +125,32 @@ func (e *Engine) baselineProbe(ctx context.Context, gen *pool.Generation, spec c
 	return "", false
 }
 
+// rotateAPITransport performs provider rotate calls directly. A nil Proxy
+// func on a Transport means "no proxy, ever" — deliberately not
+// ProxyFromEnvironment, because the rotate API's headers and body are
+// credentials and an ambient HTTP(S)_PROXY would receive them. The client
+// below sets this Transport explicitly: leaving it unset would fall back to
+// http.DefaultTransport, which honors the environment.
+var rotateAPITransport = &http.Transport{
+	ForceAttemptHTTP2: true,
+	TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
+}
+
+// rotateClient builds the one-shot client for a provider rotate call.
+func rotateClient(api config.RotateAPI) *http.Client {
+	return &http.Client{
+		Transport: rotateAPITransport,
+		Timeout:   api.Timeout,
+		// Never follow redirects: a 3xx would replay the rotate API's
+		// headers (and body on 307/308) to whatever host it names. The
+		// first response is final, so a redirect fails the call like any
+		// other non-2xx status.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
 // callRotateAPI performs the provider call that swaps the route's egress IP.
 // It returns a Retry-After hint when the provider rate-limits the call.
 func (e *Engine) callRotateAPI(ctx context.Context, api config.RotateAPI) (time.Duration, error) {
@@ -140,16 +166,7 @@ func (e *Engine) callRotateAPI(ctx context.Context, api config.RotateAPI) (time.
 		req.Header.Set(name, value)
 	}
 
-	client := &http.Client{
-		Timeout: api.Timeout,
-		// Never follow redirects: a 3xx would replay the rotate API's
-		// headers (and body on 307/308) to whatever host it names. The
-		// first response is final, so a redirect fails the call like any
-		// other non-2xx status.
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	client := rotateClient(api)
 	resp, err := client.Do(req)
 	if err != nil {
 		// url.Error embeds the full URL, which may carry credentials in its

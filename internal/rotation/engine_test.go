@@ -286,6 +286,23 @@ func TestCallRotateAPIClassifiesResponses(t *testing.T) {
 		return a, apiSpec(a)
 	}
 
+	t.Run("transport dials direct, never the ambient proxy", func(t *testing.T) {
+		// The rotate API's headers and body are credentials: they must never
+		// reach an ambient HTTP(S)_PROXY. A nil Proxy func on a Transport
+		// means no proxy; the danger is the Client falling back to
+		// http.DefaultTransport (ProxyFromEnvironment) when Transport is
+		// unset. Loopback targets are exempt from proxying in net/http, so
+		// asserting the wiring is the only hermetic check here.
+		if rotateAPITransport.Proxy != nil {
+			t.Fatal("rotateAPITransport.Proxy set; want the nil func = no proxy, ever")
+		}
+		if got := rotateClient(config.RotateAPI{Timeout: time.Second}).Transport; got != http.RoundTripper(rotateAPITransport) {
+			t.Fatalf("rotate client transport = %v, want rotateAPITransport", got)
+		}
+		if got := rotateAPITransport.TLSClientConfig.MinVersion; got != tls.VersionTLS12 {
+			t.Fatalf("rotate TLS MinVersion = %v, want TLS 1.2", got)
+		}
+	})
 	t.Run("200 succeeds", func(t *testing.T) {
 		a, api := setup(t)
 		if _, err := New(nil, discardLogger()).callRotateAPI(context.Background(), api); err != nil {
