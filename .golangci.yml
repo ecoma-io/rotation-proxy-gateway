@@ -6,7 +6,7 @@
 #
 # The standard v2 baseline catches unchecked errors and static-analysis
 # regressions across production code and tests. It is enabled without blanket
-# exclusions: Issue #2 was closed only after every existing finding was fixed.
+# exclusions; Issue #2 tracks clearing the legacy findings before it is closed.
 version: "2"
 linters:
   default: standard
