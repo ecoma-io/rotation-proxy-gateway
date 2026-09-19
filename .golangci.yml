@@ -1,0 +1,11 @@
+# golangci-lint configuration.
+#
+# The default v2 linter set is the whole mandate: `errcheck`, `govet`,
+# `ineffassign`, `staticcheck`, `unused`. Nothing is enabled beyond it — a
+# linter roster longer than the code it reads is noise, and the repository's
+# own gate (AGENTS.md) already pairs this with `gofmt`.
+#
+# Formatting is deliberately NOT delegated here — `gofmt` is its own gate in
+# ci.yml, because `gofmt -l` exits 0 over findings and only emptiness means
+# clean.
+version: "2"
