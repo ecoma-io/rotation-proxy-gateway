@@ -127,11 +127,11 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 		return nil, err
 	}
 	failSetup := func(op string, err error) (net.Conn, error) {
-		conn.Close()
+		_ = conn.Close()
 		return nil, &SocksProtocolError{Op: op, Err: err}
 	}
 	failHandshake := func(op string, err error) (net.Conn, error) {
-		conn.Close()
+		_ = conn.Close()
 		return nil, &SocksHandshakeError{Op: op, Err: err}
 	}
 
@@ -142,7 +142,9 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 	}
 	wantAuth := user != "" || pass != ""
 
-	conn.SetDeadline(time.Now().Add(timeout))
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return failHandshake("set handshake deadline", err)
+	}
 	br := bufio.NewReader(conn)
 
 	methods := []byte{0x00} // no auth
@@ -163,7 +165,7 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 	case 0x00: // no auth needed
 	case 0x02:
 		if !wantAuth {
-			conn.Close()
+			_ = conn.Close()
 			return nil, &ProxyAuthError{Reason: "endpoint requires credentials but none are configured"}
 		}
 		if len(user) > 255 || len(pass) > 255 {
@@ -183,11 +185,11 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 			return failHandshake("read authentication", fmt.Errorf("unexpected auth version 0x%02x", reply[0]))
 		}
 		if reply[1] != 0x00 {
-			conn.Close()
+			_ = conn.Close()
 			return nil, &ProxyAuthError{Reason: "endpoint rejected credentials"}
 		}
 	case 0xff:
-		conn.Close()
+		_ = conn.Close()
 		return nil, &ProxyAuthError{Reason: "endpoint accepted no offered authentication method"}
 	default:
 		return failHandshake("negotiate authentication", fmt.Errorf("unsupported method 0x%02x", choice[1]))
@@ -221,7 +223,10 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 	if err := discardSocksBoundAddress(br, head[3]); err != nil {
 		return failHandshake("read bound address", err)
 	}
-	conn.SetDeadline(time.Time{})
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return nil, &SocksHandshakeError{Op: "clear handshake deadline", Err: err}
+	}
 	return withBufferedPrefix(conn, br), nil
 }
 
@@ -273,7 +278,9 @@ func withBufferedPrefix(conn net.Conn, br *bufio.Reader) net.Conn {
 		return conn
 	}
 	prefix := make([]byte, br.Buffered())
-	io.ReadFull(br, prefix)
+	if _, err := io.ReadFull(br, prefix); err != nil {
+		return conn
+	}
 	return &prefixConn{Conn: conn, prefix: prefix}
 }
 

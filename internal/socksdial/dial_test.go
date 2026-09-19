@@ -40,7 +40,7 @@ func startScriptedSocks(t *testing.T, script socksScript) string {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -48,8 +48,8 @@ func startScriptedSocks(t *testing.T, script socksScript) string {
 				return
 			}
 			go func() {
-				defer conn.Close()
-				conn.SetDeadline(time.Now().Add(dialTestTimeout))
+				defer func() { _ = conn.Close() }()
+				_ = conn.SetDeadline(time.Now().Add(dialTestTimeout))
 				handleScriptedConn(t, conn, script)
 			}()
 		}
@@ -237,7 +237,7 @@ func TestDialSuccessRoundTripNoAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err := conn.Write([]byte("ping")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestDialConnectRequestTargetEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	conn.Close()
+	_ = conn.Close()
 }
 
 func TestDialSuccessWithAuth(t *testing.T) {
@@ -265,7 +265,7 @@ func TestDialSuccessWithAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err := conn.Write([]byte("ping")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestDialBoundAddressTypes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Dial: %v", err)
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			if _, err := conn.Write([]byte("ping")); err != nil {
 				t.Fatalf("write: %v", err)
 			}
@@ -303,7 +303,7 @@ func TestDialPipelinedHandshakeData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	got := make([]byte, 3)
 	if _, err := io.ReadFull(conn, got); err != nil || string(got) != "PRE" {
 		t.Fatalf("prefix = %q, err = %v", got, err)
@@ -411,7 +411,7 @@ func TestDialEndpointRefused(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	refused := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 	_, err = Dial(context.Background(), dialURL(t, "socks5://"+refused), "example.com:443", dialTestTimeout)
 	assertTaxonomy(t, err, true, false, false)
 }
