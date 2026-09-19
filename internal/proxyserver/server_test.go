@@ -1081,7 +1081,9 @@ func TestCloseConnsDoesNotHoldConnectionMapLockWhileClosing(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}), defaultRuntime(), testLogger())
-	s.trackConn(conn)
+	if !s.beginSession(conn) {
+		t.Fatal("beginSession refused a connection on a live server")
+	}
 
 	closed := make(chan struct{})
 	go func() {

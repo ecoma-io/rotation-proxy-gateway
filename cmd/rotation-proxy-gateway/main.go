@@ -165,10 +165,15 @@ func run() error {
 
 	started := time.Now()
 	adminSrv := &http.Server{
-		Addr:              bootstrap.AdminAddr,
 		Handler:           proxyserver.AdminMux(version, started, store, listenerViews, engine.Rotations),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
+	}
+	// Bind before announcing: a failed bind is fatal before serving starts,
+	// and the log must carry the address that actually listens.
+	adminLn, err := net.Listen("tcp", bootstrap.AdminAddr)
+	if err != nil {
+		return fmt.Errorf("admin listener: %w", err)
 	}
 
 	errCh := make(chan error, len(listeners)+1)
@@ -183,8 +188,8 @@ func run() error {
 		}()
 	}
 	go func() {
-		log.Info().Str("addr", bootstrap.AdminAddr).Msg("admin listening")
-		if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Info().Str("addr", adminLn.Addr().String()).Msg("admin listening")
+		if err := adminSrv.Serve(adminLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("admin listener: %w", err)
 		}
 	}()
@@ -247,6 +252,12 @@ func run() error {
 // immediately, so an idle process exits at once; once the budget expires the
 // remaining sessions' client connections are force-closed and later listeners
 // stop waiting. Established tunnels are never broken before that deadline.
+//
+// Budget invariant: every listener shares the one ctx deadline, so the worst
+// case is grace plus the per-listener force-close tail (proxyserver's
+// forceCloseWait, 1s) times the three listeners, plus the admin shutdown —
+// with the default 55s grace that is ~58s, and the surrounding orchestrator's
+// kill timer (compose stop_grace_period: 60s) must stay above it.
 func shutdownAll(engineCancel context.CancelFunc, listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
 	engineCancel()
 	ctx, cancel := context.WithTimeout(context.Background(), grace)

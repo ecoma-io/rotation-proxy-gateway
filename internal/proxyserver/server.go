@@ -56,9 +56,19 @@ type Server struct {
 
 	cmu   sync.Mutex
 	conns map[net.Conn]struct{}
+	// shuttingDown refuses new sessions once shutdown began closing
+	// listeners. Guarded by cmu together with the connection map so admission
+	// and the drain wait cannot interleave.
+	shuttingDown bool
 	// live counts tracked sessions so Shutdown can wait for the drain without
 	// polling the connection map.
 	live sync.WaitGroup
+	// baseCtx is the context every upstream dial runs under. Shutdown
+	// cancels it when the grace budget expires, unblocking dials still in
+	// their TCP connect phase; handshake-phase dials unblock through
+	// CloseConns closing the client side or their own dial deadline.
+	baseCtx    context.Context
+	cancelBase context.CancelFunc
 
 	startTime time.Time
 	requests  atomic.Uint64
@@ -91,15 +101,18 @@ func NewRuntime(store *pool.Store, log zerolog.Logger, version, listener string,
 		}
 		return len(allowed) == 0
 	}
+	baseCtx, cancelBase := context.WithCancel(context.Background())
 	return &Server{
-		store:     store,
-		log:       log.With().Str("listener", listener).Logger(),
-		version:   version,
-		listener:  listener,
-		allow:     allow,
-		dial:      dialVia,
-		conns:     map[net.Conn]struct{}{},
-		startTime: time.Now(),
+		store:      store,
+		log:        log.With().Str("listener", listener).Logger(),
+		version:    version,
+		listener:   listener,
+		allow:      allow,
+		dial:       dialVia,
+		conns:      map[net.Conn]struct{}{},
+		baseCtx:    baseCtx,
+		cancelBase: cancelBase,
+		startTime:  time.Now(),
 	}
 }
 
@@ -114,7 +127,10 @@ func (s *Server) Serve(ln net.Listener) error {
 			}
 			return err
 		}
-		s.live.Add(1)
+		if !s.beginSession(conn) {
+			conn.Close() //nolint:errcheck // refused session during shutdown
+			continue
+		}
 		go func() {
 			defer s.live.Done()
 			s.serveConn(conn)
@@ -122,12 +138,42 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 }
 
+// beginSession admits one accepted connection: registration for force-close
+// and the drain count land in one critical section, so a session can never be
+// admitted uncounted between Shutdown's drain wait and its connection sweep.
+// It refuses connections that arrive after shutdown began; the caller closes
+// them and keeps accepting until the listener itself closes.
+func (s *Server) beginSession(c net.Conn) bool {
+	s.cmu.Lock()
+	defer s.cmu.Unlock()
+	if s.shuttingDown {
+		return false
+	}
+	s.conns[c] = struct{}{}
+	s.live.Add(1)
+	return true
+}
+
+// forceCloseWait bounds the extra time Shutdown spends waiting for sessions
+// to unwind after their connections were force-closed: sessions finish on
+// closed sockets promptly, so this only bites a wedged handler. The whole
+// process shutdown stays inside grace + a bounded tail (see shutdownAll in
+// cmd/rotation-proxy-gateway), which the surrounding orchestrator's kill
+// timer must exceed.
+const forceCloseWait = time.Second
+
 // Shutdown waits for active sessions to finish. When ctx expires before the
-// drain completes, tracked client connections are force-closed, the remaining
-// sessions finish on their closed connections, and ctx.Err() is returned.
-// Closing the listener itself is the caller's job: it stops new accepts at a
-// precisely chosen point in the shutdown sequence.
+// drain completes, pending upstream dials are canceled, tracked client
+// connections are force-closed, the remaining sessions finish on their closed
+// connections within forceCloseWait, and ctx.Err() is returned. Closing the
+// listener itself is the caller's job: it stops new accepts at a precisely
+// chosen point in the shutdown sequence.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.cmu.Lock()
+	s.shuttingDown = true
+	s.cmu.Unlock()
+	defer s.cancelBase()
+
 	done := make(chan struct{})
 	go func() {
 		s.live.Wait()
@@ -137,8 +183,17 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	case <-done:
 		return nil
 	case <-ctx.Done():
-		s.CloseConns()
-		<-done
+		// Cancel upstream dials first so sessions blocked in their TCP
+		// connect unwind by themselves, then force-close the client sockets
+		// to break established tunnels and handshake waits.
+		s.cancelBase()
+		if n := s.CloseConns(); n > 0 {
+			s.log.Warn().Int("connections", n).Msg("grace budget expired; force-closing client connections")
+		}
+		select {
+		case <-done:
+		case <-time.After(forceCloseWait):
+		}
 		return ctx.Err()
 	}
 }
@@ -188,7 +243,6 @@ func (s *Server) settings() sessionSettings {
 // error_kind=bad_request and never advance the request counter or touch the
 // pool; only a valid CONNECT does both.
 func (s *Server) serveConn(conn net.Conn) {
-	s.trackConn(conn)
 	defer s.untrackConn(conn)
 	defer conn.Close() //nolint:errcheck // relay shutdown handles write failure
 
@@ -236,7 +290,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, log zerolog.Log
 		// The winning pick holds the route for the tunnel's whole lifetime;
 		// earlier excluded attempts release when the handler ends.
 		defer p.Release()
-		up, err := s.dial(context.Background(), p.URL, target, settings.dialTimeout)
+		up, err := s.dial(s.baseCtx, p.URL, target, settings.dialTimeout)
 		if err != nil {
 			switch {
 			case isProxyDialError(err):
@@ -502,12 +556,6 @@ func recordTunnelClose(log zerolog.Logger, target string, p *pool.Proxy, start t
 	ev.Msg(msg)
 }
 
-func (s *Server) trackConn(c net.Conn) {
-	s.cmu.Lock()
-	s.conns[c] = struct{}{}
-	s.cmu.Unlock()
-}
-
 func (s *Server) untrackConn(c net.Conn) {
 	s.cmu.Lock()
 	delete(s.conns, c)
@@ -515,9 +563,12 @@ func (s *Server) untrackConn(c net.Conn) {
 }
 
 // CloseConns closes every tracked client connection, including established
-// tunnels and sessions still inside their handshake. Shutdown calls it when
-// the shared grace budget expires.
-func (s *Server) CloseConns() {
+// tunnels and sessions still inside their handshake, and returns how many
+// were closed. Shutdown calls it when the shared grace budget expires. It
+// deliberately does not cancel the base context — callers that need that
+// pairing use Shutdown, and tests may call this directly without tearing
+// down the server's dial context.
+func (s *Server) CloseConns() int {
 	s.cmu.Lock()
 	conns := make([]net.Conn, 0, len(s.conns))
 	for c := range s.conns {
@@ -527,6 +578,7 @@ func (s *Server) CloseConns() {
 	for _, c := range conns {
 		c.Close() //nolint:errcheck // best-effort force-close
 	}
+	return len(conns)
 }
 
 // AdminMux serves the health and status endpoints for the admin listener.

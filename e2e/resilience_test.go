@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -395,4 +396,83 @@ func TestE2E_BootstrapValidationFailsFast(t *testing.T) {
 			t.Fatalf("output missing missing-config error:\n%s", out)
 		}
 	})
+}
+
+// A session stuck inside an upstream dial must not stretch shutdown: once the
+// shared grace budget expires, the gateway cancels pending dials, force-closes
+// its client connections, and exits inside the budget plus the bounded
+// force-close tail — never anywhere near the dial timeout. The upstream here
+// is a black hole that accepts TCP but never answers the SOCKS greeting, so
+// the tunnel parks for dial-timeout (30s) unless shutdown unwinds it.
+func TestE2E_ShutdownGraceBoundsStuckDial(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	bhLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bhLn.Close() })
+	accepted := make(chan net.Conn, 4)
+	go func() {
+		for {
+			c, err := bhLn.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- c
+		}
+	}()
+
+	cfg := defaultGatewayConfig([]RouteConfig{
+		{Proxy: "socks5://" + bhLn.Addr().String(), Kind: "v4"},
+	})
+	cfg.DialTimeout = "30s"
+	g := NewGatewayWithEnv(t, cfg, "SHUTDOWN_GRACE=2s")
+
+	// One CONNECT parks the gateway inside the upstream SOCKS handshake.
+	conn, err := net.Dial("tcp", g.MixedAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	choice := make([]byte, 2)
+	if _, err := io.ReadFull(conn, choice); err != nil {
+		t.Fatal(err)
+	}
+	req, err := socksConnectRequestBytes("example.test:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gateway never dialed the black-hole upstream")
+	}
+
+	start := time.Now()
+	if err := g.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	exit := make(chan struct{})
+	go func() { _ = g.cmd.Wait(); close(exit) }()
+	select {
+	case <-exit:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("gateway still running %s after SIGTERM; shutdown is not bounded by the grace budget", time.Since(start))
+	}
+	elapsed := time.Since(start)
+	// Grace 2s (established tunnels are never broken early) plus the bounded
+	// force-close tail; the 30s dial timeout must not appear in the exit time.
+	if elapsed < 1900*time.Millisecond || elapsed > 4500*time.Millisecond {
+		t.Fatalf("shutdown took %s, want within [1.9s, 4.5s] (grace 2s + force-close tail)", elapsed)
+	}
+	g.cmd = nil // the Wait above reaped the process; cleanup must not Wait again
 }
