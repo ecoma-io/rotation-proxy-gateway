@@ -201,7 +201,7 @@ func TestRotationDrainWaitsForInFlightRequest(t *testing.T) {
 			done <- err
 			return
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		done <- nil
 	}()
 
@@ -260,7 +260,7 @@ func TestRotationDrainTimeoutForceRotates(t *testing.T) {
 			done <- err
 			return
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		done <- nil
 	}()
 	start := time.Now()
@@ -422,7 +422,7 @@ func TestRotationSingleManualRouteWindowReturns502(t *testing.T) {
 		}
 		body := make([]byte, 64)
 		_, _ = resp.Body.Read(body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode == http.StatusBadGateway {
 			saw502 = true
 			break
@@ -496,7 +496,7 @@ func TestRotationReloadMidDrainNeverCallsRotateAPI(t *testing.T) {
 			return
 		}
 		body, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if readErr == nil && len(body) != 32 {
 			readErr = fmt.Errorf("short body: %d bytes", len(body))
 		}
@@ -682,7 +682,7 @@ func TestRotationLifecycleStatesVisibleInStatus(t *testing.T) {
 	go func() {
 		resp, err := ProxyClient(g.MixedAddr).Get(held.URL + "/held")
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 	}()
 

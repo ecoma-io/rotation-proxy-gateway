@@ -93,7 +93,7 @@ func TestE2E_ReloadShrinksToOtherFamily(t *testing.T) {
 		t.Fatalf("v4 GET: %v", err)
 	}
 	_, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("v4 status=%d, want 502", resp.StatusCode)
 	}
@@ -185,7 +185,7 @@ func TestE2E_ReloadChangedCredsResetState(t *testing.T) {
 		resp, err := ProxyClient(g.MixedAddr).Get(target.URL + "/")
 		if err == nil {
 			_, _ = io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 		for _, e := range st.Pool {
 			if e.AuthBlocked {
@@ -326,7 +326,7 @@ func TestE2E_ReloadDoesNotDropInFlight(t *testing.T) {
 					continue
 				}
 				body, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
+				_ = resp.Body.Close()
 				if resp.StatusCode != http.StatusOK || string(body) != "e2e-echo:/load" {
 					failures.Add(1)
 				}

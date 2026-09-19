@@ -188,7 +188,7 @@ func freeAddr(t testing.TB) string {
 			t.Fatal(err)
 		}
 		addr := ln.Addr().String()
-		ln.Close()
+		_ = ln.Close()
 		if !handedOut[addr] {
 			handedOut[addr] = true
 			return addr
@@ -356,7 +356,7 @@ func (g *Gateway) waitHealthy(timeout time.Duration) {
 		resp, err := http.Get("http://" + g.AdminAddr + "/healthz")
 		if err == nil {
 			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK && string(body) == "ok\n" {
 				return
 			}
@@ -443,7 +443,7 @@ func (g *Gateway) Status() (*Status, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var st Status
 	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
 		return nil, err
@@ -501,7 +501,7 @@ func RawProxyRequest(t *testing.T, proxyAddr, method, targetURL string, header h
 	if err != nil {
 		t.Fatalf("dial proxy: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 	u, err := url.Parse(targetURL)
 	if err != nil {
@@ -530,7 +530,7 @@ func RawProxyRequest(t *testing.T, proxyAddr, method, targetURL string, header h
 	if err != nil {
 		t.Fatalf("read proxy response: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, resp.Header, respBody
 }
@@ -542,7 +542,7 @@ func GetVia(t *testing.T, client *http.Client, targetURL, wantBody string) (int,
 	if err != nil {
 		t.Fatalf("GET %s: %v", targetURL, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if wantBody != "" && string(body) != wantBody {
 		t.Fatalf("GET %s: body=%q, want %q (status=%d)", targetURL, body, wantBody, resp.StatusCode)
