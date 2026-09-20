@@ -42,8 +42,8 @@ func BenchmarkPickFor(b *testing.B) {
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
-					if p := pl.PickFor(exclude, nil); p != nil {
-						pl.ReportSuccess(p)
+					if p := pl.PickFor(exclude, nil, "t:443"); p != nil {
+						pl.ReportSuccess(p, "t:443")
 						p.Release()
 					}
 				}
@@ -63,8 +63,8 @@ func BenchmarkPickForBalanced(b *testing.B) {
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
-					if p := pl.PickFor(exclude, nil); p != nil {
-						pl.ReportSuccess(p)
+					if p := pl.PickFor(exclude, nil, "t:443"); p != nil {
+						pl.ReportSuccess(p, "t:443")
 						p.Release()
 					}
 				}

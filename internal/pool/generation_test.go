@@ -55,7 +55,7 @@ func TestGenerationStorePublishesSnapshots(t *testing.T) {
 	if got := store.Load(); got.Config != next {
 		t.Fatal("store did not publish new generation")
 	}
-	if got := store.Load().Pool.ReportFailure(store.Load().Pool.PickFor(nil, nil), nil); got != 3*time.Second {
+	if got := store.Load().Pool.ReportFailure(store.Load().Pool.PickFor(nil, nil, "t:443"), nil); got != 3*time.Second {
 		t.Fatalf("published pool cooldown = %s, want new base 3s", got)
 	}
 }
@@ -67,8 +67,8 @@ func TestGenerationPublishPreservesCanonicalState(t *testing.T) {
 	pl.Now = c.NowFunc
 	store := NewStore(cfg, pl)
 
-	old := store.Load().Pool.PickFor(nil, nil)
-	store.Load().Pool.ReportSuccess(old)
+	old := store.Load().Pool.PickFor(nil, nil, "t:443")
+	store.Load().Pool.ReportSuccess(old, "t:443")
 	next := mustGenerationConfig(t, generationRoutes(t, "socks5://b.test:1080", "socks5://a.test:1080"), 30*time.Second, time.Minute)
 	gen := store.Publish(next)
 	if len(gen.Pool.entries) != 2 || gen.Pool.entries[1] != old {
@@ -93,14 +93,14 @@ func TestGenerationInFlightKeepsOriginalSnapshot(t *testing.T) {
 	if got := inFlight.Config.MaxRetries; got != 3 {
 		t.Fatalf("in-flight config changed: %+v", inFlight.Config)
 	}
-	if got := inFlight.Pool.PickFor(nil, nil); got == nil || got.URL.Host != "a.test:1080" {
+	if got := inFlight.Pool.PickFor(nil, nil, "t:443"); got == nil || got.URL.Host != "a.test:1080" {
 		t.Fatalf("in-flight pool changed: %+v", got)
 	}
-	if got := store.Load().Pool.PickFor(nil, nil); got == nil || got.URL.Host != "b.test:1080" {
+	if got := store.Load().Pool.PickFor(nil, nil, "t:443"); got == nil || got.URL.Host != "b.test:1080" {
 		t.Fatalf("published pool = %+v, want b.test:1080", got)
 	}
 	// Old-generation health reports land on the old pool only.
-	inFlight.Pool.ReportSuccess(inFlight.Pool.PickFor(nil, nil))
+	inFlight.Pool.ReportSuccess(inFlight.Pool.PickFor(nil, nil, "t:443"), "t:443")
 	if snap := store.Load().Pool.Snapshot()[0]; snap.Successes != 0 {
 		t.Fatalf("in-flight report leaked into new generation: %+v", snap)
 	}
@@ -117,7 +117,7 @@ func TestGenerationConcurrentLoadPublishRaceFree(t *testing.T) {
 			for j := 0; j < 25; j++ {
 				gen := store.Load()
 				_ = gen.Config
-				_ = gen.Pool.PickFor(nil, nil)
+				_ = gen.Pool.PickFor(nil, nil, "t:443")
 			}
 		}()
 		go func() {

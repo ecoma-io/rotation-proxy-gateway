@@ -17,6 +17,7 @@ type (
 	ProxyAuthError      = socksdial.ProxyAuthError
 	SocksProtocolError  = socksdial.SocksProtocolError
 	SocksHandshakeError = socksdial.SocksHandshakeError
+	SocksReplyError     = socksdial.SocksReplyError
 )
 
 func isProxyDialError(err error) bool { return socksdial.IsDialError(err) }
@@ -24,6 +25,11 @@ func isProxyDialError(err error) bool { return socksdial.IsDialError(err) }
 func isProxyAuthError(err error) bool { return socksdial.IsAuthError(err) }
 
 func isSocksHandshakeError(err error) bool { return socksdial.IsHandshakeError(err) }
+
+// isConnectTargetError reports the target-scoped half of the handshake
+// taxonomy: the endpoint answered CONNECT itself with a non-zero reply code,
+// so the route works and only this (route, target) pair is refused.
+func isConnectTargetError(err error) bool { return socksdial.IsConnectTargetError(err) }
 
 // dialVia establishes a TCP connection to targetAddr through a SOCKS5 upstream.
 // The returned connection is ready for arbitrary byte transport.

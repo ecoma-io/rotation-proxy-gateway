@@ -920,9 +920,12 @@ func TestDialFailureCooldownsRouteExcludedAndFallsBack(t *testing.T) {
 }
 
 // A SOCKS handshake failure before the tunnel exists is socks_connect: the
-// same cooldown-and-fallback treatment as an endpoint dial failure.
+// same cooldown-and-fallback treatment as an endpoint dial failure. The
+// route-scoped flavor needs a failure the endpoint did not answer with a
+// clean refusal — a malformed CONNECT reply (unsupported bound-address type)
+// — because an explicit refusal is the target-scoped connect_target case.
 func TestHandshakeFailureFallsBackWithSocksConnectKind(t *testing.T) {
-	reject := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
+	reject := startSocks5Proxy(t, socksOptions{connectRaw: []byte{0x05, 0x00, 0x00, 0x06}})
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(reject.URL, good.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
@@ -992,8 +995,10 @@ func TestAuthFailureFallsBackWithoutDialCooldown(t *testing.T) {
 	}
 }
 
-// With one route that always rejects, the request exhausts the pool: the
-// client gets the general-failure reply and the log names no_route.
+// With one route that refuses CONNECT to the requested target, the request
+// exhausts the pool: the client gets the general-failure reply and the log
+// names no_route. The refusal is target-scoped: the pair cools, the route
+// itself stays available.
 func TestSingleRejectingRouteExhaustsToGeneralFailure(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
@@ -1007,8 +1012,11 @@ func TestSingleRejectingRouteExhaustsToGeneralFailure(t *testing.T) {
 	}
 
 	snap := pl.Snapshot()[0]
-	if snap.Failures != 1 || snap.Successes != 0 || snap.AuthFailures != 0 || snap.Available {
-		t.Fatalf("handshake failure did not record route health: %+v", snap)
+	if snap.TargetFailures != 1 || snap.TargetCooldowns != 1 || snap.Failures != 0 || !snap.Available {
+		t.Fatalf("connect-target refusal did not record pair-scoped health: %+v", snap)
+	}
+	if snap.Successes != 0 || snap.AuthFailures != 0 || snap.CooldownFor != "0s" {
+		t.Fatalf("route-level state moved on a target-scoped refusal: %+v", snap)
 	}
 	if got := len(fs.hits); got != 1 {
 		t.Fatalf("upstream attempts = %d, want 1", got)
@@ -1018,9 +1026,58 @@ func TestSingleRejectingRouteExhaustsToGeneralFailure(t *testing.T) {
 	}
 	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel failed"})
 	if _, ok := findRecord(output, map[string]string{
+		"msg": "upstream refused connect target", "error_kind": "connect_target", "cooldown": "1s",
+	}); !ok {
+		t.Errorf("logs missing the connect_target record:\n%s", output)
+	}
+	if _, ok := findRecord(output, map[string]string{
 		"msg": "tunnel failed", "error_kind": "no_route", "attempts": "1",
 	}); !ok {
 		t.Errorf("logs missing the no_route record:\n%s", output)
+	}
+}
+
+// The issue #5 scenario in miniature: one route that serves every target
+// except one. The refusal cools only the (route, target) pair — the same
+// route immediately serves a different target, and the pair's cooldown never
+// touches route-level health.
+func TestConnectTargetRefusalKeepsRouteForOtherTargets(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05, refuseHost: "blocked.test"})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	var logs safeLogBuffer
+	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
+
+	// First request: the refused target exhausts the single-route pool.
+	conn, code := socksConnectReply(t, addr, "blocked.test:443", socksCmdConnect)
+	_ = conn.Close()
+	if code != socksReplyGeneral {
+		t.Fatalf("blocked target reply = 0x%02x, want general failure 0x01", code)
+	}
+
+	// The route never cooled: an unrelated target is served by the same route
+	// without touching the all-cooling fallback.
+	conn, code = socksConnectReply(t, addr, startRawEchoTarget(t), socksCmdConnect)
+	if code != socksReplySuccess {
+		t.Fatalf("unrelated target reply = 0x%02x, want success 0x00", code)
+	}
+	_ = conn.Close()
+
+	snap := pl.Snapshot()[0]
+	if !snap.Available || snap.Failures != 0 || snap.Successes != 1 ||
+		snap.TargetFailures != 1 || snap.TargetCooldowns != 1 {
+		t.Fatalf("pair-scoped state = %+v, want a healthy route with one cooled pair", snap)
+	}
+	if status := s.ListenerStatus(); status.Requests != 2 || status.Failovers != 1 {
+		t.Fatalf("listener status = %+v, want 2 requests and 1 failover", status)
+	}
+	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel"})
+	if _, ok := findRecord(output, map[string]string{
+		"msg": "upstream refused connect target", "error_kind": "connect_target",
+	}); !ok {
+		t.Errorf("logs missing the connect_target record:\n%s", output)
+	}
+	if _, ok := findRecord(output, map[string]string{"msg": "tunnel", "upstream": fs.URL.Host}); !ok {
+		t.Errorf("logs missing the successful tunnel through the refusing route:\n%s", output)
 	}
 }
 

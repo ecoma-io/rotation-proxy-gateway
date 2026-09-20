@@ -217,11 +217,11 @@ func (s *Server) generation() *pool.Generation {
 // by.
 const MixedListener = "mixed"
 
-func (s *Server) pick(gen *pool.Generation, exclude map[*pool.Proxy]bool) *pool.Proxy {
+func (s *Server) pick(gen *pool.Generation, exclude map[*pool.Proxy]bool, target string) *pool.Proxy {
 	if s.listener == MixedListener {
-		return gen.Pool.PickFor(exclude, s.allow)
+		return gen.Pool.PickFor(exclude, s.allow, target)
 	}
-	return gen.Pool.PickForDedicated(exclude, s.allow)
+	return gen.Pool.PickForDedicated(exclude, s.allow, target)
 }
 
 type sessionSettings struct {
@@ -327,7 +327,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 				Msg("inbound handshake deadline expired before the next attempt")
 			return
 		}
-		p := s.pick(gen, exclude)
+		p := s.pick(gen, exclude, target)
 		if p == nil {
 			break
 		}
@@ -340,7 +340,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 				Int("attempt", attempts).Int("excluded", len(exclude))
 			// A pick from the all-cooling fallback arrives with cooldown left;
 			// the size of that bet is the whole point of the line.
-			if cd := gen.Pool.CoolingFor(p); cd > 0 {
+			if cd := gen.Pool.CoolingFor(p, target); cd > 0 {
 				ev = ev.Str("cooldown_remaining", logDuration(cd))
 			}
 			ev.Msg("route selected")
@@ -355,6 +355,17 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 					Int("attempt", attempts).Str("error_kind", errorKindProxyConnect).
 					Str("error", logErrorValue(err)).Str("cooldown", cooldown.String()).
 					Msg("upstream dial failed")
+			case isConnectTargetError(err):
+				// The endpoint answered CONNECT itself: the route works and
+				// only the (route, target) pair is refused, so the cooldown
+				// lands on the pair and the route stays eligible for every
+				// other target. Same retry treatment as socks_connect.
+				cooldown := gen.Pool.ReportTargetFailure(p, target, err)
+				exclude[p] = true
+				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
+					Int("attempt", attempts).Str("error_kind", errorKindConnectTarget).
+					Str("error", logErrorValue(err)).Str("cooldown", cooldown.String()).
+					Msg("upstream refused connect target")
 			case isSocksHandshakeError(err):
 				cooldown := gen.Pool.ReportFailure(p, err)
 				exclude[p] = true
@@ -384,7 +395,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 			}
 			continue
 		}
-		gen.Pool.ReportSuccess(p)
+		gen.Pool.ReportSuccess(p, target)
 		upstream, chosen = up, p
 		break
 	}

@@ -116,6 +116,8 @@ type PoolEntry struct {
 	Failures            uint64        `json:"failures"`
 	AuthFailures        uint64        `json:"authFailures"`
 	AuthBlocked         bool          `json:"authBlocked"`
+	TargetCooldowns     int           `json:"targetCooldowns"`
+	TargetFailures      uint64        `json:"targetFailures"`
 	Rotation            *RotationView `json:"rotation,omitempty"`
 }
 

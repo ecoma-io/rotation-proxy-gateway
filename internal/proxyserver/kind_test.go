@@ -46,7 +46,7 @@ func TestSettingsFollowPublishedGeneration(t *testing.T) {
 	if got, want := server.settings(), (sessionSettings{maxRetries: 4, dialTimeout: 6 * time.Second}); got != want {
 		t.Fatalf("settings = %+v, want %+v", got, want)
 	}
-	if picked := server.pick(server.generation(), nil); picked == nil || picked.URL.Host != "b.test:1080" {
+	if picked := server.pick(server.generation(), nil, "t:443"); picked == nil || picked.URL.Host != "b.test:1080" {
 		t.Fatalf("published pool pick = %+v, want b.test:1080", picked)
 	}
 }
@@ -88,7 +88,7 @@ func TestGenerationIsolatesInFlightWork(t *testing.T) {
 	if got := generationSettings(inFlight); got != inFlightSettings {
 		t.Fatalf("in-flight settings changed: got %+v, want %+v", got, inFlightSettings)
 	}
-	if picked := server.pick(inFlight, nil); picked == nil || picked.URL.Host != "a.test:1080" {
+	if picked := server.pick(inFlight, nil, "t:443"); picked == nil || picked.URL.Host != "a.test:1080" {
 		t.Fatalf("in-flight pool pick = %+v, want a.test:1080", picked)
 	}
 	current := server.generation()
@@ -98,7 +98,7 @@ func TestGenerationIsolatesInFlightWork(t *testing.T) {
 	if current.Config.MaxRetries != 5 {
 		t.Fatalf("current settings = %+v, want MaxRetries 5", current.Config)
 	}
-	if picked := server.pick(current, nil); picked == nil || picked.URL.Host != "b.test:1080" {
+	if picked := server.pick(current, nil, "t:443"); picked == nil || picked.URL.Host != "b.test:1080" {
 		t.Fatalf("current pool pick = %+v, want b.test:1080", picked)
 	}
 }

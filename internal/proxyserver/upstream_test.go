@@ -43,6 +43,11 @@ type socksOptions struct {
 	// connectPrefix is extra stream bytes written immediately after a
 	// success reply, modeling a peer that pipelines post-handshake data.
 	connectPrefix []byte
+	// refuseHost makes the endpoint answer CONNECT with connectRep only for
+	// this target host; every other target dials through normally. It models
+	// a route that works but refuses one destination — the pair-scoped
+	// cooldown trigger.
+	refuseHost string
 }
 
 type fakeSocks struct {
@@ -94,8 +99,15 @@ func (s *fakeSocks) handle(conn net.Conn) {
 		return
 	}
 	if s.opts.connectRep != 0 {
-		fakeSocksReply(conn, s.opts.connectRep)
-		return
+		refuse := true
+		if s.opts.refuseHost != "" {
+			host, _, err := net.SplitHostPort(target)
+			refuse = err == nil && host == s.opts.refuseHost
+		}
+		if refuse {
+			fakeSocksReply(conn, s.opts.connectRep)
+			return
+		}
 	}
 	up, err := net.Dial("tcp", target)
 	if err != nil {
@@ -308,6 +320,9 @@ func TestDialViaConnectReplyIsHandshakeError(t *testing.T) {
 	handshakeErr := assertSocksHandshakeError(t, err, "connect target")
 	if !strings.Contains(handshakeErr.Error(), "SOCKS reply 0x05") {
 		t.Fatalf("handshake error = %q, want it to name the reply", handshakeErr.Error())
+	}
+	if !isConnectTargetError(err) {
+		t.Fatalf("explicit refusal must classify as connect-target: %v", err)
 	}
 }
 
