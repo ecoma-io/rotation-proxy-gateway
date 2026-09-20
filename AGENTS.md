@@ -84,16 +84,21 @@ Read [`README.md`](README.md) before changing failure classification.
   block splits mixed-listener picks between egress families by relative share
   (a family clock above the weighted order; zero-share families serve only as
   standby; availability always beats the ratio; dedicated listeners ignore
-  it). It is a single shared pool: cooldown/auth state is visible through both
-  dedicated and mixed listeners.
+  it). It is a single shared pool: cooldown, pair-scoped target-cooldown, and
+  auth state are visible through both dedicated and mixed listeners.
 - Endpoint DNS/TCP failure is `proxy_connect`: cooldown then a distinct
   eligible fallback. SOCKS auth failure is `auth_route`, blocks the route, and
   may fall back, but never creates dial cooldown. A SOCKS handshake failure
   before the tunnel exists—greeting, method/auth framing, CONNECT framing or
-  reply, bound-address reads—is `socks_connect`: the same cooldown-and-fallback
-  treatment as `proxy_connect`, because no client bytes have crossed the tunnel
-  yet. Local SOCKS request errors and post-tunnel errors are `setup`;
-  exhausting eligible routes is `no_route`.
+  reply I/O, bound-address reads—is `socks_connect`: the same
+  cooldown-and-fallback treatment as `proxy_connect`, because no client bytes
+  have crossed the tunnel yet. A CONNECT the upstream itself refuses with a
+  non-zero reply is `connect_target`: same cooldown-and-fallback treatment,
+  but the cooldown is scoped to the (route, target) pair—same base→max curve,
+  bounded per-route tracking (1024, expired-then-soonest eviction), summary
+  counts only in `/status`—so one refused target cannot cool the route for
+  other targets. Local SOCKS request errors and post-tunnel errors are
+  `setup`; exhausting eligible routes is `no_route`.
 - Errors after the SOCKS tunnel is established—including target reads/writes,
   malformed target content, cancellation, and broken tunnel—and local inbound
   request errors (malformed target encoding, oversized configured
