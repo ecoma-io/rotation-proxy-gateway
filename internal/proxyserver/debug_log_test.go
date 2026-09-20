@@ -49,7 +49,7 @@ func TestRouteSelectedDebugMarksCoolingFallback(t *testing.T) {
 	var logs safeLogBuffer
 	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
-	p := pl.PickFor(nil, nil)
+	p := pl.PickFor(nil, nil, "t:443")
 	if p == nil {
 		t.Fatal("pick = nil, want the only route")
 	}

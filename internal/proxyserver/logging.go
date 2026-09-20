@@ -14,11 +14,12 @@ import (
 const maxLogErrorLength = 512
 
 const (
-	errorKindProxyConnect = "proxy_connect"
-	errorKindAuthRoute    = "auth_route"
-	errorKindSocksConnect = "socks_connect"
-	errorKindSetup        = "setup"
-	errorKindNoRoute      = "no_route"
+	errorKindProxyConnect  = "proxy_connect"
+	errorKindAuthRoute     = "auth_route"
+	errorKindSocksConnect  = "socks_connect"
+	errorKindConnectTarget = "connect_target"
+	errorKindSetup         = "setup"
+	errorKindNoRoute       = "no_route"
 )
 
 // upstreamLogValue returns the redacted route identity used in logs. URL.Host
@@ -76,6 +77,8 @@ func logErrorKind(err error) string {
 		return errorKindProxyConnect
 	case isProxyAuthError(err):
 		return errorKindAuthRoute
+	case isConnectTargetError(err):
+		return errorKindConnectTarget
 	case isSocksHandshakeError(err):
 		return errorKindSocksConnect
 	default:

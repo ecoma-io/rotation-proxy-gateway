@@ -20,8 +20,13 @@ const (
 	// SocksAuthRequired demands username/password and rejects bad creds.
 	SocksAuthRequired
 	// SocksRejectTarget answers the CONNECT request with 0x05 (refused),
-	// modeling a post-dial setup failure: no health change, no retry.
+	// modeling an upstream that refuses one destination after a successful
+	// greeting: the connect_target pair-scoped cooldown.
 	SocksRejectTarget
+	// SocksDropConnect consumes the CONNECT request then closes without a
+	// reply, modeling a route-level handshake failure (truncated reply I/O):
+	// socks_connect, the route-scoped cooldown.
+	SocksDropConnect
 )
 
 // SocksSim is a minimal configurable SOCKS5 server for e2e. It speaks only
@@ -37,6 +42,10 @@ type SocksSim struct {
 	// Down, when true, closes accepted connections immediately, modeling an
 	// endpoint whose TCP socket answers but the SOCKS service is gone.
 	Down atomic.Bool
+	// RefuseHost narrows SocksRejectTarget to one destination host; every
+	// other target tunnels normally, modeling a route that works but refuses
+	// one destination — the issue #5 incident shape.
+	RefuseHost string
 
 	Hits atomic.Uint64
 	Addr string
@@ -169,7 +178,17 @@ func (s *SocksSim) handle(conn net.Conn) {
 	target := net.JoinHostPort(host, strconv.Itoa(int(portBytes[0])<<8|int(portBytes[1])))
 
 	if s.Mode == SocksRejectTarget {
-		_, _ = conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		refuse := true
+		if s.RefuseHost != "" {
+			h, _, err := net.SplitHostPort(target)
+			refuse = err == nil && h == s.RefuseHost
+		}
+		if refuse {
+			_, _ = conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return
+		}
+	}
+	if s.Mode == SocksDropConnect {
 		return
 	}
 	up, err := s.dialOutbound(target)

@@ -113,7 +113,7 @@ func TestBalancedZeroShareFamilyIsStandby(t *testing.T) {
 	}
 
 	pl.ReportFailure(pl.entries[0], errors.New("TEST dial refused"))
-	if got := pl.PickFor(nil, nil); got.Kind != config.EgressV6 {
+	if got := pl.PickFor(nil, nil, "t:443"); got.Kind != config.EgressV6 {
 		t.Fatalf("standby pick = %s, want v6 while v4 cools down", got.Kind)
 	}
 
@@ -135,7 +135,7 @@ func TestBalancedDedicatedKindIgnoresRatio(t *testing.T) {
 	for i, kind := range []config.EgressKind{config.EgressV6, config.EgressV4} {
 		var got []config.EgressKind
 		for range 4 {
-			p := pl.PickForDedicated(nil, only(kind))
+			p := pl.PickForDedicated(nil, only(kind), "t:443")
 			if p == nil {
 				t.Fatalf("dedicated %s pick ran dry", kind)
 			}
@@ -157,7 +157,7 @@ func TestDedicatedPickNeverAdvancesFamilyClocks(t *testing.T) {
 	before := pl.kindPass
 
 	for range 10 {
-		p := pl.PickForDedicated(nil, only(config.EgressV4))
+		p := pl.PickForDedicated(nil, only(config.EgressV4), "t:443")
 		if p == nil || p.Kind != config.EgressV4 {
 			t.Fatalf("dedicated pick = %v, want the v4 route", p)
 		}
@@ -169,7 +169,7 @@ func TestDedicatedPickNeverAdvancesFamilyClocks(t *testing.T) {
 	// The mixed split is unaffected: with untouched clocks v4 wins the next
 	// mixed pick, and that pick does advance the clocks — proving the
 	// assertion above has teeth.
-	if got := pl.PickFor(nil, nil); got.Kind != config.EgressV4 {
+	if got := pl.PickFor(nil, nil, "t:443"); got.Kind != config.EgressV4 {
 		t.Fatalf("first mixed pick after the dedicated burst = %s, want v4 (clocks untouched)", got.Kind)
 	}
 	afterMixed := pl.kindPass
@@ -180,7 +180,7 @@ func TestDedicatedPickNeverAdvancesFamilyClocks(t *testing.T) {
 	// The all-cooling fallback on the dedicated path keeps the same
 	// discipline: the cooling v4 route serves without touching the clocks.
 	pl.ReportFailure(pl.entries[0], errors.New("TEST dial refused"))
-	if p := pl.PickForDedicated(nil, only(config.EgressV4)); p == nil {
+	if p := pl.PickForDedicated(nil, only(config.EgressV4), "t:443"); p == nil {
 		t.Fatal("dedicated cooling fallback ran dry")
 	}
 	if pl.kindPass != afterMixed {
@@ -195,7 +195,7 @@ func TestReconfigureCarriesFamilyClocks(t *testing.T) {
 	kinds := []config.EgressKind{config.EgressV4, config.EgressV6}
 	pl := balancedPool(t, c, config.KindBalance{V4: 1, V6: 1}, kinds...)
 
-	if got := pl.PickFor(nil, nil); got.Kind != config.EgressV4 {
+	if got := pl.PickFor(nil, nil, "t:443"); got.Kind != config.EgressV4 {
 		t.Fatalf("first pick = %s, want v4", got.Kind)
 	}
 
@@ -203,7 +203,7 @@ func TestReconfigureCarriesFamilyClocks(t *testing.T) {
 		{URL: mustURL(t, "socks5://k0.test:1080"), Kind: config.EgressV4},
 		{URL: mustURL(t, "socks5://k1.test:1080"), Kind: config.EgressV6},
 	}, 30*time.Second, time.Minute, config.KindBalance{V4: 1, V6: 1})
-	if got := next.PickFor(nil, nil); got.Kind != config.EgressV6 {
+	if got := next.PickFor(nil, nil, "t:443"); got.Kind != config.EgressV6 {
 		t.Fatalf("first pick after reload = %s, want v6 (family clocks carried over)", got.Kind)
 	}
 }

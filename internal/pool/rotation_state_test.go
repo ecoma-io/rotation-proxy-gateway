@@ -39,7 +39,7 @@ func TestManualOnlyPoolServes(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newManualPool(t, c, "socks5://m1:1", "socks5://m2:2")
 
-	if got := pl.PickFor(nil, nil).URL.Host; got != "m1:1" {
+	if got := pl.PickFor(nil, nil, "t:443").URL.Host; got != "m1:1" {
 		t.Fatalf("pick = %s, want m1:1", got)
 	}
 	snap := pl.Snapshot()
@@ -59,11 +59,11 @@ func TestPickForSkipsRotatingRoute(t *testing.T) {
 	rotating := pl.entries[0]
 
 	// Prime the LRU so m2 would normally be next; the rotating flag must win.
-	pl.PickFor(nil, nil)
+	pl.PickFor(nil, nil, "t:443")
 	rotating.BeginRotation(RotationDraining)
 
 	for range 3 {
-		if got := pl.PickFor(nil, nil).URL.Host; got != "m2:2" {
+		if got := pl.PickFor(nil, nil, "t:443").URL.Host; got != "m2:2" {
 			t.Fatalf("pick = %s, want m2:2 while m1 rotates", got)
 		}
 	}
@@ -83,7 +83,7 @@ func TestAllCoolingFallbackSkipsRotatingRoute(t *testing.T) {
 	pl.ReportFailure(pl.entries[0], nil)
 	pl.entries[1].BeginRotation(RotationRotating)
 
-	if got := pl.PickFor(nil, nil); got == nil || got.URL.Host != "m1:1" {
+	if got := pl.PickFor(nil, nil, "t:443"); got == nil || got.URL.Host != "m1:1" {
 		t.Fatalf("fallback pick = %v, want cooling m1:1", got)
 	}
 
@@ -91,7 +91,7 @@ func TestAllCoolingFallbackSkipsRotatingRoute(t *testing.T) {
 	// recovers sooner only when all entries cool; with m2 eligible the LRU
 	// main path applies. Either way m2 must be pickable again.
 	pl.entries[1].AbandonRotation()
-	if got := pl.PickFor(nil, nil); got == nil {
+	if got := pl.PickFor(nil, nil, "t:443"); got == nil {
 		t.Fatalf("pick = nil after abandoning rotation, want any eligible route")
 	}
 }
@@ -100,11 +100,11 @@ func TestInFlightAccounting(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newManualPool(t, c, "socks5://m1:1")
 
-	p := pl.PickFor(nil, nil)
+	p := pl.PickFor(nil, nil, "t:443")
 	if p.InFlight() != 1 {
 		t.Fatalf("InFlight after pick = %d, want 1", p.InFlight())
 	}
-	q := pl.PickFor(nil, nil)
+	q := pl.PickFor(nil, nil, "t:443")
 	if q != p || p.InFlight() != 2 {
 		t.Fatalf("second pick = %v InFlight = %d, want same route at 2", q, p.InFlight())
 	}
@@ -160,11 +160,11 @@ func TestMarkStaleRecordsRetryAndDeprioritizes(t *testing.T) {
 	stale := pl.entries[1]
 
 	// Without the stale bump, m2 (pass 0) would win this LRU pick.
-	pl.PickFor(nil, nil) // m1
+	pl.PickFor(nil, nil, "t:443") // m1
 	stale.BeginRotation(RotationVerifying)
 	pl.MarkStale(stale, 90*time.Second, 2)
 
-	if got := pl.PickFor(nil, nil).URL.Host; got != "m1:1" {
+	if got := pl.PickFor(nil, nil, "t:443").URL.Host; got != "m1:1" {
 		t.Fatalf("pick = %s, want m1:1 (stale route pushed to LRU back)", got)
 	}
 	s := findStatus(t, pl.Snapshot(), "m2:2")

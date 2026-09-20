@@ -38,7 +38,7 @@ func pickN(t *testing.T, pl *Pool, n int) []*Proxy {
 	t.Helper()
 	picks := make([]*Proxy, 0, n)
 	for range n {
-		p := pl.PickFor(nil, nil)
+		p := pl.PickFor(nil, nil, "t:443")
 		if p == nil {
 			t.Fatalf("pick ran dry after %d picks", len(picks))
 		}
@@ -130,7 +130,7 @@ func TestWeightedFallbackIgnoresWeights(t *testing.T) {
 	pl.ReportFailure(pl.entries[1], nil)
 	pl.ReportFailure(pl.entries[1], nil) // light route: until +60s
 
-	if got := pl.PickFor(nil, nil).URL.Host; got != "w0.test:1080" {
+	if got := pl.PickFor(nil, nil, "t:443").URL.Host; got != "w0.test:1080" {
 		t.Fatalf("all-cooling pick = %s, want w0 (soonest recovery, not heaviest)", got)
 	}
 }
@@ -141,9 +141,9 @@ func TestReportSuccessAdvancesWeightedStep(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := weightedPool(t, c, 1, 1)
 
-	first := pl.PickFor(nil, nil)
-	pl.ReportSuccess(first)
-	pl.PickFor(nil, nil) // the other route
+	first := pl.PickFor(nil, nil, "t:443")
+	pl.ReportSuccess(first, "t:443")
+	pl.PickFor(nil, nil, "t:443") // the other route
 
 	got := hosts(pickN(t, pl, 2))
 	if !equalHosts(got, "w1.test:1080", "w0.test:1080") {
@@ -156,8 +156,8 @@ func TestMarkStaleJumpsWeightedBack(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := weightedPool(t, c, 1, 1, 5)
 
-	pl.PickFor(nil, nil) // w0
-	pl.PickFor(nil, nil) // w1
+	pl.PickFor(nil, nil, "t:443") // w0
+	pl.PickFor(nil, nil, "t:443") // w1
 	heavy := pl.entries[2]
 	heavy.BeginRotation(RotationVerifying)
 	pl.MarkStale(heavy, 90*time.Second, 1)
@@ -179,8 +179,8 @@ func TestReconfigureRetunesWeightKeepingState(t *testing.T) {
 	pl := NewRoutes(specs, 30*time.Second, time.Minute, config.KindBalance{})
 	pl.Now = c.NowFunc
 
-	a := pl.PickFor(nil, nil)
-	pl.ReportSuccess(a)
+	a := pl.PickFor(nil, nil, "t:443")
+	pl.ReportSuccess(a, "t:443")
 	if snap := pl.Snapshot()[0]; snap.Successes != 1 {
 		t.Fatalf("pre-reload successes = %d, want 1", snap.Successes)
 	}
@@ -220,8 +220,8 @@ func TestReconfigureAnchorsNewRouteAtRecencyFront(t *testing.T) {
 	}
 	pl := NewRoutes(specs, 30*time.Second, time.Minute, config.KindBalance{})
 	pl.Now = c.NowFunc
-	pl.PickFor(nil, nil)
-	pl.PickFor(nil, nil)
+	pl.PickFor(nil, nil, "t:443")
+	pl.PickFor(nil, nil, "t:443")
 
 	grown := []config.RouteSpec{
 		specs[0],

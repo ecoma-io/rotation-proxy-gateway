@@ -260,14 +260,15 @@ func TestE2E_AuthFailureFallsBackWithoutCooldown(t *testing.T) {
 	}
 }
 
-// With a single route whose SOCKS CONNECT fails, the route is excluded within
-// the request: the pool exhausts to the no-route general-failure reply while
-// the failure is recorded in route health.
+// With a single route whose SOCKS handshake dies before a CONNECT reply (the
+// route-scoped socks_connect flavor), the route is excluded within the
+// request: the pool exhausts to the no-route general-failure reply while the
+// failure is recorded in route health.
 func TestE2E_SocksHandshakeFailureExhaustsToNoRoute(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
-	reject := NewSocksSim(t, SocksRejectTarget, "", "")
+	reject := NewSocksSim(t, SocksDropConnect, "", "")
 	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
 		{Proxy: reject.RouteValue(), Kind: "v4"},
 	}))
@@ -294,7 +295,7 @@ func TestE2E_HandshakeFailureFallsBackWithCooldown(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
-	reject := NewSocksSim(t, SocksRejectTarget, "", "")
+	reject := NewSocksSim(t, SocksDropConnect, "", "")
 	good := NewSocksSim(t, SocksOK, "", "")
 	target := NewEchoTarget(t)
 	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
@@ -323,7 +324,7 @@ func TestE2E_ConnectTunnelHandshakeFailureFallsBack(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
 	}
-	reject := NewSocksSim(t, SocksRejectTarget, "", "")
+	reject := NewSocksSim(t, SocksDropConnect, "", "")
 	good := NewSocksSim(t, SocksOK, "", "")
 	target := NewTLSEchoTarget(t)
 	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{

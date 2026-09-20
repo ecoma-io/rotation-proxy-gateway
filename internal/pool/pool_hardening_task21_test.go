@@ -28,11 +28,11 @@ func TestHardeningConcurrentReportSuccessRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 50; j++ {
-				p := pl.PickFor(nil, nil)
+				p := pl.PickFor(nil, nil, "t:443")
 				if p == nil {
 					return
 				}
-				pl.ReportSuccess(p)
+				pl.ReportSuccess(p, "t:443")
 			}
 		}()
 	}
@@ -50,7 +50,7 @@ func TestHardeningAllCoolingFallbackMarksUsed(t *testing.T) {
 
 	seqBeforeA := pl.entries[0].recencyPass()
 	seqBeforeB := pl.entries[1].recencyPass()
-	got := pl.PickFor(nil, nil)
+	got := pl.PickFor(nil, nil, "t:443")
 	if got == nil || got.URL.Host != "a.test:1080" {
 		t.Fatalf("pick with all cooling = %v, want a.test:1080 (soonest recovery)", got)
 	}
@@ -60,7 +60,7 @@ func TestHardeningAllCoolingFallbackMarksUsed(t *testing.T) {
 	// Second fallback pick with both still cooling must rotate to the other route
 	// now that the first fallback choice is marked most-recently used... but both
 	// are cooling so earliest-recovery still wins; at minimum seq must keep advancing.
-	second := pl.PickFor(nil, nil)
+	second := pl.PickFor(nil, nil, "t:443")
 	if second == nil {
 		t.Fatalf("second fallback pick = nil, want earliest recovery route")
 	}
@@ -100,10 +100,10 @@ func TestHardeningCooldownSaturatesNeverNegative(t *testing.T) {
 func TestReconfigureRetainsCanonicalState(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newTestPool(t, c, "socks5://TEST-user:TEST-pass@a.test:1080", "socks5://b.test:1080", "socks5://c.test:1080")
-	pl.ReportSuccess(pl.entries[0])
+	pl.ReportSuccess(pl.entries[0], "t:443")
 	pl.ReportFailure(pl.entries[1], errors.New("TEST dial refused"))
-	pl.PickFor(nil, nil)
-	pl.PickFor(nil, nil)
+	pl.PickFor(nil, nil, "t:443")
+	pl.PickFor(nil, nil, "t:443")
 
 	oldA := pl.entries[0]
 	oldB := pl.entries[1]
@@ -151,7 +151,7 @@ func TestHardeningConcurrentPoolRaceFree(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 25; j++ {
-				_ = pl.PickFor(nil, nil)
+				_ = pl.PickFor(nil, nil, "t:443")
 			}
 		}()
 		go func() {
@@ -163,7 +163,7 @@ func TestHardeningConcurrentPoolRaceFree(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 25; j++ {
-				pl.ReportSuccess(routes[j%2])
+				pl.ReportSuccess(routes[j%2], "t:443")
 			}
 		}()
 		go func() {

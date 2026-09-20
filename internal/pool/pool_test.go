@@ -41,7 +41,7 @@ func TestRoundRobinCyclesAll(t *testing.T) {
 	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2", "socks5://c:3")
 	var got []string
 	for range 6 {
-		got = append(got, pl.PickFor(nil, nil).URL.Host)
+		got = append(got, pl.PickFor(nil, nil, "t:443").URL.Host)
 	}
 	want := []string{"a:1", "b:2", "c:3", "a:1", "b:2", "c:3"}
 	if !reflect.DeepEqual(got, want) {
@@ -53,17 +53,17 @@ func TestFailureCooldownSkipAndRevive(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2")
 
-	first := pl.PickFor(nil, nil)
+	first := pl.PickFor(nil, nil, "t:443")
 	if first.URL.Host != "a:1" {
 		t.Fatalf("first pick = %s, want a:1", first.URL.Host)
 	}
 	pl.ReportFailure(first, errors.New("dial refused"))
 
-	if got := pl.PickFor(nil, nil).URL.Host; got != "b:2" {
+	if got := pl.PickFor(nil, nil, "t:443").URL.Host; got != "b:2" {
 		t.Fatalf("pick after failure = %s, want b:2 (a cooling)", got)
 	}
 	c.advance(31 * time.Second)
-	if got := pl.PickFor(nil, nil).URL.Host; got != "a:1" {
+	if got := pl.PickFor(nil, nil, "t:443").URL.Host; got != "a:1" {
 		t.Fatalf("pick after cooldown = %s, want a:1 revived", got)
 	}
 }
@@ -71,7 +71,7 @@ func TestFailureCooldownSkipAndRevive(t *testing.T) {
 func TestCooldownExponentialCap(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newTestPool(t, c, "socks5://a:1")
-	p := pl.PickFor(nil, nil)
+	p := pl.PickFor(nil, nil, "t:443")
 
 	if cd := pl.ReportFailure(p, nil); cd != 30*time.Second {
 		t.Fatalf("first cooldown = %s, want 30s", cd)
@@ -89,8 +89,8 @@ func TestCooldownExponentialCap(t *testing.T) {
 func TestExhaustedReturnsNil(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newTestPool(t, c, "socks5://a:1")
-	p := pl.PickFor(nil, nil)
-	if got := pl.PickFor(map[*Proxy]bool{p: true}, nil); got != nil {
+	p := pl.PickFor(nil, nil, "t:443")
+	if got := pl.PickFor(map[*Proxy]bool{p: true}, nil, "t:443"); got != nil {
 		t.Fatalf("Pick(all excluded) = %v, want nil", got)
 	}
 }
@@ -103,7 +103,7 @@ func TestAllCoolingPicksSoonestRecovery(t *testing.T) {
 	pl.ReportFailure(pl.entries[1], nil)
 	pl.ReportFailure(pl.entries[1], nil) // b: two failures -> until +60s
 
-	got := pl.PickFor(nil, nil)
+	got := pl.PickFor(nil, nil, "t:443")
 	if got.URL.Host != "a:1" {
 		t.Fatalf("pick with all cooling = %s, want a:1 (soonest recovery)", got.URL.Host)
 	}
@@ -119,7 +119,7 @@ func TestAuthBlockedDoesNotCreateCooldown(t *testing.T) {
 		snap[0].Failures != 0 || snap[0].ConsecutiveFailures != 0 || snap[0].CooldownFor != "0s" {
 		t.Fatalf("blocked route snapshot = %+v", snap[0])
 	}
-	if got := pl.PickFor(nil, nil); got.URL.Host != "b:2" {
+	if got := pl.PickFor(nil, nil, "t:443"); got.URL.Host != "b:2" {
 		t.Fatalf("Pick() = %s, want unblocked b:2", got.URL.Host)
 	}
 }
@@ -128,7 +128,7 @@ func TestAllAuthBlockedReturnsNil(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newTestPool(t, c, "socks5://a:1")
 	pl.ReportAuthBlocked(pl.entries[0], errors.New("auth rejected"))
-	if got := pl.PickFor(nil, nil); got != nil {
+	if got := pl.PickFor(nil, nil, "t:443"); got != nil {
 		t.Fatalf("Pick() = %v, want nil when all routes auth-blocked", got)
 	}
 }
@@ -146,7 +146,7 @@ func TestReportSuccessClearsDialCooldownButKeepsAuthBlock(t *testing.T) {
 	if snap := pl.Snapshot()[0]; snap.Available || snap.ConsecutiveFailures != 2 {
 		t.Fatalf("cooling route snapshot = %+v", pl.Snapshot()[0])
 	}
-	pl.ReportSuccess(a)
+	pl.ReportSuccess(a, "t:443")
 	snap := pl.Snapshot()[0]
 	if !snap.Available || snap.ConsecutiveFailures != 0 || snap.CooldownFor != "0s" || snap.LastDialError != "" {
 		t.Fatalf("success did not clear dial health: %+v", snap)
@@ -157,12 +157,12 @@ func TestReportSuccessClearsDialCooldownButKeepsAuthBlock(t *testing.T) {
 
 	b := pl.entries[1]
 	pl.ReportAuthBlocked(b, errors.New("endpoint rejected credentials"))
-	pl.ReportSuccess(b)
+	pl.ReportSuccess(b, "t:443")
 	snapB := pl.Snapshot()[1]
 	if !snapB.AuthBlocked || snapB.Available {
 		t.Fatalf("success cleared an authentication block: %+v", snapB)
 	}
-	if got := pl.PickFor(nil, nil); got == nil || got.URL.Host != "a:1" {
+	if got := pl.PickFor(nil, nil, "t:443"); got == nil || got.URL.Host != "a:1" {
 		t.Fatalf("auth-blocked route re-entered rotation: got %v", got)
 	}
 }

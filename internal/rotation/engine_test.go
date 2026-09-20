@@ -728,7 +728,7 @@ func TestProcedureDrainForcesAfterTimeout(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	held := s.pl.PickFor(nil, nil) // one in-flight request that never finishes
+	held := s.pl.PickFor(nil, nil, "t:443") // one in-flight request that never finishes
 	start := time.Now()
 	s.runOne(spec)
 	elapsed := time.Since(start)
@@ -751,7 +751,7 @@ func TestProcedureAbortsOnShutdown(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	held := s.pl.PickFor(nil, nil) // drain would wait for the full timeout
+	held := s.pl.PickFor(nil, nil, "t:443") // drain would wait for the full timeout
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -802,7 +802,7 @@ func TestProcedureAbortsMidFlightWhenReloadRemovesRoute(t *testing.T) {
 	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
 	s := newSetup(t, cfg, nil, ips)
 
-	held := s.pl.PickFor(nil, nil) // park the procedure in the drain loop
+	held := s.pl.PickFor(nil, nil, "t:443") // park the procedure in the drain loop
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

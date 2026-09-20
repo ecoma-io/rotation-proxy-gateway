@@ -53,7 +53,7 @@ func TestCooldownRealClockLifecycle(t *testing.T) {
 		{URL: mustURL(t, "socks5://a:1"), Kind: config.EgressV4},
 		{URL: mustURL(t, "socks5://b:2"), Kind: config.EgressV4},
 	}, 300*time.Millisecond, 10*time.Second, config.KindBalance{})
-	p := pl.PickFor(nil, nil)
+	p := pl.PickFor(nil, nil, "t:443")
 	if p == nil {
 		t.Fatal("pick = nil, want the first route")
 	}
@@ -75,7 +75,7 @@ func TestCooldownRealClockLifecycle(t *testing.T) {
 	}
 
 	// The next pick uses the healthy peer, not the cooling route.
-	if got := pl.PickFor(nil, nil); got == nil || got.URL.Host == p.URL.Host {
+	if got := pl.PickFor(nil, nil, "t:443"); got == nil || got.URL.Host == p.URL.Host {
 		t.Fatalf("pick = %v, want the healthy peer b:2", got)
 	}
 
@@ -85,7 +85,7 @@ func TestCooldownRealClockLifecycle(t *testing.T) {
 	if !snap.Available || snap.CooldownFor != "0s" {
 		t.Fatalf("route did not recover after real elapsed time: %+v", snap)
 	}
-	if got := pl.PickFor(nil, nil); got != p {
+	if got := pl.PickFor(nil, nil, "t:443"); got != p {
 		t.Fatalf("pick = %v, want the recovered route", got)
 	}
 }
@@ -97,7 +97,7 @@ func TestCooldownRealClockLifecycle(t *testing.T) {
 func TestCooldownAndStreakWriteAsOneUnit(t *testing.T) {
 	pl := NewRoutes([]config.RouteSpec{{URL: mustURL(t, "socks5://a:1"), Kind: config.EgressV4}},
 		30*time.Second, time.Minute, config.KindBalance{})
-	p := pl.PickFor(nil, nil)
+	p := pl.PickFor(nil, nil, "t:443")
 	if p == nil {
 		t.Fatal("pick = nil, want the single route")
 	}
@@ -110,14 +110,14 @@ func TestCooldownAndStreakWriteAsOneUnit(t *testing.T) {
 			defer wg.Done()
 			for range rounds {
 				pl.ReportFailure(p, errors.New("dial refused (TEST)"))
-				pl.ReportSuccess(p)
+				pl.ReportSuccess(p, "t:443")
 			}
 		}()
 	}
 	wg.Wait()
 
 	// A final success must leave no cooldown and no failure streak...
-	pl.ReportSuccess(p)
+	pl.ReportSuccess(p, "t:443")
 	snap := pl.Snapshot()[0]
 	if !snap.Available || snap.CooldownFor != "0s" || snap.ConsecutiveFailures != 0 {
 		t.Fatalf("post-success state = %+v, want available, no cooldown, no streak", snap)
@@ -190,19 +190,19 @@ func TestCoolingForReportsRemainingCooldown(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2")
 
-	a := pl.PickFor(nil, nil)
+	a := pl.PickFor(nil, nil, "t:443")
 	if a == nil || a.URL.Host != "a:1" {
 		t.Fatalf("pick = %v, want a:1", a)
 	}
-	if got := pl.CoolingFor(a); got != 0 {
+	if got := pl.CoolingFor(a, "t:443"); got != 0 {
 		t.Fatalf("CoolingFor(healthy) = %s, want 0", got)
 	}
 	pl.ReportFailure(a, errors.New("dial refused (TEST)"))
-	if got := pl.CoolingFor(a); got != 30*time.Second {
+	if got := pl.CoolingFor(a, "t:443"); got != 30*time.Second {
 		t.Fatalf("CoolingFor right after failure = %s, want the 30s base", got)
 	}
 	c.advance(31 * time.Second)
-	if got := pl.CoolingFor(a); got != 0 {
+	if got := pl.CoolingFor(a, "t:443"); got != 0 {
 		t.Fatalf("CoolingFor after expiry = %s, want 0", got)
 	}
 }
