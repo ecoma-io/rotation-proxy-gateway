@@ -62,7 +62,10 @@ func (e *SocksProtocolError) Unwrap() error { return e.Err }
 // or authentication framing, CONNECT framing or reply, and bound-address
 // reads. No client bytes have crossed the tunnel, so like ProxyDialError it
 // records dial health and permits a distinct-route retry; it logs under its
-// own error kind.
+// own error kind. When the endpoint itself answered the CONNECT request with
+// an explicit non-zero reply code the Err chain carries a SocksReplyError:
+// the route works and the refusal is about this target, so the failure is
+// target-scoped rather than route-scoped (see IsConnectTargetError).
 type SocksHandshakeError struct {
 	Op  string
 	Err error
@@ -93,6 +96,29 @@ func IsAuthError(err error) bool {
 func IsHandshakeError(err error) bool {
 	var handshakeErr *SocksHandshakeError
 	return errors.As(err, &handshakeErr)
+}
+
+// SocksReplyError marks the CONNECT-stage failure where a connected endpoint
+// answered the CONNECT request itself with an explicit non-zero reply code
+// (RFC 1928 REP). The greeting succeeded and a complete reply arrived, so the
+// route demonstrably works; what is refused is this target. It always travels
+// wrapped in a SocksHandshakeError — same stage, same retry treatment — but
+// the pool scopes the resulting cooldown to the (route, target) pair instead
+// of the route.
+type SocksReplyError struct {
+	Reply byte
+}
+
+func (e *SocksReplyError) Error() string { return fmt.Sprintf("SOCKS reply 0x%02x", e.Reply) }
+
+// IsConnectTargetError reports whether err is a CONNECT request the endpoint
+// explicitly refused with a non-zero reply code — the target-scoped half of
+// the handshake taxonomy. Every other handshake failure (greeting, auth
+// framing, CONNECT framing or reply I/O, bound-address reads) stays
+// route-scoped.
+func IsConnectTargetError(err error) bool {
+	var replyErr *SocksReplyError
+	return errors.As(err, &replyErr)
 }
 
 // Dial establishes a TCP connection to targetAddr through a SOCKS5 upstream.
@@ -249,7 +275,10 @@ func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout tim
 		return failHandshake(conn, "read connect", fmt.Errorf("invalid SOCKS response"))
 	}
 	if head[1] != 0x00 {
-		return failHandshake(conn, "connect target", fmt.Errorf("SOCKS reply 0x%02x", head[1]))
+		// The endpoint spoke a complete reply refusing this target: the route
+		// works, the (route, target) pair does not. SocksReplyError inside the
+		// handshake error is what splits pair-scoped from route-scoped health.
+		return failHandshake(conn, "connect target", &SocksReplyError{Reply: head[1]})
 	}
 	if err := discardSocksBoundAddress(br, head[3]); err != nil {
 		return failHandshake(conn, "read bound address", err)

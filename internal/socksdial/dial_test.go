@@ -355,6 +355,16 @@ func TestDialHandshakeFailures(t *testing.T) {
 		addr := startScriptedSocks(t, socksScript{replyCode: 0x05})
 		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
 		assertTaxonomy(t, err, false, false, true)
+		if !IsConnectTargetError(err) {
+			t.Fatalf("explicit CONNECT refusal must classify as connect-target: %v", err)
+		}
+		var reply *SocksReplyError
+		if !errors.As(err, &reply) || reply.Reply != 0x05 {
+			t.Fatalf("err = %v, want wrapped SocksReplyError{0x05}", err)
+		}
+		if want := "SOCKS handshake failed during connect target: SOCKS reply 0x05"; err.Error() != want {
+			t.Fatalf("err text = %q, want %q", err.Error(), want)
+		}
 	})
 	t.Run("unsupported bound address type", func(t *testing.T) {
 		addr := startScriptedSocks(t, socksScript{atyp: 0x06, bound: []byte{}})
@@ -405,6 +415,55 @@ func TestDialLocalSetupFailures(t *testing.T) {
 	})
 }
 
+// Only an explicit non-zero reply to the CONNECT request is target-scoped;
+// every other handshake failure stays route-scoped.
+func TestDialConnectTargetScope(t *testing.T) {
+	t.Run("refusal carries the endpoint's reply code", func(t *testing.T) {
+		for _, code := range []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08} {
+			addr := startScriptedSocks(t, socksScript{replyCode: code})
+			_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+			assertTaxonomy(t, err, false, false, true)
+			if !IsConnectTargetError(err) {
+				t.Fatalf("reply 0x%02x must classify as connect-target: %v", code, err)
+			}
+		}
+	})
+	t.Run("route-scoped handshake failures are not connect-target", func(t *testing.T) {
+		for _, script := range []socksScript{
+			{dropGreet: true},
+			{method: 0x01},
+			{dropConn: true},
+			{atyp: 0x06, bound: []byte{}},
+		} {
+			addr := startScriptedSocks(t, script)
+			_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+			assertTaxonomy(t, err, false, false, true)
+			if IsConnectTargetError(err) {
+				t.Fatalf("handshake failure %v must stay route-scoped", err)
+			}
+		}
+	})
+	t.Run("auth and dial failures are not connect-target", func(t *testing.T) {
+		authAddr := startScriptedSocks(t, socksScript{method: 0x02, authStatus: 0x01})
+		_, err := Dial(context.Background(), dialURL(t, "socks5://u:p@"+authAddr), "example.com:443", dialTestTimeout)
+		assertTaxonomy(t, err, false, true, false)
+		if IsConnectTargetError(err) {
+			t.Fatalf("auth failure must not classify as connect-target: %v", err)
+		}
+		ln, lerr := net.Listen("tcp", "127.0.0.1:0")
+		if lerr != nil {
+			t.Fatalf("listen: %v", lerr)
+		}
+		refused := ln.Addr().String()
+		_ = ln.Close()
+		_, err = Dial(context.Background(), dialURL(t, "socks5://"+refused), "example.com:443", dialTestTimeout)
+		assertTaxonomy(t, err, true, false, false)
+		if IsConnectTargetError(err) {
+			t.Fatalf("dial failure must not classify as connect-target: %v", err)
+		}
+	})
+}
+
 func TestDialEndpointRefused(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -443,7 +502,15 @@ func TestErrorPredicatesWrapAndNil(t *testing.T) {
 	if !IsHandshakeError(hsErr) || IsDialError(hsErr) || IsAuthError(hsErr) {
 		t.Fatalf("wrapped SocksHandshakeError misclassified: %v", hsErr)
 	}
-	if IsDialError(nil) || IsAuthError(nil) || IsHandshakeError(nil) {
+	plainHS := &SocksHandshakeError{Op: "read connect", Err: errors.New("eof")}
+	if IsConnectTargetError(plainHS) {
+		t.Fatalf("handshake error without SocksReplyError must not classify as connect-target: %v", plainHS)
+	}
+	wrappedTarget := fmt.Errorf("wrap: %w", &SocksHandshakeError{Op: "connect target", Err: &SocksReplyError{Reply: 0x01}})
+	if !IsHandshakeError(wrappedTarget) || !IsConnectTargetError(wrappedTarget) {
+		t.Fatalf("wrapped connect-target refusal misclassified: %v", wrappedTarget)
+	}
+	if IsDialError(nil) || IsAuthError(nil) || IsHandshakeError(nil) || IsConnectTargetError(nil) {
 		t.Fatal("nil must not classify as any error kind")
 	}
 	if IsDialError(errors.New("plain")) || IsAuthError(errors.New("plain")) || IsHandshakeError(errors.New("plain")) {
