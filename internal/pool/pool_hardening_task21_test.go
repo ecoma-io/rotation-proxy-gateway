@@ -135,7 +135,8 @@ func TestReconfigureRetainsCanonicalState(t *testing.T) {
 	}
 }
 
-// Defect 5b: concurrent PickFor/Report*/Snapshot/Reconfigure is race-free.
+// Defect 5b: concurrent PickFor/Report*/Snapshot is race-free. Concurrent
+// Reconfigure has its own test below: TestHardeningConcurrentReconfigureRaceFree.
 func TestHardeningConcurrentPoolRaceFree(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newTestPool(t, c, "socks5://a.test:1080", "socks5://b.test:1080")
@@ -181,4 +182,88 @@ func TestHardeningConcurrentPoolRaceFree(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// Concurrent Reconfigure under -race, the coverage the comment above used to
+// claim: reloads publish overlapping route sets while serving goroutines pick,
+// report, and snapshot whichever generation they loaded. Reconfigure shares
+// the *Proxy for unchanged URL+kind+origin, so reports from older generations
+// land on the same route objects the newest generation serves — exactly the
+// in-flight-operations-finish-on-their-own-snapshot contract. Reload sets
+// churn every identity dimension (order, membership, kind, origin) while
+// keeping overlap, decided deterministically by iteration.
+func TestHardeningConcurrentReconfigureRaceFree(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	routes := mustRouteSpecs(t, "socks5://a.test:1080", "socks5://b.test:1080", "socks5://c.test:1080")
+	pl := NewRoutes(routes, 30*time.Second, time.Minute)
+	pl.Now = c.NowFunc
+	store := NewStore(mustGenerationConfig(t, routes, 30*time.Second, time.Minute), pl)
+
+	failErr := errors.New("TEST dial refused")
+	authErr := errors.New("endpoint rejected credentials")
+	aURL := mustURL(t, "socks5://a.test:1080")
+	bSpec := config.RouteSpec{URL: mustURL(t, "socks5://b.test:1080"), Kind: config.EgressV4}
+	reloadSet := func(i int) []config.RouteSpec {
+		switch i % 4 {
+		case 0: // reorder only: every identity retained
+			return mustRouteSpecs(t, "socks5://c.test:1080", "socks5://a.test:1080", "socks5://b.test:1080")
+		case 1: // drop two routes, add one
+			return mustRouteSpecs(t, "socks5://a.test:1080", "socks5://d.test:1080")
+		case 2: // kind churn on a: fresh route state
+			return []config.RouteSpec{{URL: aURL, Kind: config.EgressV6}, bSpec}
+		default: // origin churn on a: fresh route state
+			return []config.RouteSpec{
+				{URL: aURL, Kind: config.EgressV4, Origin: config.RouteOriginManual},
+				bSpec,
+			}
+		}
+	}
+
+	const reloads, rounds = 60, 50
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range reloads {
+			store.Publish(mustGenerationConfig(t, reloadSet(i), 30*time.Second, time.Minute))
+		}
+	}()
+	for range 4 {
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			for range rounds {
+				if p := store.Load().Pool.PickFor(nil, nil, "t:443"); p != nil {
+					p.Release()
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for j := range rounds {
+				gen := store.Load()
+				pts := gen.Pool.RoutePointers()
+				if len(pts) == 0 {
+					continue
+				}
+				p := pts[j%len(pts)]
+				gen.Pool.ReportFailure(p, failErr)
+				gen.Pool.ReportSuccess(p, "t:443")
+				gen.Pool.ReportAuthBlocked(p, authErr)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range rounds {
+				_ = store.Load().Pool.Snapshot()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// The final generation is the last published set: publishes land even
+	// while serving churns the shared route state.
+	if got := store.Load().Pool.Size(); got != len(reloadSet(reloads-1)) {
+		t.Fatalf("final pool size = %d, want %d", got, len(reloadSet(reloads-1)))
+	}
 }
