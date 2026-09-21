@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -46,9 +47,35 @@ type SocksSim struct {
 	// other target tunnels normally, modeling a route that works but refuses
 	// one destination — the issue #5 incident shape.
 	RefuseHost string
+	// TunnelTo, when set, replaces the destination the tunnel is established
+	// to: the CONNECT request is still parsed and recorded exactly as
+	// received, but the sim dials this address instead. Address-type tests
+	// use it to send reserved names (example.test) that must be recorded, not
+	// resolved.
+	TunnelTo string
 
 	Hits atomic.Uint64
 	Addr string
+
+	mu   sync.Mutex
+	reqs []SocksConnectRecord
+}
+
+// SocksConnectRecord is the raw CONNECT request one tunnel carried. ATYP and
+// Addr are the wire bytes as received — the assertions of the address-type
+// preservation tests.
+type SocksConnectRecord struct {
+	ATYP byte
+	Addr []byte
+	Host string
+	Port int
+}
+
+// Connects returns every CONNECT request received so far, in order.
+func (s *SocksSim) Connects() []SocksConnectRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]SocksConnectRecord(nil), s.reqs...)
 }
 
 // NewSocksSim starts the simulator on 127.0.0.1:0.
@@ -144,6 +171,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 	if _, err := io.ReadFull(br, req); err != nil || req[0] != 0x05 || req[1] != 0x01 {
 		return
 	}
+	rec := SocksConnectRecord{ATYP: req[3]}
 	var host string
 	switch req[3] {
 	case 0x01:
@@ -151,6 +179,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 		if _, err := io.ReadFull(br, b); err != nil {
 			return
 		}
+		rec.Addr = append([]byte(nil), b...)
 		host = net.IP(b).String()
 	case 0x03:
 		n, err := br.ReadByte()
@@ -161,12 +190,14 @@ func (s *SocksSim) handle(conn net.Conn) {
 		if _, err := io.ReadFull(br, b); err != nil {
 			return
 		}
+		rec.Addr = append([]byte(nil), b...)
 		host = string(b)
 	case 0x04:
 		b := make([]byte, 16)
 		if _, err := io.ReadFull(br, b); err != nil {
 			return
 		}
+		rec.Addr = append([]byte(nil), b...)
 		host = net.IP(b).String()
 	default:
 		return
@@ -175,7 +206,15 @@ func (s *SocksSim) handle(conn net.Conn) {
 	if _, err := io.ReadFull(br, portBytes); err != nil {
 		return
 	}
-	target := net.JoinHostPort(host, strconv.Itoa(int(portBytes[0])<<8|int(portBytes[1])))
+	rec.Host = host
+	rec.Port = int(portBytes[0])<<8 | int(portBytes[1])
+	s.mu.Lock()
+	s.reqs = append(s.reqs, rec)
+	s.mu.Unlock()
+	target := net.JoinHostPort(host, strconv.Itoa(rec.Port))
+	if s.TunnelTo != "" {
+		target = s.TunnelTo
+	}
 
 	if s.Mode == SocksRejectTarget {
 		refuse := true
