@@ -8,12 +8,14 @@ import (
 	"time"
 )
 
-// Adversarial warm-pool coverage. The pool is background-only at this stage:
-// nothing on the serving path borrows from it, so every test proves the pool
-// stays inside its contract on its own — bounded connections, no CONNECT
-// frames while parked, generation isolation across rotations, config
-// generations honored on reload, no route-health writes, and no leak past
-// shutdown.
+// Adversarial warm-pool coverage through the real binary: bounded
+// connections, no CONNECT frames while parked, generation isolation across
+// rotations, config generations honored on reload, no route-health writes,
+// and no leak past shutdown. Requests do borrow on the serving path
+// (internal/proxyserver warmdial_test.go pins that seam's failure
+// classification); these tests hold the pool to its side of the contract
+// while traffic flows — an end-to-end borrow is proven by the paired WarmAB
+// benchmarks' warm_borrow_ratio metric, not asserted here.
 
 func warmEnabled() *WarmPoolConfig {
 	return &WarmPoolConfig{Enabled: true}

@@ -320,6 +320,96 @@ func TestRotationInvalidatesAndBlocksReplenish(t *testing.T) {
 	}
 }
 
+// TestMidDialRotationDiscardsFreshConn drives the sharpest straddle: a dial
+// claimed (epoch stamped), a rotation beginning while the dial is in flight,
+// and the dial completing afterwards. The post-dial epoch check must close
+// the fresh connection instead of parking it — an old-generation socket must
+// never sit in ready, even briefly, waiting for the borrow-time check.
+func TestMidDialRotationDiscardsFreshConn(t *testing.T) {
+	srv := newHalfServer(t, "ok")
+	store, proxies := warmStore(defaultWarm(), mustURL(t, "socks5://"+srv.addr))
+	wp := newTestPool(store)
+	defer wp.Stop()
+	p := proxies[0]
+
+	wp.sweep()
+	task, ok := wp.claimTask()
+	if !ok {
+		t.Fatal("no dial claimed after sweep")
+	}
+	// The rotation begins between the claim (epoch stamped) and the dial's
+	// post-dial check — exactly the window runDial's equality check exists
+	// for. Ending the rotation before the dial keeps the epoch moved.
+	p.BeginRotation(pool.RotationDraining)
+	wp.runDial(task)
+
+	st := wp.Snapshot()
+	if st.Created != 0 || st.IdleTotal != 0 {
+		t.Fatalf("straddled conn was parked: created=%d idle=%d, want 0/0", st.Created, st.IdleTotal)
+	}
+	if st.GenerationInvalidated != 1 {
+		t.Fatalf("generation-invalidated = %d, want 1 (post-dial discard)", st.GenerationInvalidated)
+	}
+	waitFor(t, "far end sees the discarded conn close", 2*time.Second, func() bool {
+		return srv.parked.Load() == 0
+	})
+	if hc := wp.Borrow(p); hc != nil {
+		_ = hc.Close()
+		t.Fatal("borrow handed out a straddled-generation conn")
+	}
+
+	// The bucket survives the straddle: the new epoch warms normally.
+	p.EndRotation("198.51.100.9", time.Now())
+	wp.sweep()
+	drain(wp)
+	if hc := wp.Borrow(p); hc == nil {
+		t.Fatal("borrow missed the new-epoch conn after rotation")
+	} else {
+		_ = hc.Close()
+	}
+}
+
+// TestBorrowDisabledAfterReload pins the disable edge: a pool whose config
+// was reloaded to enabled=false must stop serving immediately — not one
+// sweep interval later — even though parked conns still sit in the bucket
+// awaiting the sweeper's drain.
+func TestBorrowDisabledAfterReload(t *testing.T) {
+	srv := newHalfServer(t, "ok")
+	u := mustURL(t, "socks5://"+srv.addr)
+	w := defaultWarm()
+	store, proxies := warmStore(w, u)
+	wp := newTestPool(store)
+	defer wp.Stop()
+
+	wp.sweep()
+	drain(wp)
+	if got := wp.Snapshot().IdleTotal; got != 1 {
+		t.Fatalf("setup: idle=%d, want 1", got)
+	}
+
+	// Same routes, warm pool disabled: a disable reload, nothing else.
+	w.Enabled = false
+	store.Publish(&config.RuntimeConfig{
+		DialTimeout:  2 * time.Second,
+		CooldownBase: 50 * time.Millisecond,
+		CooldownMax:  time.Second,
+		WarmPool:     w,
+		Routes:       []config.RouteSpec{{URL: u, Kind: config.EgressV4}},
+	})
+
+	if hc := wp.Borrow(proxies[0]); hc != nil {
+		_ = hc.Close()
+		t.Fatal("borrow served from a pool disabled by reload")
+	}
+	if got := wp.Snapshot().IdleTotal; got != 1 {
+		t.Fatalf("idle before drain sweep = %d, want 1 (the sweeper owns the drain)", got)
+	}
+	wp.sweep()
+	if got := wp.Snapshot().IdleTotal; got != 0 {
+		t.Fatalf("sweep after disable left idle=%d, want 0", got)
+	}
+}
+
 func TestAuthFailureStopsReplenishUntilEpochMoves(t *testing.T) {
 	srv := newHalfServer(t, "authreject")
 	store, proxies := warmStore(defaultWarm(), mustURL(t, "socks5://u:p@"+srv.addr))

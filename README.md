@@ -374,9 +374,9 @@ The optional `warm-pool` block (off by default) keeps a bounded set of
 half-established upstream connections ready in the background: TCP connected,
 SOCKS greeting and authentication done, **no `CONNECT` sent**. A parked
 connection knows nothing about any target — the gateway never pre-connects to
-a destination — so borrowing one removes exactly the greeting round trip from
-a request's upstream setup. Route selection, cooldown, auth-block, and
-rotation state are untouched by the pool.
+a destination — so borrowing one removes the upstream TCP-connect and
+greeting round trips from a request's setup. Route selection, cooldown,
+auth-block, and rotation state are untouched by the pool.
 
 A request that has selected a route first tries to borrow a parked connection
 and falls back to the ordinary cold dial when none exists. Borrowing never

@@ -15,9 +15,13 @@
 //
 // Lock and lifecycle invariants, kept so the pool cannot deadlock or leak:
 //
-//   - wp.mu is a leaf lock. No pool lock, no I/O, and no wait happens under
-//     it. The sweeper collects the live route-pointer set (RoutePointers
-//     takes the pool lock) BEFORE acquiring wp.mu, so the two never nest.
+//   - wp.mu is a leaf in the lock-ordering sense: no other lock is taken
+//     under it and nothing waits under it. The close of a collected
+//     connection and a debug log write do run under it — both fast and
+//     non-reentrant, so a Borrow or Snapshot can at worst stall behind one
+//     pass's closes. The sweeper collects the live route-pointer set
+//     (RoutePointers takes the pool lock) BEFORE acquiring wp.mu, so the
+//     two never nest.
 //   - Borrow touches only Proxy atomics (RotatingNow and friends) and never
 //     takes a pool lock.
 //   - The wake channel is never closed — a send racing a close would panic
@@ -502,6 +506,12 @@ func (wp *Pool) runDial(t dialTask) {
 // out here is single-use: CompleteConnect consumes it.
 func (wp *Pool) Borrow(p *pool.Proxy) *socksdial.HalfConn {
 	if p == nil {
+		return nil
+	}
+	// A pool disabled by reload must stop serving at once, not one sweep
+	// interval later: without this check conns parked during the enabled era
+	// stay borrowable briefly after /status already reports enabled=false.
+	if !wp.store.Load().Config.WarmPool.Enabled {
 		return nil
 	}
 	wp.mu.Lock()
