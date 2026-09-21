@@ -2,6 +2,7 @@ package proxyserver
 
 import (
 	"bufio"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
@@ -291,6 +292,21 @@ func TestCredentialsMatch(t *testing.T) {
 	}
 }
 
+// credentialDigest must be a MAC under the process-wide random key, not an
+// unkeyed hash: an unkeyed fast digest of a credential would hand a
+// memory-disclosure reader an offline brute-force target. Recomputing the
+// HMAC independently pins both the keying and the digest form.
+func TestCredentialDigestIsKeyedMAC(t *testing.T) {
+	key := credentialDigestKey()
+	mac := hmac.New(sha256.New, key[:])
+	mac.Write([]byte("probe value"))
+	var want [credentialDigestSize]byte
+	mac.Sum(want[:0])
+	if got := credentialDigest([]byte("probe value")); got != want {
+		t.Fatalf("credentialDigest = %x, want the HMAC-SHA256 digest %x", got, want)
+	}
+}
+
 // The comparison must stay unconditional across the pair: credentialsMatch
 // digests both presented fields and runs both constant-time comparisons before
 // any branch exists, so the only quantity the exchange can observe is the
@@ -316,8 +332,8 @@ func TestCredentialsMatchCombinedResult(t *testing.T) {
 	}
 	for _, username := range usernames {
 		for _, password := range passwords {
-			userSum := sha256.Sum256([]byte(username))
-			passSum := sha256.Sum256([]byte(password))
+			userSum := credentialDigest([]byte(username))
+			passSum := credentialDigest([]byte(password))
 			userOK := subtle.ConstantTimeCompare(userSum[:], account.usernameSum[:]) == 1
 			passOK := subtle.ConstantTimeCompare(passSum[:], account.passwordSum[:]) == 1
 			if want := userOK && passOK; want != credentialsMatch(account, []byte(username), []byte(password)) {
