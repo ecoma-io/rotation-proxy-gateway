@@ -36,19 +36,36 @@ var version = "0.1.0-dev"
 // one stream for the json-file log driver.
 var fatalLog = logging.New(os.Stdout)
 
+// usageLine names every supported invocation. It is static text: it must
+// never carry configuration values or credentials.
+const usageLine = "usage: rotation-proxy-gateway [version|healthcheck]\n" +
+	"no arguments starts the gateway; configuration comes from the RPGW_ environment and the runtime YAML\n"
+
 func main() {
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "version":
-			fmt.Println(version)
-			return
-		case "healthcheck":
-			os.Exit(healthcheck())
+	os.Exit(runArgs(os.Args[1:]))
+}
+
+// runArgs dispatches the command line and returns the process exit code. An
+// empty argument list starts the server; a recognized subcommand runs and
+// exits; any other first argument is a usage error, so a typo or a stray flag
+// can never fall through and boot a live gateway on the default addresses.
+func runArgs(args []string) int {
+	if len(args) == 0 {
+		if err := run(); err != nil {
+			fatalLog.Error().Str("err", sanitize.ErrorString(err)).Msg("fatal")
+			return 1
 		}
+		return 0
 	}
-	if err := run(); err != nil {
-		fatalLog.Error().Str("err", sanitize.ErrorString(err)).Msg("fatal")
-		os.Exit(1)
+	switch args[0] {
+	case "version":
+		fmt.Println(version)
+		return 0
+	case "healthcheck":
+		return healthcheck()
+	default:
+		fmt.Fprint(os.Stderr, usageLine)
+		return 2
 	}
 }
 

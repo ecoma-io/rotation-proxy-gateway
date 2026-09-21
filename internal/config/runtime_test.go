@@ -200,6 +200,7 @@ func TestLoadRuntimeRejectsInvalidRotationSettings(t *testing.T) {
 		{"negative backoff", "  retry-backoff-max: 4m\n", "  retry-backoff-max: -1s\n", "rotation.retry-backoff-max must be positive"},
 		{"plaintext check url", "  ip-check-url: https://ipcheck.example/trace\n", "  ip-check-url: http://ipcheck.example/trace\n", "rotation.ip-check-url must use https"},
 		{"relative check url", "  ip-check-url: https://ipcheck.example/trace\n", "  ip-check-url: /trace\n", "rotation.ip-check-url must be an absolute URL"},
+		{"scheme-only check url", "  ip-check-url: https://ipcheck.example/trace\n", "  ip-check-url: https://\n", "rotation.ip-check-url must include a host"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			content := strings.Replace(validRuntimeConfig, tc.old, tc.replacement, 1)
@@ -349,6 +350,7 @@ func TestLoadRuntimeRejectsInvalidManualRoutes(t *testing.T) {
 		{"bad rotate-interval", "      rotate-interval: 90s\n", "      rotate-interval: sometimes\n", "rotate-interval must be a Go duration"},
 		{"missing api url", "        url: https://provider.example/rotate\n", "", "api.url is required"},
 		{"relative api url", "        url: https://provider.example/rotate\n", "        url: /rotate\n", "api.url must be an absolute http or https URL"},
+		{"scheme-only api url", "        url: https://provider.example/rotate\n", "        url: http://\n", "api.url must include a host"},
 		{"bad method", "        method: POST\n", "        method: BAD METHOD\n", "api.method must be a valid HTTP method token"},
 		{"zero api timeout", "        timeout: 4s\n", "        timeout: 0s\n", "api.timeout must be positive"},
 		{"invalid header name", "          Content-Type: application/json\n", "          Content Type: application/json\n", "api.headers contains an invalid header name"},
