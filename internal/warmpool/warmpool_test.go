@@ -189,9 +189,12 @@ func TestReplenishFillsToMinIdle(t *testing.T) {
 	if st.IdleTotal != 2 || st.Created != 2 {
 		t.Fatalf("after drain: idle=%d created=%d, want 2/2", st.IdleTotal, st.Created)
 	}
-	if srv.parked.Load() != 2 {
-		t.Fatalf("parked far-end conns = %d, want 2", srv.parked.Load())
-	}
+	// The far end parks a conn only after its greeting write lands, which can
+	// trail the client-side handshake the pool already counted — poll rather
+	// than assert immediately (observed as a CI flake, never locally).
+	waitFor(t, "far-end parked conns", 2*time.Second, func() bool {
+		return srv.parked.Load() == 2
+	})
 	if st.Routes[0].Upstream != srv.addr {
 		t.Fatalf("route status upstream = %q, want %q (credentials must never appear)", st.Routes[0].Upstream, srv.addr)
 	}
