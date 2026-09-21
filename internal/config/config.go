@@ -3,7 +3,6 @@ package config
 
 import (
 	"errors"
-	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -38,10 +37,19 @@ func parseProxyLine(line string) (*url.URL, error) {
 		return nil, errors.New("route proxy lines carry no scheme: the endpoint protocol is always SOCKS5 (forms: host:port, user:pass@host:port, host:port:user:pass)")
 	}
 	if strings.Contains(line, "@") {
-		// "user:pass@host:port".
+		// "user:pass@host:port". Both credentials are required: a username
+		// without a password (or an empty pair) is not one of the documented
+		// forms, and an empty-but-present pair would dial without auth while
+		// holding a route identity distinct from the bare host:port form.
 		u, err := url.Parse("socks5://" + line)
 		if err != nil {
 			return nil, errors.New("invalid proxy URL")
+		}
+		if u.User == nil || u.User.Username() == "" {
+			return nil, errors.New("proxy credentials must be user:pass@host:port")
+		}
+		if pass, ok := u.User.Password(); !ok || pass == "" {
+			return nil, errors.New("proxy credentials must be user:pass@host:port")
 		}
 		if u.Hostname() == "" {
 			return nil, errors.New("proxy host is required")
@@ -61,6 +69,12 @@ func parseProxyLine(line string) (*url.URL, error) {
 	// literal such as "[2001:db8::1]:1080:user:pass".
 	host, port, user, pass, ok := splitHostPortCreds(line)
 	if !ok {
+		return nil, errors.New("invalid proxy format (want host:port, user:pass@host:port, or host:port:user:pass)")
+	}
+	// The bare branches never run url.Parse, so screen the host characters
+	// here: whitespace or URL separators would otherwise load as a route that
+	// can only ever fail to dial.
+	if strings.ContainsAny(host, " \t/?#%\\") {
 		return nil, errors.New("invalid proxy format (want host:port, user:pass@host:port, or host:port:user:pass)")
 	}
 	if err := checkPort(port); err != nil {
@@ -144,9 +158,13 @@ func normalizePort(port string) string {
 // checkPort validates a proxy port is numeric and in range without including a
 // potentially credential-bearing pool entry in the error.
 func checkPort(port string) error {
+	// Static on purpose: the offending text sits in the credential position
+	// of a mistyped bare line ("host:password"), so quoting it would leak
+	// into boot and reload-reject logs. The route index in the wrapped error
+	// names the line to fix.
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 1 || n > 65535 {
-		return fmt.Errorf("invalid proxy port %q", port)
+		return errors.New("invalid proxy port (want 1-65535)")
 	}
 	return nil
 }
