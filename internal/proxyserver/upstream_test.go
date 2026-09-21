@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/socksdial"
 )
@@ -493,7 +492,7 @@ func TestConnectFramingFailuresExhaustToNoRoute(t *testing.T) {
 	for _, tc := range rawCases {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := startSocks5Proxy(t, socksOptions{connectRaw: tc.raw})
-			pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+			pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 			s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
 			conn, code := socksConnectReply(t, addr, "example.com:80", socksCmdConnect)
 			_ = conn.Close()

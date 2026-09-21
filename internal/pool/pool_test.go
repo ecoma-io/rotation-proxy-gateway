@@ -31,7 +31,7 @@ func newTestPool(t *testing.T, c *clock, urls ...string) *Pool {
 	for _, raw := range urls {
 		routes = append(routes, config.RouteSpec{URL: mustURL(t, raw), Kind: config.EgressV4})
 	}
-	pl := NewRoutes(routes, 30*time.Second, time.Minute, config.KindBalance{})
+	pl := NewRoutes(routes, 30*time.Second, time.Minute)
 	pl.Now = c.NowFunc
 	return pl
 }
@@ -44,6 +44,48 @@ func TestRoundRobinCyclesAll(t *testing.T) {
 		got = append(got, pl.PickFor(nil, nil, "t:443").URL.Host)
 	}
 	want := []string{"a:1", "b:2", "c:3", "a:1", "b:2", "c:3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pick order = %v, want %v", got, want)
+	}
+}
+
+// A completed request demotes the route one extra step: the route that just
+// served absorbs ReportSuccess's advance, so its peers take the next picks.
+func TestReportSuccessAdvancesOneStep(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2")
+	var got []string
+	a := pl.PickFor(nil, nil, "t:443")
+	got = append(got, a.URL.Host)
+	pl.ReportSuccess(a, "t:443")
+	for range 3 {
+		got = append(got, pl.PickFor(nil, nil, "t:443").URL.Host)
+	}
+	want := []string{"a:1", "b:2", "b:2", "a:1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pick order = %v, want %v", got, want)
+	}
+}
+
+// A route added by reload joins at the recency front: it is picked on the
+// next lap rather than absorbing a catch-up burst against accumulated passes.
+func TestReconfigureAnchorsNewRouteAtRecencyFront(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := newTestPool(t, c, "socks5://a:1", "socks5://b:2")
+	pl.PickFor(nil, nil, "t:443")
+	pl.PickFor(nil, nil, "t:443")
+
+	next := pl.Reconfigure([]config.RouteSpec{
+		{URL: mustURL(t, "socks5://a:1"), Kind: config.EgressV4},
+		{URL: mustURL(t, "socks5://b:2"), Kind: config.EgressV4},
+		{URL: mustURL(t, "socks5://c:3"), Kind: config.EgressV4},
+	}, 30*time.Second, time.Minute)
+
+	var got []string
+	for range 3 {
+		got = append(got, next.PickFor(nil, nil, "t:443").URL.Host)
+	}
+	want := []string{"a:1", "b:2", "c:3"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("pick order = %v, want %v", got, want)
 	}

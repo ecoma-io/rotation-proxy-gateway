@@ -32,17 +32,6 @@ cooldown:
 # Timeout covering SOCKS endpoint TCP dialing and SOCKS setup.
 dial-timeout: 10s
 
-# Optional family split for the mixed listener: shares are relative, so v4 7
-# + v6 3 sends about 70% of mixed traffic through v4 routes regardless of how
-# many routes each family has. Route weight still distributes picks inside
-# one family. A family with no share only serves as standby; a family with no
-# live route always defers to the other. The dedicated v4/v6 listeners ignore
-# this block. Delete it to let each family's share follow its routes' own
-# weights.
-balance:
-  v4: 7
-  v6: 3
-
 # Optional background pool of half-established upstream connections: TCP +
 # SOCKS greeting + auth, no CONNECT — parked connections are never
 # target-specific. A request that selects a route borrows one instead of
@@ -104,10 +93,6 @@ proxies:
   auto:
     - proxy: username:password@v4-provider.example:1080
       kind: v4
-      # Optional selection weight (whole number, 1-1000, default 1): picks
-      # distribute proportionally, so weight 3 serves about three times the
-      # traffic of a weight-1 peer. Equal or absent weights give round-robin.
-      weight: 3
     - proxy: username:password@[2001:db8::1]:1080
       kind: v6
 
@@ -118,8 +103,6 @@ proxies:
   manual:
     - proxy: username:password@v6-provider.example:1080
       kind: v6
-      # Selection weight, same meaning as on auto routes.
-      weight: 1
       # Minimum time between two rotations of this route. It is also the
       # first backoff step when a rotation did not change the IP.
       rotate-interval: 90s

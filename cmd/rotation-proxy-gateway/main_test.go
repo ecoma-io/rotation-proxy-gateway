@@ -282,7 +282,7 @@ func newTestStore() *pool.Store {
 		CooldownBase: time.Second,
 		CooldownMax:  time.Minute,
 	}
-	return pool.NewStore(runtime, pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}))
+	return pool.NewStore(runtime, pool.NewRoutes(nil, time.Second, time.Minute))
 }
 
 // awaitReachable dials the listener until the address accepts TCP connections,

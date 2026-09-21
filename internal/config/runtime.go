@@ -26,17 +26,6 @@ const (
 	// 60s docker stop_grace_period and a 90s systemd TimeoutStopSec.
 	DefaultShutdownGrace = 55 * time.Second
 
-	// Route selection weight defaults and bounds. Weight shapes how often a
-	// route is picked relative to its peers; 1 makes every route equal.
-	DefaultRouteWeight = 1
-	MaxRouteWeight     = 1000
-
-	// MaxBalanceShare bounds one egress family's share in the balance block.
-	// Shares are relative, so only their ratio matters; the magnitude bound
-	// matches MaxRouteWeight so the family clock keeps the same stride
-	// resolution as a route weight at the extreme.
-	MaxBalanceShare = 1000
-
 	// Rotation defaults. These bound how manual routes rotate their egress IP
 	// through their provider API; every one is overridable in the rotation
 	// block of the runtime YAML.
@@ -85,15 +74,10 @@ const (
 )
 
 // RouteSpec is one validated static SOCKS route from the runtime config.
-// Weight is the route's selection weight in [DefaultRouteWeight, MaxRouteWeight]:
-// a route is picked proportionally to its weight against its eligible peers.
-// It is deliberately not part of the route identity — a reload that only
-// retunes weights keeps the route's health state.
 type RouteSpec struct {
 	URL    *url.URL
 	Kind   EgressKind
 	Origin RouteOrigin
-	Weight int
 }
 
 // ManualRouteSpec is one validated API-rotated SOCKS route. Besides the SOCKS
@@ -103,20 +87,6 @@ type ManualRouteSpec struct {
 	RouteSpec
 	RotateInterval time.Duration
 	API            RotateAPI
-}
-
-// KindBalance sets how the mixed listener splits picks between the two egress
-// families: the values are relative shares, so V4=7, V6=3 sends about 70% of
-// mixed traffic through v4 routes no matter how many routes each family has.
-// Route weight still distributes picks inside one family. A family with no
-// share only serves as standby when the shared family has no live route; a
-// family with no live route always defers to the other, so availability beats
-// the ratio. The dedicated v4/v6 listeners are unaffected: their kind filter
-// leaves a single family. The zero value disables the split, keeping the flat
-// weighted pool where each family's share follows its routes' own weights.
-type KindBalance struct {
-	V4 int
-	V6 int
 }
 
 // RotateAPI describes the provider HTTP request that rotates a manual route's
@@ -224,7 +194,6 @@ type RuntimeConfig struct {
 	Routes       []RouteSpec
 	ManualRoutes []ManualRouteSpec
 	Rotation     RotationSettings
-	Balance      KindBalance
 	WarmPool     WarmPoolSettings
 }
 
@@ -235,15 +204,7 @@ type fileConfig struct {
 	DialTimeout string             `mapstructure:"dial-timeout"`
 	Rotation    rotationFileConfig `mapstructure:"rotation"`
 	Proxies     proxiesFileConfig  `mapstructure:"proxies"`
-	Balance     balanceFileConfig  `mapstructure:"balance"`
 	WarmPool    warmPoolFileConfig `mapstructure:"warm-pool"`
-}
-
-// balanceFileConfig keeps the shares as `any` so viper's weak typing cannot
-// silently truncate a mistyped share the way it would turn 2.5 into 2.
-type balanceFileConfig struct {
-	V4 any `mapstructure:"v4"`
-	V6 any `mapstructure:"v6"`
 }
 
 type cooldownFileConfig struct {
@@ -263,7 +224,7 @@ type rotationFileConfig struct {
 
 // warmPoolFileConfig keeps the counts as `any` so viper's weak typing cannot
 // silently truncate a mistyped bound (2.5 → 2), the same anti-coercion rule
-// as max-retries and route weights.
+// as max-retries.
 type warmPoolFileConfig struct {
 	Enabled                 *bool  `mapstructure:"enabled"`
 	MinIdlePerProxy         any    `mapstructure:"min-idle-per-proxy"`
@@ -280,15 +241,13 @@ type proxiesFileConfig struct {
 }
 
 type autoProxyFileConfig struct {
-	Proxy  string `mapstructure:"proxy"`
-	Kind   string `mapstructure:"kind"`
-	Weight any    `mapstructure:"weight"`
+	Proxy string `mapstructure:"proxy"`
+	Kind  string `mapstructure:"kind"`
 }
 
 type manualProxyFileConfig struct {
 	Proxy          string        `mapstructure:"proxy"`
 	Kind           string        `mapstructure:"kind"`
-	Weight         any           `mapstructure:"weight"`
 	RotateInterval string        `mapstructure:"rotate-interval"`
 	API            apiFileConfig `mapstructure:"api"`
 }
@@ -489,10 +448,6 @@ func runtimeFromFile(raw fileConfig) (*RuntimeConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	balance, err := parseBalance(raw.Balance)
-	if err != nil {
-		return nil, err
-	}
 	warmPool, err := parseWarmPoolSettings(raw.WarmPool)
 	if err != nil {
 		return nil, err
@@ -505,7 +460,6 @@ func runtimeFromFile(raw fileConfig) (*RuntimeConfig, error) {
 		DialTimeout:  dialTimeout,
 		LogLevel:     raw.LogLevel,
 		Rotation:     rotation,
-		Balance:      balance,
 		WarmPool:     warmPool,
 	}
 	for i, route := range raw.Proxies.Auto {
@@ -743,8 +697,8 @@ func parseMaxConcurrent(raw any) (*int, *int, error) {
 
 // parseMaxRetries requires a whole YAML integer: viper's weak typing would
 // otherwise truncate 2.5 to 2 and quietly change the retry budget, the same
-// anti-coercion rule as parseRouteWeight. An absent value falls through to the
-// range check, which reports it.
+// anti-coercion rule as the warm-pool counts. An absent value falls through to
+// the range check, which reports it.
 func parseMaxRetries(raw any) (int, error) {
 	if raw == nil {
 		return 0, nil
@@ -770,57 +724,7 @@ func parseRouteSpec(raw autoProxyFileConfig) (RouteSpec, error) {
 		return RouteSpec{}, err
 	}
 	spec.Origin = RouteOriginAuto
-	if spec.Weight, err = parseRouteWeight(raw.Weight); err != nil {
-		return RouteSpec{}, err
-	}
 	return spec, nil
-}
-
-// parseRouteWeight applies the default weight, then validates the override.
-// Only whole YAML integers are accepted: viper's weak typing would otherwise
-// silently truncate 2.5 to 2 and turn a config typo into a quiet share change.
-func parseRouteWeight(raw any) (int, error) {
-	if raw == nil {
-		return DefaultRouteWeight, nil
-	}
-	n, ok := raw.(int)
-	if !ok {
-		return 0, fmt.Errorf("weight must be a whole number between %d and %d", DefaultRouteWeight, MaxRouteWeight)
-	}
-	if n < DefaultRouteWeight || n > MaxRouteWeight {
-		return 0, fmt.Errorf("weight must be between %d and %d, got %d", DefaultRouteWeight, MaxRouteWeight, n)
-	}
-	return n, nil
-}
-
-// parseBalance validates the balance block shares. An absent or empty block
-// disables the family split, so only present keys are checked: each must be a
-// whole YAML integer in [1, MaxBalanceShare] — same anti-weak-typing rule as
-// route weight. Shares are relative; any positive pair is a valid ratio.
-func parseBalance(raw balanceFileConfig) (KindBalance, error) {
-	balance := KindBalance{}
-	var err error
-	if balance.V4, err = parseBalanceShare("balance.v4", raw.V4); err != nil {
-		return balance, err
-	}
-	if balance.V6, err = parseBalanceShare("balance.v6", raw.V6); err != nil {
-		return balance, err
-	}
-	return balance, nil
-}
-
-func parseBalanceShare(name string, raw any) (int, error) {
-	if raw == nil {
-		return 0, nil
-	}
-	n, ok := raw.(int)
-	if !ok {
-		return 0, fmt.Errorf("%s must be a whole number between 1 and %d", name, MaxBalanceShare)
-	}
-	if n < 1 || n > MaxBalanceShare {
-		return 0, fmt.Errorf("%s must be between 1 and %d, got %d", name, MaxBalanceShare, n)
-	}
-	return n, nil
 }
 
 // parseManualRouteSpec validates one manual entry: the same SOCKS endpoint
@@ -832,9 +736,6 @@ func parseManualRouteSpec(raw manualProxyFileConfig) (ManualRouteSpec, error) {
 	}
 	manual := ManualRouteSpec{RouteSpec: spec}
 	manual.Origin = RouteOriginManual
-	if manual.Weight, err = parseRouteWeight(raw.Weight); err != nil {
-		return ManualRouteSpec{}, err
-	}
 	if raw.RotateInterval == "" {
 		return ManualRouteSpec{}, errors.New("rotate-interval is required (Go duration, e.g. 90s)")
 	}

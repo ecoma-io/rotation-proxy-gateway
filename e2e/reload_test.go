@@ -108,8 +108,9 @@ func TestE2E_InvalidConfigKeepsServing(t *testing.T) {
 	}
 
 	// The old global: block is rejected on reload (the gateway removed the HTTP
-	// era's settings), as are malformed YAML, duplicate routes, and an empty
-	// pool. The last-known-good config keeps serving through every rejection.
+	// era's settings), as are the removed route weight and balance block,
+	// malformed YAML, duplicate routes, and an empty pool. The last-known-good
+	// config keeps serving through every rejection.
 	cases := map[string]string{
 		"malformed yaml": "log-level: [unclosed\nmax-retries: nope\n",
 		"duplicate route": fmt.Sprintf(`log-level: info
@@ -144,6 +145,25 @@ max-retries: 3
 cooldown: {base: 5s, max: 1m}
 dial-timeout: 5s
 global: {target-tls-insecure: false, max-body-buffer: 67108864}
+proxies:
+  auto:
+    - {proxy: '` + socks.RouteValue() + `', kind: v4}
+  manual: []
+`,
+		"removed route weight": `log-level: info
+max-retries: 3
+cooldown: {base: 5s, max: 1m}
+dial-timeout: 5s
+proxies:
+  auto:
+    - {proxy: '` + socks.RouteValue() + `', kind: v4, weight: 3}
+  manual: []
+`,
+		"removed balance block": `log-level: info
+max-retries: 3
+cooldown: {base: 5s, max: 1m}
+dial-timeout: 5s
+balance: {v4: 7, v6: 3}
 proxies:
   auto:
     - {proxy: '` + socks.RouteValue() + `', kind: v4}

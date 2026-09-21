@@ -209,9 +209,9 @@ func TestReconfigureRetainsTargetCooldowns(t *testing.T) {
 	pairFail(pl, a, "blocked.test:443")
 
 	next := pl.Reconfigure([]config.RouteSpec{
-		{URL: mustURL(t, "socks5://a:1"), Kind: config.EgressV4, Weight: 3},
+		{URL: mustURL(t, "socks5://a:1"), Kind: config.EgressV4},
 		{URL: mustURL(t, "socks5://b:2"), Kind: config.EgressV4},
-	}, 30*time.Second, time.Minute, config.KindBalance{})
+	}, 30*time.Second, time.Minute)
 
 	if got := next.PickFor(nil, nil, "blocked.test:443"); got == nil || got.URL.Host == "a:1" {
 		t.Fatalf("pick after reload = %v, want the retained pair cooldown honored", got)
@@ -226,20 +226,20 @@ func TestReconfigureRetainsTargetCooldowns(t *testing.T) {
 	rebuilt := pl.Reconfigure([]config.RouteSpec{
 		{URL: mustURL(t, "socks5://a:1"), Kind: config.EgressV6},
 		{URL: mustURL(t, "socks5://b:2"), Kind: config.EgressV4},
-	}, 30*time.Second, time.Minute, config.KindBalance{})
+	}, 30*time.Second, time.Minute)
 	if snap := rebuilt.Snapshot()[0]; snap.TargetCooldowns != 0 || snap.TargetFailures != 0 {
 		t.Fatalf("rebuilt route carried pair state: %+v", snap)
 	}
 }
 
 // The kind filter composes with the pair filter: a pair-cooled v4 route
-// leaves the mixed pick to the healthy v6 route.
-func TestBalancedPickRespectsPairScope(t *testing.T) {
+// leaves the unfiltered pick to the healthy v6 route.
+func TestPickRespectsPairScope(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := NewRoutes([]config.RouteSpec{
 		{URL: mustURL(t, "socks5://a:1"), Kind: config.EgressV4},
 		{URL: mustURL(t, "socks5://b:2"), Kind: config.EgressV6},
-	}, 30*time.Second, time.Minute, config.KindBalance{V4: 1, V6: 1})
+	}, 30*time.Second, time.Minute)
 	pl.Now = c.NowFunc
 
 	a := pl.PickFor(nil, nil, "blocked.test:443")

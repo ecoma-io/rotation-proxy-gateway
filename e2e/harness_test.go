@@ -37,16 +37,14 @@ func (b *lockedBuffer) String() string {
 
 // RouteConfig is one static SOCKS route in the generated gateway config.
 type RouteConfig struct {
-	Proxy  string
-	Kind   string
-	Weight int // 0 omits the weight key; the gateway defaults to 1
+	Proxy string
+	Kind  string
 }
 
 // ManualRouteConfig is one API-driven rotation route in the generated config.
 type ManualRouteConfig struct {
 	Proxy          string
 	Kind           string
-	Weight         int // 0 omits the weight key; the gateway defaults to 1
 	RotateInterval string
 	API            ManualAPIConfig
 }
@@ -71,13 +69,6 @@ type RotationConfig struct {
 	RetryBackoffMax string
 }
 
-// BalanceConfig is the family-split block; nil in GatewayConfig omits it. A
-// zero share omits the key, leaving that family as standby.
-type BalanceConfig struct {
-	V4 int
-	V6 int
-}
-
 // GatewayConfig is the full runtime YAML written for one gateway instance.
 type GatewayConfig struct {
 	LogLevel     string
@@ -88,7 +79,6 @@ type GatewayConfig struct {
 	Routes       []RouteConfig
 	Manual       []ManualRouteConfig
 	Rotation     *RotationConfig
-	Balance      *BalanceConfig
 	WarmPool     *WarmPoolConfig
 }
 
@@ -120,7 +110,6 @@ type PoolEntry struct {
 	Proxy               string        `json:"proxy"`
 	Kind                string        `json:"kind"`
 	Origin              string        `json:"origin"`
-	Weight              uint64        `json:"weight"`
 	Available           bool          `json:"available"`
 	InFlight            int           `json:"inFlight"`
 	ConsecutiveFailures int           `json:"consecutiveFailures"`
@@ -143,12 +132,6 @@ type RotationView struct {
 	ConsecutiveSameIP int    `json:"consecutiveSameIP"`
 }
 
-// BalanceView is the active family split reported by /status when configured.
-type BalanceView struct {
-	V4 int `json:"v4"`
-	V6 int `json:"v6"`
-}
-
 // Status is the decoded /status body.
 type Status struct {
 	Version   string `json:"version"`
@@ -159,9 +142,8 @@ type Status struct {
 		Requests  uint64 `json:"requests"`
 		Failovers uint64 `json:"failovers"`
 	} `json:"listeners"`
-	Pool     []PoolEntry  `json:"pool"`
-	Balance  *BalanceView `json:"balance,omitempty"`
-	WarmPool *WarmView    `json:"warmPool,omitempty"`
+	Pool     []PoolEntry `json:"pool"`
+	WarmPool *WarmView   `json:"warmPool,omitempty"`
 }
 
 // WarmView is the warm-pool section of /status.
@@ -255,15 +237,6 @@ func renderConfig(cfg GatewayConfig) string {
 			fmt.Fprintf(&sb, "  retry-backoff-max: %s\n", cfg.Rotation.RetryBackoffMax)
 		}
 	}
-	if cfg.Balance != nil {
-		sb.WriteString("balance:\n")
-		if cfg.Balance.V4 > 0 {
-			fmt.Fprintf(&sb, "  v4: %d\n", cfg.Balance.V4)
-		}
-		if cfg.Balance.V6 > 0 {
-			fmt.Fprintf(&sb, "  v6: %d\n", cfg.Balance.V6)
-		}
-	}
 	if cfg.WarmPool != nil {
 		w := cfg.WarmPool
 		sb.WriteString("warm-pool:\n")
@@ -290,9 +263,6 @@ func renderConfig(cfg GatewayConfig) string {
 	sb.WriteString("proxies:\n  auto:\n")
 	for _, r := range cfg.Routes {
 		fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n", yamlQuote(r.Proxy), r.Kind)
-		if r.Weight > 0 {
-			fmt.Fprintf(&sb, "      weight: %d\n", r.Weight)
-		}
 	}
 	if len(cfg.Manual) == 0 {
 		sb.WriteString("  manual: []\n")
@@ -301,9 +271,6 @@ func renderConfig(cfg GatewayConfig) string {
 	sb.WriteString("  manual:\n")
 	for _, m := range cfg.Manual {
 		fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n", yamlQuote(m.Proxy), m.Kind)
-		if m.Weight > 0 {
-			fmt.Fprintf(&sb, "      weight: %d\n", m.Weight)
-		}
 		fmt.Fprintf(&sb, "      rotate-interval: %s\n", m.RotateInterval)
 		fmt.Fprintf(&sb, "      api:\n        url: %s\n", m.API.URL)
 		if m.API.Method != "" {

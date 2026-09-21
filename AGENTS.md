@@ -57,8 +57,8 @@ addresses and must not overlap (including wildcard binds on the same port).
 
 Runtime settings and active routes live only in `config.yaml`:
 `log-level`, `max-retries`, `cooldown`, `dial-timeout`, `proxies.auto`,
-`proxies.manual`, the `rotation` block, and the optional `balance` and
-`warm-pool` blocks. The process polls the file each
+`proxies.manual`, the `rotation` block, and the optional
+`warm-pool` block. The process polls the file each
 second and reloads when its content hash changes, so in-place edits and atomic
 replacements both reload under any mount style. A failed parse/validation
 leaves the last-known-good pool and runtime settings serving. Do not add a
@@ -72,7 +72,8 @@ last-known-good config keeps serving, and on first boot the process refuses
 to start. Route proxy lines carry no scheme (`host:port`,
 `user:pass@host:port`, `host:port:user:pass`): the endpoint protocol is
 always SOCKS5, so a line containing `socks5://` — or any scheme — is
-rejected the same way.
+rejected the same way. The removed weighted-selection keys — a route
+`weight` and a `balance` block — are rejected identically.
 
 `kind: v4|v6` means the provider-backed **public egress IP family**. It does
 not classify the SOCKS endpoint transport address and does not restrict target
@@ -82,13 +83,9 @@ address families. Do not infer kind by resolving a hostname.
 
 Read [`README.md`](README.md) before changing failure classification.
 
-- The pool selects the usable **eligible** route with the smallest weighted
-  recency pass: picks distribute proportionally to each route's `weight`
-  (default 1; all-equal weights are true round-robin). The optional `balance`
-  block splits mixed-listener picks between egress families by relative share
-  (a family clock above the weighted order; zero-share families serve only as
-  standby; availability always beats the ratio; dedicated listeners ignore
-  it). It is a single shared pool: cooldown, pair-scoped target-cooldown, and
+- The pool selects the usable **eligible** route with the smallest recency
+  pass, first-seen order breaking ties — true round-robin over the eligible
+  set. It is a single shared pool: cooldown, pair-scoped target-cooldown, and
   auth state are visible through both dedicated and mixed listeners.
 - Endpoint DNS/TCP failure is `proxy_connect`: cooldown then a distinct
   eligible fallback. SOCKS auth failure is `auth_route`, blocks the route, and

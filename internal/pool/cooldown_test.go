@@ -52,7 +52,7 @@ func TestCooldownRealClockLifecycle(t *testing.T) {
 	pl := NewRoutes([]config.RouteSpec{
 		{URL: mustURL(t, "socks5://a:1"), Kind: config.EgressV4},
 		{URL: mustURL(t, "socks5://b:2"), Kind: config.EgressV4},
-	}, 300*time.Millisecond, 10*time.Second, config.KindBalance{})
+	}, 300*time.Millisecond, 10*time.Second)
 	p := pl.PickFor(nil, nil, "t:443")
 	if p == nil {
 		t.Fatal("pick = nil, want the first route")
@@ -96,7 +96,7 @@ func TestCooldownRealClockLifecycle(t *testing.T) {
 // only because each report writes both fields as one critical section.
 func TestCooldownAndStreakWriteAsOneUnit(t *testing.T) {
 	pl := NewRoutes([]config.RouteSpec{{URL: mustURL(t, "socks5://a:1"), Kind: config.EgressV4}},
-		30*time.Second, time.Minute, config.KindBalance{})
+		30*time.Second, time.Minute)
 	p := pl.PickFor(nil, nil, "t:443")
 	if p == nil {
 		t.Fatal("pick = nil, want the single route")
@@ -226,7 +226,7 @@ func TestPoolSizeAndCountAllowed(t *testing.T) {
 	}
 
 	pl6 := NewRoutes([]config.RouteSpec{{URL: mustURL(t, "socks5://v6:1"), Kind: config.EgressV6}},
-		30*time.Second, time.Minute, config.KindBalance{})
+		30*time.Second, time.Minute)
 	if got := pl6.CountAllowed(v6Only); got != 1 {
 		t.Fatalf("CountAllowed(v6) = %d, want 1", got)
 	}
