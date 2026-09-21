@@ -100,18 +100,28 @@ func NewSourceEchoTarget(t testing.TB) *TargetSim {
 }
 
 // NewSlowBodyTarget streams half a body, holds the connection for hold, then
-// completes it — a request that stays in flight while a rotation proceeds.
+// completes it — a request that stays in flight while a rotation proceeds. The
+// hold yields to teardown: closing stop (registered to run before srv.Close in
+// the LIFO cleanup chain) wakes a parked handler, so a client that abandons
+// the body unread never pins the test's cleanup for the remaining hold.
 func NewSlowBodyTarget(t testing.TB, hold time.Duration) *TargetSim {
+	t.Helper()
+	stop := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", "32")
 		_, _ = io.WriteString(w, "0123456789abcdef")
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
-		time.Sleep(hold)
+		select {
+		case <-time.After(hold):
+		case <-stop:
+			return
+		}
 		_, _ = io.WriteString(w, "ghijklmnopqrstuv")
 	}))
 	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(stop) })
 	return fromServer(srv)
 }
 

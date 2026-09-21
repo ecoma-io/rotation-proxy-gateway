@@ -303,6 +303,55 @@ func TestE2E_WarmPoolRotationInvalidatesGeneration(t *testing.T) {
 	tunnelOnce(t, g, target.Host)
 }
 
+// A borrowed warm connection whose CONNECT the endpoint itself refuses keeps
+// the cold path's classification at the process boundary: connect_target,
+// pair-scoped cooldown, route-level health untouched. The unit seam
+// (internal/proxyserver warmdial_test.go) pins dialWarmFirst's handling; this
+// drives the whole binary with the pool armed and proves the parked
+// connection really served the refused request (borrowed=1, exactly one
+// CONNECT frame) before asserting the failure landed on the (route, target)
+// pair — never on the route, and never as a warm-pool health write.
+func TestE2E_WarmBorrowedRefusedConnectStaysPairScoped(t *testing.T) {
+	skipShort(t)
+	sim := NewSocksSim(t, SocksRejectTarget, "", "")
+	sim.RefuseHost = "blocked.example"
+	cfg := defaultGatewayConfig([]RouteConfig{{Proxy: sim.RouteValue(), Kind: "v4"}})
+	cfg.WarmPool = warmEnabled()
+	g := NewGateway(t, cfg)
+	defer g.stop()
+
+	// One parked half connection — greeting only, no CONNECT frame yet.
+	waitWarm(t, g, "fills to one parked conn", func(v *WarmView) bool { return v.IdleTotal == 1 }, 5*time.Second)
+	if got := sim.Connected.Load(); got != 0 {
+		t.Fatalf("parked conns sent %d CONNECT frames, want none", got)
+	}
+
+	failedSocksTunnel(t, g.MixedAddr, "blocked.example:80")
+
+	// The refusal traveled through the borrowed connection: exactly one
+	// CONNECT frame reached the endpoint and the pool recorded one borrow.
+	if got := sim.Connected.Load(); got != 1 {
+		t.Fatalf("CONNECT frames = %d, want exactly the one through the borrowed conn", got)
+	}
+	waitWarm(t, g, "records the borrow", func(v *WarmView) bool { return v.Borrowed == 1 }, 5*time.Second)
+
+	st := g.WaitForCondition(5*time.Second, "pair-scoped refusal recorded", func(st *Status) bool {
+		return len(st.Pool) == 1 && st.Pool[0].TargetCooldowns == 1
+	})
+	entry := st.Pool[0]
+	if !entry.Available || entry.Failures != 0 || entry.CooldownFor != "0s" {
+		t.Fatalf("borrowed refusal moved route-level health: %+v", entry)
+	}
+	if entry.TargetFailures != 1 {
+		t.Fatalf("targetFailures = %d, want 1: %+v", entry.TargetFailures, entry)
+	}
+	recs := waitForLogRecord(t, g, map[string]string{"error_kind": "connect_target"}, 5*time.Second)
+	rec, ok := findLogRecord(recs, map[string]string{"error_kind": "connect_target"})
+	if !ok || !recordHasKey(rec, "cooldown") {
+		t.Fatalf("connect_target record missing cooldown: %v", rec)
+	}
+}
+
 // H: shutdown closes every parked connection before the process exits — no
 // upstream socket outlives the gateway.
 func TestE2E_WarmPoolShutdownClosesParkedConns(t *testing.T) {

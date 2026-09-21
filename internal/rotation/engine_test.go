@@ -772,6 +772,83 @@ func TestProcedureAbortsOnShutdown(t *testing.T) {
 	held.Release()
 }
 
+// TestProcedureVerifyWindowAbortsOnContextCancel parks a procedure inside the
+// verify window — a probe in flight that misses cancellation, as a dial deep
+// in a syscall can — and cancels the engine context. The verify loop's own
+// context checkpoint must end the procedure at the probe's return instead of
+// running out the 30s IP-check window: no rotation is recorded and no outcome
+// survives. TestRunCancelAbandonsActiveProcedure covers the rotate-API-call
+// park; this is the verify-phase counterpart.
+func TestProcedureVerifyWindowAbortsOnContextCancel(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7") // the IP never changes: verify keeps polling
+	api := newAPIServer(t)
+	spec := manualRoute(t, "m1.test", time.Minute, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	cfg.Rotation.IPCheckTimeout = 30 * time.Second
+	cfg.Rotation.IPCheckInterval = 50 * time.Millisecond
+	s := newSetup(t, cfg, nil, ips)
+
+	base := s.e.dial
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	var dials atomic.Int64
+	s.e.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
+		switch dials.Add(1) {
+		case 1:
+			return base(ctx, pu, target, timeout) // the baseline probe
+		case 2:
+			// The first verify probe parks mid-dial and ignores its context:
+			// only the verify loop's checkpoint can observe the cancellation.
+			close(parked)
+			<-release
+			return nil, errors.New("verify probe returned after cancellation (TEST)")
+		default:
+			return nil, errors.New("verify probed again after cancellation (TEST)")
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.e.runProcedure(ctx, s.gen, spec, s.pl.Lookup(routeID(spec.RouteSpec)), routeID(spec.RouteSpec))
+	}()
+	waitRotationState(t, s.pl, "m1.test", "verifying")
+	select {
+	case <-parked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("verify never started its first probe")
+	}
+
+	start := time.Now()
+	cancel()
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("procedure did not leave the verify window promptly after cancellation")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("procedure exited the verify window after %s, want the checkpoint not the IP-check window", elapsed)
+	}
+	if got := s.e.Rotations(); got != 0 {
+		t.Fatalf("Rotations = %d, want 0 for a canceled verify", got)
+	}
+	st := snapshotHost(t, s.pl, "m1.test")
+	if st.Rotation.State != "idle" || st.Rotation.LastIP != "" {
+		t.Fatalf("canceled verify left an outcome behind: %+v", st.Rotation)
+	}
+	// The window is dead: no further probes fire after the abort.
+	time.Sleep(300 * time.Millisecond)
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("dials = %d after the abort, want exactly baseline + one verify probe", got)
+	}
+	if got := api.calls.Load(); got != 1 {
+		t.Fatalf("rotate API calls = %d, want 1", got)
+	}
+}
+
 func TestProcedureAbortsForRemovedRoute(t *testing.T) {
 	ips := newIPServer(t, "203.0.113.7")
 	api := newAPIServer(t)

@@ -90,15 +90,28 @@ func isConnResetError(err error) bool {
 	return errors.Is(err, syscall.ECONNRESET)
 }
 
+// deadRouteValue produces a loopback address whose listener is already
+// closed, simulating a dead route endpoint. The address flows through the
+// same handedOut registry as freeAddr: the OS can re-issue the just-freed
+// ephemeral port to the next bind, and an unregistered "dead" address could
+// later be handed to a live sim or gateway listener — flipping dial-refusal
+// assertions to successes or failing unrelated binds.
 func deadRouteValue(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	handedOutMu.Lock()
+	defer handedOutMu.Unlock()
+	for {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		if !handedOut[addr] {
+			handedOut[addr] = true
+			return addr
+		}
 	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
 }
 
 // failedSocksTunnel asserts the gateway rejects the CONNECT attempt with the

@@ -410,6 +410,16 @@ func TestLoadBootstrapDefaultsAndConflicts(t *testing.T) {
 			want: "must not overlap",
 		},
 		{
+			// The two wildcard spellings are one dual-stack bind each on
+			// Linux: distinct strings must not defeat the overlap check.
+			name: "dual-stack wildcard pair overlap",
+			set: map[string]string{
+				"RPGW_MIXED_LISTEN_ADDR": "[::]:30121",
+				"RPGW_V4_LISTEN_ADDR":    "0.0.0.0:30121",
+			},
+			want: "must not overlap",
+		},
+		{
 			name: "specific overlaps wildcard",
 			set:  map[string]string{"RPGW_V4_LISTEN_ADDR": "127.0.0.1:30121"},
 			want: "must not overlap",
