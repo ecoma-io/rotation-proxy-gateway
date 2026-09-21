@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -138,6 +140,106 @@ func TestHealthcheckInvalidBootstrapFails(t *testing.T) {
 	if got := healthcheck(); got != 1 {
 		t.Fatalf("healthcheck() = %d, want 1 for invalid bootstrap", got)
 	}
+}
+
+// captureFileOutput swaps one os.Stdout/os.Stderr for a pipe, runs fn, and
+// returns what fn wrote. The captured streams carry at most a usage line or a
+// version string, far below the pipe buffer, so the read cannot block.
+func captureFileOutput(t *testing.T, target **os.File, fn func()) string {
+	t.Helper()
+	saved := *target
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	*target = w
+	defer func() { *target = saved }()
+	fn()
+	_ = w.Close()
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+// isolateServerEnv neutralizes ambient bootstrap config and points the config
+// file at a guaranteed-missing path, so any dispatch that reaches the server
+// path deterministically fails at config load — before any listener binds —
+// and returns 1 instead of blocking the test.
+func isolateServerEnv(t *testing.T) {
+	t.Helper()
+	isolateHealthcheckEnv(t)
+	t.Setenv("RPGW_CONFIG_FILE", filepath.Join(t.TempDir(), "missing.yaml"))
+}
+
+func TestRunArgsUnknownArgumentIsUsageError(t *testing.T) {
+	isolateServerEnv(t)
+	for _, arg := range []string{"--help", "--version", "healthchek"} {
+		t.Run(arg, func(t *testing.T) {
+			var code int
+			out := captureFileOutput(t, &os.Stderr, func() { code = runArgs([]string{arg}) })
+			// Exit 2 proves the server path was never entered: with the
+			// missing config file, a fall-through to run() would return 1
+			// after starting (and failing) startup, not print usage.
+			if code != 2 {
+				t.Fatalf("runArgs([%q]) = %d, want 2", arg, code)
+			}
+			if out != usageLine {
+				t.Fatalf("stderr = %q, want the usage line %q", out, usageLine)
+			}
+		})
+	}
+}
+
+func TestRunArgsEmptyArgsEnterServerPath(t *testing.T) {
+	isolateServerEnv(t)
+	// With a missing config file the server path fails at LoadRuntime and
+	// returns 1 — never the usage code 2 — pinning that the no-argument
+	// invocation still dispatches to run() and never reaches a listener bind.
+	if got := runArgs(nil); got != 1 {
+		t.Fatalf("runArgs(nil) = %d, want 1 (server path failing on the missing config)", got)
+	}
+}
+
+func TestRunArgsVersionPrintsAndSucceeds(t *testing.T) {
+	isolateServerEnv(t)
+	var code int
+	out := captureFileOutput(t, &os.Stdout, func() { code = runArgs([]string{"version"}) })
+	if code != 0 {
+		t.Fatalf("runArgs([version]) = %d, want 0", code)
+	}
+	if out != version+"\n" {
+		t.Fatalf("stdout = %q, want %q", out, version+"\n")
+	}
+}
+
+func TestRunArgsHealthcheckKeepsExitContract(t *testing.T) {
+	t.Run("healthy admin exits 0", func(t *testing.T) {
+		isolateServerEnv(t)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/healthz" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Write([]byte("ok\n")) //nolint:errcheck
+		}))
+		defer srv.Close()
+		t.Setenv("RPGW_ADMIN_ADDR", adminAddrFor(t, srv))
+		if got := runArgs([]string{"healthcheck"}); got != 0 {
+			t.Fatalf("runArgs([healthcheck]) = %d, want 0", got)
+		}
+	})
+	t.Run("unreachable admin exits 1", func(t *testing.T) {
+		isolateServerEnv(t)
+		srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+		addr := adminAddrFor(t, srv)
+		srv.Close()
+		t.Setenv("RPGW_ADMIN_ADDR", addr)
+		if got := runArgs([]string{"healthcheck"}); got != 1 {
+			t.Fatalf("runArgs([healthcheck]) = %d, want 1", got)
+		}
+	})
 }
 
 func warnTestConfig(t *testing.T, kinds ...config.EgressKind) *config.RuntimeConfig {
