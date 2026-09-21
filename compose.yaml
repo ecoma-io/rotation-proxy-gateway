@@ -21,6 +21,10 @@ services:
       # Optional. The drain budget is shared by all listeners and must stay
       # below stop_grace_period so docker's SIGKILL never cuts it short.
       # RPGW_SHUTDOWN_GRACE: 45s
+      # Optional. username:password — when set, every proxy listener requires
+      # SOCKS5 username/password auth (RFC 1929); unset keeps the no-auth
+      # default. Bootstrap-only like everything in this block.
+      # RPGW_ACCOUNT=user:pass
     # docker stop sends SIGTERM and waits this long before SIGKILL. Keep it
     # above the gateway's RPGW_SHUTDOWN_GRACE (default 55s) plus a little margin.
     stop_grace_period: 60s

@@ -499,7 +499,7 @@ func ingressRequestFromFrame(t *testing.T, frame []byte) socksRequest {
 	}
 	results := make(chan outcome, 1)
 	go func() {
-		req, err := readSocksRequest(bufio.NewReader(serverSide), serverSide)
+		req, err := readSocksRequest(bufio.NewReader(serverSide), serverSide, nil)
 		results <- outcome{req: req, err: err}
 	}()
 	if _, err := clientSide.Write(socksGreetingFrame(socksAuthNone)); err != nil {

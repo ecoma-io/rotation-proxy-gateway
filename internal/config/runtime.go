@@ -181,6 +181,10 @@ type BootstrapConfig struct {
 	// ShutdownGrace bounds the entire graceful drain: one shared deadline for
 	// all listeners, not a per-listener window.
 	ShutdownGrace time.Duration
+	// Account, when set, is the RFC 1929 credential pair every proxy listener
+	// demands from clients. Nil keeps the no-authentication default. Like every
+	// bootstrap value it is restart-only.
+	Account *InboundAccount
 }
 
 // RuntimeConfig is the immutable set of values used by new client operations.
@@ -316,6 +320,16 @@ func LoadBootstrap() (*BootstrapConfig, error) {
 			return nil, fmt.Errorf("RPGW_SHUTDOWN_GRACE %q must be a Go duration", raw)
 		}
 		cfg.ShutdownGrace = d
+	}
+	// A set account must parse or startup fails: a value that was ignored
+	// would leave the deployment serving without the authentication its
+	// operator believes is on — the open-proxy quiet failure.
+	if raw, ok := os.LookupEnv("RPGW_ACCOUNT"); ok && raw != "" {
+		account, err := parseAccount(raw)
+		if err != nil {
+			return nil, fmt.Errorf("RPGW_ACCOUNT %w", err)
+		}
+		cfg.Account = account
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err

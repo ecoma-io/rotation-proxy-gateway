@@ -1,11 +1,13 @@
 // Package proxyserver implements the inbound SOCKS5 proxy. Client connections
-// speak RFC 1928 CONNECT with no authentication; every accepted tunnel is
-// relayed through SOCKS5 routes from the shared health-aware pool.
+// speak RFC 1928 CONNECT, with no authentication unless a bootstrap account is
+// configured (RFC 1929); every accepted tunnel is relayed through SOCKS5
+// routes from the shared health-aware pool.
 package proxyserver
 
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -36,6 +38,7 @@ const inboundHandshakeTimeout = 30 * time.Second
 const (
 	socksVersion             = 0x05
 	socksAuthNone            = 0x00
+	socksAuthUserPass        = 0x02
 	socksAuthUnaccepted      = 0xff
 	socksCmdConnect          = 0x01
 	socksCmdBind             = 0x02
@@ -47,6 +50,26 @@ const (
 	socksReplyGeneral        = 0x01
 	socksReplyCmdUnsupported = 0x07
 )
+
+// RFC 1929 username/password subnegotiation constants: one version byte
+// (0x01) framing ULEN/UNAME/PLEN/PASSWD and a one-byte status in the reply.
+const (
+	authUPVersion = 0x01
+	authUPSuccess = 0x00
+	authUPFailure = 0xff
+)
+
+// errInboundAuth marks a completed RFC 1929 exchange whose credentials did
+// not match the configured account: the failure reply was already written,
+// so the caller only logs and closes. It never carries credential bytes.
+var errInboundAuth = errors.New("inbound authentication rejected")
+
+// inboundAccount is the RFC 1929 credential pair a server demands from every
+// client. A nil pointer keeps the historical NO AUTHENTICATION handshake.
+type inboundAccount struct {
+	username []byte
+	password []byte
+}
 
 // WarmBorrower is the serving path's window into the warm pool. Borrow is a
 // non-blocking pop: nil means dial cold, exactly as before the pool existed.
@@ -69,6 +92,10 @@ type Server struct {
 	// test Server) keeps the cold dial path. It is set once, before Serve
 	// starts, and read-only afterwards.
 	warm WarmBorrower
+	// account, when non-nil, switches the inbound handshake to mandatory
+	// RFC 1929 username/password authentication. Set once, before Serve
+	// starts, and read-only afterwards; nil keeps no-authentication.
+	account *inboundAccount
 
 	cmu   sync.Mutex
 	conns map[net.Conn]struct{}
@@ -234,6 +261,14 @@ func (s *Server) UseWarmPool(w WarmBorrower) {
 	s.warm = w
 }
 
+// UseInboundAccount arms mandatory RFC 1929 username/password authentication
+// for every session on this listener. It must be called before Serve;
+// afterwards the field is read-only. The slices are retained as-is, so the
+// caller must not mutate them afterwards.
+func (s *Server) UseInboundAccount(username, password []byte) {
+	s.account = &inboundAccount{username: username, password: password}
+}
+
 // dialWarmFirst establishes the upstream tunnel for one attempt: a parked
 // half connection when the warm pool has one for this route, the cold dial
 // otherwise. A borrowed connection that the endpoint itself refuses
@@ -307,8 +342,15 @@ func (s *Server) serveConn(conn net.Conn) {
 		inboundBufPool.Put(br)
 	}()
 
-	req, err := readSocksRequest(br, conn)
+	req, err := readSocksRequest(br, conn, s.account)
 	if err != nil {
+		// A rejected credential is a terminal failure an operator who armed
+		// authentication needs to see; every other framing reject stays flow
+		// detail at debug. Neither line carries credential bytes.
+		if errors.Is(err, errInboundAuth) {
+			s.log.Warn().Str("error_kind", "auth_rejected").Msg("socks authentication rejected")
+			return
+		}
 		s.log.Debug().Str("error_kind", "bad_request").Str("error", socksRejectLogValue(err)).Msg("socks request rejected")
 		return
 	}
@@ -497,15 +539,18 @@ type socksRequest struct {
 	cmd    byte
 }
 
-// readSocksRequest performs the RFC 1928 greeting (version 5, NO
-// AUTHENTICATION REQUIRED only) and reads one request. Reads come from br so
-// a buffered framing captures the whole exchange in as few socket reads as
-// possible; protocol replies are written to w. Parse failures return an error
-// and the connection must simply close: the RFC defines no reply for a request
-// the server could not parse, and an unknown address type makes the frame
-// length unknowable. Parseable but unsupported commands (BIND, UDP ASSOCIATE)
-// return with the command so the caller can answer 0x07.
-func readSocksRequest(br *bufio.Reader, w io.Writer) (socksRequest, error) {
+// readSocksRequest performs the RFC 1928 greeting and reads one request. With
+// a nil account the only accepted method is NO AUTHENTICATION REQUIRED; with
+// an account configured the only accepted method is username/password
+// (RFC 1929) — a configured credential is mandatory, not offered as an
+// alternative to 0x00. Reads come from br so a buffered framing captures the
+// whole exchange in as few socket reads as possible; protocol replies are
+// written to w. Parse failures return an error and the connection must simply
+// close: the RFC defines no reply for a request the server could not parse,
+// and an unknown address type makes the frame length unknowable. Parseable
+// but unsupported commands (BIND, UDP ASSOCIATE) return with the command so
+// the caller can answer 0x07.
+func readSocksRequest(br *bufio.Reader, w io.Writer, account *inboundAccount) (socksRequest, error) {
 	// Greeting: VER NMETHODS METHODS...
 	head := make([]byte, 2)
 	if _, err := io.ReadFull(br, head); err != nil {
@@ -521,9 +566,13 @@ func readSocksRequest(br *bufio.Reader, w io.Writer) (socksRequest, error) {
 	if _, err := io.ReadFull(br, methods); err != nil {
 		return socksRequest{}, fmt.Errorf("read methods: %w", err)
 	}
+	var want byte = socksAuthNone
+	if account != nil {
+		want = socksAuthUserPass
+	}
 	offered := false
 	for _, m := range methods {
-		if m == socksAuthNone {
+		if m == want {
 			offered = true
 			break
 		}
@@ -532,8 +581,13 @@ func readSocksRequest(br *bufio.Reader, w io.Writer) (socksRequest, error) {
 		w.Write([]byte{socksVersion, socksAuthUnaccepted}) //nolint:errcheck // the connection closes either way
 		return socksRequest{}, errors.New("no acceptable authentication method")
 	}
-	if _, err := w.Write([]byte{socksVersion, socksAuthNone}); err != nil {
+	if _, err := w.Write([]byte{socksVersion, want}); err != nil {
 		return socksRequest{}, fmt.Errorf("write method selection: %w", err)
+	}
+	if account != nil {
+		if err := readUserPassAuth(br, w, account); err != nil {
+			return socksRequest{}, err
+		}
 	}
 
 	// Request: VER CMD RSV ATYP DST.ADDR DST.PORT
@@ -592,6 +646,46 @@ func readSocksRequest(br *bufio.Reader, w io.Writer) (socksRequest, error) {
 	default:
 		return socksRequest{}, fmt.Errorf("unsupported address type 0x%02x", atyp)
 	}
+}
+
+// readUserPassAuth performs the RFC 1929 username/password subnegotiation:
+// VER ULEN UNAME PLEN PASSWD in, VER STATUS back. A mismatch writes the
+// failure reply and returns errInboundAuth — the caller closes, never logs
+// credential bytes. Malformed frames (bad version, truncation) return an
+// error with no reply, the same close-silently doctrine as the rest of the
+// inbound framing.
+func readUserPassAuth(br *bufio.Reader, w io.Writer, account *inboundAccount) error {
+	ver := make([]byte, 2) // VER, ULEN
+	if _, err := io.ReadFull(br, ver); err != nil {
+		return fmt.Errorf("read auth version: %w", err)
+	}
+	if ver[0] != authUPVersion {
+		return fmt.Errorf("unexpected auth version 0x%02x", ver[0])
+	}
+	uname := make([]byte, ver[1])
+	if _, err := io.ReadFull(br, uname); err != nil {
+		return fmt.Errorf("read auth username: %w", err)
+	}
+	plen := make([]byte, 1)
+	if _, err := io.ReadFull(br, plen); err != nil {
+		return fmt.Errorf("read auth password length: %w", err)
+	}
+	passwd := make([]byte, plen[0])
+	if _, err := io.ReadFull(br, passwd); err != nil {
+		return fmt.Errorf("read auth password: %w", err)
+	}
+	// Constant-time on both fields: the handshake is the one place a timing
+	// side channel would discriminate between a known-username/wrong-password
+	// guess and a wrong username.
+	if subtle.ConstantTimeCompare(uname, account.username) != 1 ||
+		subtle.ConstantTimeCompare(passwd, account.password) != 1 {
+		w.Write([]byte{authUPVersion, authUPFailure}) //nolint:errcheck // the connection closes either way
+		return errInboundAuth
+	}
+	if _, err := w.Write([]byte{authUPVersion, authUPSuccess}); err != nil {
+		return fmt.Errorf("write auth reply: %w", err)
+	}
+	return nil
 }
 
 // socksTarget builds the request target from one inbound frame's address

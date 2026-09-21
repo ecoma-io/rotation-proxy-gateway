@@ -67,19 +67,26 @@ These values create sockets or choose the polled file and are read only when
 the process starts. Empty proxy listener addresses disable their listener, but
 at least one proxy listener must remain enabled.
 
-| Variable                 |         Default | Meaning                                                    |
-| ------------------------ | --------------: | ---------------------------------------------------------- |
-| `RPGW_CONFIG_FILE`       |   `config.yaml` | Runtime YAML file path                                     |
-| `RPGW_ADMIN_ADDR`        | `0.0.0.0:30120` | Always-on admin listener; network policy controls exposure |
-| `RPGW_MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress listener                                |
-| `RPGW_V4_LISTEN_ADDR`    |        `:30122` | v4-egress-only listener                                    |
-| `RPGW_V6_LISTEN_ADDR`    |        `:30123` | v6-egress-only listener                                    |
-| `RPGW_SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown            |
+| Variable                 |         Default | Meaning                                                        |
+| ------------------------ | --------------: | -------------------------------------------------------------- |
+| `RPGW_CONFIG_FILE`       |   `config.yaml` | Runtime YAML file path                                         |
+| `RPGW_ADMIN_ADDR`        | `0.0.0.0:30120` | Always-on admin listener; network policy controls exposure     |
+| `RPGW_MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress listener                                    |
+| `RPGW_V4_LISTEN_ADDR`    |        `:30122` | v4-egress-only listener                                        |
+| `RPGW_V6_LISTEN_ADDR`    |        `:30123` | v6-egress-only listener                                        |
+| `RPGW_SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown                |
+| `RPGW_ACCOUNT`           |         _unset_ | `username:password` — require RFC 1929 auth on proxy listeners |
 
 All enabled addresses must be valid, use a numeric port, and not overlap --
 including wildcard binds on the same port. Docker Healthcheck uses only
 `RPGW_ADMIN_ADDR`; a bad runtime reload cannot make an otherwise-running service
 unhealthy.
+
+`RPGW_ACCOUNT`, when set, must read `username:password`: split at the first
+colon (the password may itself contain colons), a username of 1-255 bytes and
+a password of 0-255 bytes -- the RFC 1929 field limits. An empty value is the
+same as unset. Any other shape -- no colon, an empty username, an oversized
+field -- fails startup instead of silently serving without authentication.
 
 The unprefixed names these variables replaced (`CONFIG_FILE`, `ADMIN_ADDR`,
 `MIXED_LISTEN_ADDR`, `V4_LISTEN_ADDR`, `V6_LISTEN_ADDR`, `SHUTDOWN_GRACE`) are
@@ -499,10 +506,24 @@ one `CONNECT` request per connection.
 
 ### Authentication
 
-Only NO AUTHENTICATION REQUIRED (`0x00`) is accepted. Username/password
-authentication (RFC 1929) is deliberately not supported: a client whose
-greeting offers no `0x00` method receives `05 ff` and the connection is
-closed.
+Authentication follows `RPGW_ACCOUNT`:
+
+- **Unset (the default):** only NO AUTHENTICATION REQUIRED (`0x00`) is
+  accepted. A client whose greeting offers no `0x00` method receives `05 ff`
+  and the connection is closed.
+- **Set to `username:password`:** every proxy listener requires
+  username/password authentication (RFC 1929). Method negotiation selects
+  `0x02` when the client offers it; a greeting without `0x02` -- including
+  one offering only `0x00` -- receives `05 ff` and the connection is closed.
+  The RFC 1929 exchange must present the exact configured username and
+  password; anything else receives the failure reply (`01 ff`) and the
+  connection is closed.
+
+Credentials are compared in constant time. Neither the configured account nor
+anything a client presents ever appears in logs, errors, or `/status`.
+Authentication happens before route selection: a failed authentication is a
+local inbound error -- it never advances the listener `requests` metric,
+never touches route health, and is never retried against another route.
 
 ### Commands
 
@@ -539,8 +560,9 @@ exactly what the selected outbound route receives.
 
 ### Handshake deadline
 
-A 30-second read deadline bounds the greeting/request exchange and is cleared
-once the tunnel is established. Established tunnels have no timeouts.
+A 30-second read deadline bounds the greeting, the RFC 1929 exchange when
+`RPGW_ACCOUNT` is set, and the CONNECT request; it is cleared once the tunnel
+is established. Established tunnels have no timeouts.
 
 ### Keep-alive
 
@@ -624,8 +646,10 @@ clients migrate:
   `global.target-tls-insecure` and `global.max-body-buffer` keys are no longer
   accepted and the config fails validation otherwise (on first boot the process
   refuses to start).
-- Since only NO AUTHENTICATION is offered, a client configured to send SOCKS
-  username/password must have that mode disabled.
+- Authentication follows `RPGW_ACCOUNT`. Unset, only NO AUTHENTICATION is
+  offered and a client configured to send SOCKS username/password must have
+  that mode disabled. Set, every client must speak SOCKS username/password
+  mode with the exact configured `username:password`.
 - Keep-alive is now client-owned: one client connection carries exactly one
   tunnel, and pooled clients reuse it across requests. HTTP clients over SOCKS
   typically do this automatically.
