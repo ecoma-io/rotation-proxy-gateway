@@ -44,13 +44,17 @@ Before optimizing:
 
 ## What each benchmark measures
 
-| Benchmark                           | Path exercised                                                                         | What it isolates                                |
-| ----------------------------------- | -------------------------------------------------------------------------------------- | ----------------------------------------------- |
-| `BenchmarkDirect_SmallGET`          | client → target with no proxy: the floor                                               | pure HTTP baseline                              |
-| `BenchmarkProxied_SmallGET`         | client → gateway → SOCKS5 → target, small GET                                          | setup latency + relay for one full request      |
-| `BenchmarkProxied_SmallGETParallel` | same, fresh tunnel per request, `GOMAXPROCS` workers                                   | per-request setup under concurrency             |
-| `BenchmarkProxied_TunnelSetup`      | inbound SOCKS5 greet/CONNECT → route pick → outbound SOCKS5 setup, then close; no HTTP | setup-latency floor: the double handshake alone |
-| `BenchmarkProxied_BulkGET_1MiB`     | one tunnel reused, 1MiB HTTP response relayed per iteration (`SetBytes` reports MB/s)  | relay throughput, setup excluded                |
+| Benchmark                           | Path exercised                                                                         | What it isolates                                 |
+| ----------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| `BenchmarkDirect_SmallGET`          | client → target with no proxy: the floor                                               | pure HTTP baseline                               |
+| `BenchmarkProxied_SmallGET`         | client → gateway → SOCKS5 → target, small GET                                          | setup latency + relay for one full request       |
+| `BenchmarkProxied_SmallGETParallel` | same, fresh tunnel per request, `GOMAXPROCS` workers                                   | per-request setup under concurrency              |
+| `BenchmarkProxied_TunnelSetup`      | inbound SOCKS5 greet/CONNECT → route pick → outbound SOCKS5 setup, then close; no HTTP | setup-latency floor: the double handshake alone  |
+| `BenchmarkProxied_BulkGET_1MiB`     | one tunnel reused, 1MiB HTTP response relayed per iteration (`SetBytes` reports MB/s)  | relay throughput, setup excluded                 |
+| `BenchmarkHA_SingleProxyDowntime`   | 4 routes, continuous load; one route down 2.5s mid-window, back at 5s                  | availability and tail latency across one failure |
+| `BenchmarkHA_ConcurrentDowntime`    | same, but two of four routes fail at the same instant                                  | fallback behavior under concurrent failures      |
+| `BenchmarkHA_RotationUnderTraffic`  | 2 manual routes rotating every 1.5s under continuous load                              | what rotation windows cost a serving pool        |
+| `BenchmarkHA_BurstExhaust`          | 2-worker steady load → 32-worker burst → steady load again, all on 4 routes            | burst absorption and post-burst recovery         |
 
 The gap between `Direct` and `Proxied` small GET is the full per-request cost
 of one gateway hop plus one SOCKS5 hop: the per-tunnel inbound and outbound
@@ -62,6 +66,37 @@ on top, so its value subtracted from the small GET is roughly the cost of
 speaking HTTP through an established tunnel. `Proxied_BulkGET_1MiB` measures
 the other axis — steady-state relay throughput — with setup removed from the
 timed loop entirely (the tunnel is established once, before `ResetTimer`).
+
+## HA scenarios
+
+The `BenchmarkHA_*` set (ha_test.go) measures **traffic-level outcomes**, not
+setup or relay cost. Each iteration runs one full 8s scenario window against a
+fresh gateway, sims, and target, with a worker pool driving fresh-tunnel
+requests through the mixed listener continuously (`runLoad` in load_test.go).
+Failures are injected at fixed offsets (down at 2.5s, recovered at 5s) so every
+iteration sees the same shape; HA gateways use a 1s/5s cooldown so a recovered
+route is re-admitted inside the window. Reported metrics per benchmark:
+
+- `success_ratio`, `failed_ops`, `p50_ms`/`p95_ms`/`p99_ms` over successful
+  operations — the client-visible distribution, not pool internals.
+- Downtime benchmarks additionally report `downtime_*` (operations completing
+  inside the failure window) and `recovered_*` (after recovery).
+- `BenchmarkHA_BurstExhaust` prefixes each phase (`low1_`, `burst_`, `low2_`).
+- `BenchmarkHA_RotationUnderTraffic` reports `rotations` completed in-window.
+
+These benchmarks assert nothing — functional tests own correctness; the HA
+numbers exist to compare behavior changes (for example a connection-pooling
+feature) as distributions: a change is only acceptable if `success_ratio` does
+not regress and tail latency during failure windows does not worsen. Run the
+same before/after workflow as above:
+
+```bash
+go test ./e2e/ -run=NONE -bench=HA -benchmem -count=5 > /tmp/ha-before.txt
+```
+
+One scenario window is several seconds long, so each HA benchmark takes
+roughly (count × iterations × window) wall-clock; keep that in mind when
+raising `-count`.
 
 ## Interpretation caveats — read before drawing conclusions
 

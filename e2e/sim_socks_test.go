@@ -55,6 +55,14 @@ type SocksSim struct {
 	TunnelTo string
 
 	Hits atomic.Uint64
+
+	// Connected counts CONNECT requests read to the end: accepts minus
+	// connected is the number of connections that stopped at the greeting,
+	// method, or auth phase — the shape a pre-CONNECT parked warm connection
+	// has while parked. Live is the current accepted-but-not-closed count.
+	Connected atomic.Uint64
+	Live      atomic.Int64
+
 	Addr string
 
 	mu   sync.Mutex
@@ -110,8 +118,12 @@ func (s *SocksSim) RouteValue() string {
 }
 
 func (s *SocksSim) handle(conn net.Conn) {
-	defer func() { _ = conn.Close() }()
 	s.Hits.Add(1)
+	s.Live.Add(1)
+	defer func() {
+		s.Live.Add(-1)
+		_ = conn.Close()
+	}()
 	if s.Down.Load() {
 		return
 	}
@@ -217,6 +229,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 	if s.TunnelTo != "" {
 		target = s.TunnelTo
 	}
+	s.Connected.Add(1)
 
 	if s.Mode == SocksRejectTarget {
 		refuse := true
