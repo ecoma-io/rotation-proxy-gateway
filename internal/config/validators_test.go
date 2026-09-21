@@ -64,19 +64,43 @@ func TestHeaderAndMethodValidators(t *testing.T) {
 	}
 }
 
-// SHUTDOWN_GRACE is process-global: garbage must fail LoadBootstrap loudly
+// RPGW_SHUTDOWN_GRACE is process-global: garbage must fail LoadBootstrap loudly
 // rather than silently keeping the default drain budget.
 func TestLoadBootstrapRejectsBadShutdownGrace(t *testing.T) {
-	t.Setenv("CONFIG_FILE", "")
-	t.Setenv("ADMIN_ADDR", "")
-	t.Setenv("MIXED_LISTEN_ADDR", DefaultMixedListenAddr)
-	t.Setenv("V4_LISTEN_ADDR", DefaultV4ListenAddr)
-	t.Setenv("V6_LISTEN_ADDR", DefaultV6ListenAddr)
-	t.Setenv("SHUTDOWN_GRACE", "not-a-duration")
+	t.Setenv("RPGW_CONFIG_FILE", "")
+	t.Setenv("RPGW_ADMIN_ADDR", "")
+	t.Setenv("RPGW_MIXED_LISTEN_ADDR", DefaultMixedListenAddr)
+	t.Setenv("RPGW_V4_LISTEN_ADDR", DefaultV4ListenAddr)
+	t.Setenv("RPGW_V6_LISTEN_ADDR", DefaultV6ListenAddr)
+	t.Setenv("RPGW_SHUTDOWN_GRACE", "not-a-duration")
 	_, err := LoadBootstrap()
-	if err == nil || !strings.Contains(err.Error(), "SHUTDOWN_GRACE") {
-		t.Fatalf("LoadBootstrap() error = %v, want SHUTDOWN_GRACE complaint", err)
+	if err == nil || !strings.Contains(err.Error(), "RPGW_SHUTDOWN_GRACE") {
+		t.Fatalf("LoadBootstrap() error = %v, want RPGW_SHUTDOWN_GRACE complaint", err)
 	}
+}
+
+// The unprefixed bootstrap names are retired: a set legacy name must fail
+// loudly with its replacement named, not let the process silently boot on
+// defaults. Presence alone is fatal — an empty legacy listener value used to
+// mean "disable", so ignoring it would silently re-enable the listener.
+func TestLoadBootstrapRejectsLegacyEnvNames(t *testing.T) {
+	for _, legacy := range []string{"ADMIN_ADDR", "CONFIG_FILE", "MIXED_LISTEN_ADDR", "SHUTDOWN_GRACE", "V4_LISTEN_ADDR", "V6_LISTEN_ADDR"} {
+		t.Run(legacy, func(t *testing.T) {
+			t.Setenv(legacy, "")
+			_, err := LoadBootstrap()
+			if err == nil || !strings.Contains(err.Error(), legacy) || !strings.Contains(err.Error(), "RPGW_"+legacy) {
+				t.Fatalf("LoadBootstrap() error = %v, want %s renamed to RPGW_%s", err, legacy, legacy)
+			}
+		})
+	}
+	t.Run("every set legacy name is reported", func(t *testing.T) {
+		t.Setenv("CONFIG_FILE", "config.yaml")
+		t.Setenv("ADMIN_ADDR", "0.0.0.0:30120")
+		_, err := LoadBootstrap()
+		if err == nil || !strings.Contains(err.Error(), "RPGW_CONFIG_FILE") || !strings.Contains(err.Error(), "RPGW_ADMIN_ADDR") {
+			t.Fatalf("LoadBootstrap() error = %v, want both legacy names reported", err)
+		}
+	})
 }
 
 // Overlap must compare ports numerically: validation admits leading-zero

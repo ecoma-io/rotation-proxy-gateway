@@ -42,10 +42,10 @@ remains live but replies with the ordinary no-route SOCKS general-failure
 
 ```bash
 cp config.example.yaml config.yaml # add real static SOCKS routes
-MIXED_LISTEN_ADDR=:30121 \
-V4_LISTEN_ADDR=:30122 \
-V6_LISTEN_ADDR=:30123 \
-ADMIN_ADDR=0.0.0.0:30120 \
+RPGW_MIXED_LISTEN_ADDR=:30121 \
+RPGW_V4_LISTEN_ADDR=:30122 \
+RPGW_V6_LISTEN_ADDR=:30123 \
+RPGW_ADMIN_ADDR=0.0.0.0:30120 \
 go run ./cmd/rotation-proxy-gateway
 
 curl --socks5-hostname 127.0.0.1:30121 https://example.com/
@@ -53,7 +53,11 @@ curl http://127.0.0.1:30120/status
 ```
 
 `config.yaml` normally contains upstream credentials and is ignored by Git and
-Docker build contexts. Do not commit it or bake it into an image.
+Docker build contexts. Do not commit it or bake it into an image. Every
+bootstrap variable carries the `RPGW_` prefix;
+[`.env.example`](.env.example) lists them all with their defaults — copy it to
+`.env` (Git-ignored) and either export it before a bare-metal run
+(`set -a; . ./.env; set +a`) or pass `--env-file .env` to `docker run`.
 
 ## Configuration
 
@@ -63,19 +67,26 @@ These values create sockets or choose the polled file and are read only when
 the process starts. Empty proxy listener addresses disable their listener, but
 at least one proxy listener must remain enabled.
 
-| Variable            |         Default | Meaning                                                    |
-| ------------------- | --------------: | ---------------------------------------------------------- |
-| `CONFIG_FILE`       |   `config.yaml` | Runtime YAML file path                                     |
-| `ADMIN_ADDR`        | `0.0.0.0:30120` | Always-on admin listener; network policy controls exposure |
-| `MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress listener                                |
-| `V4_LISTEN_ADDR`    |        `:30122` | v4-egress-only listener                                    |
-| `V6_LISTEN_ADDR`    |        `:30123` | v6-egress-only listener                                    |
-| `SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown            |
+| Variable                 |         Default | Meaning                                                    |
+| ------------------------ | --------------: | ---------------------------------------------------------- |
+| `RPGW_CONFIG_FILE`       |   `config.yaml` | Runtime YAML file path                                     |
+| `RPGW_ADMIN_ADDR`        | `0.0.0.0:30120` | Always-on admin listener; network policy controls exposure |
+| `RPGW_MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress listener                                |
+| `RPGW_V4_LISTEN_ADDR`    |        `:30122` | v4-egress-only listener                                    |
+| `RPGW_V6_LISTEN_ADDR`    |        `:30123` | v6-egress-only listener                                    |
+| `RPGW_SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown            |
 
 All enabled addresses must be valid, use a numeric port, and not overlap --
 including wildcard binds on the same port. Docker Healthcheck uses only
-`ADMIN_ADDR`; a bad runtime reload cannot make an otherwise-running service
+`RPGW_ADMIN_ADDR`; a bad runtime reload cannot make an otherwise-running service
 unhealthy.
+
+The unprefixed names these variables replaced (`CONFIG_FILE`, `ADMIN_ADDR`,
+`MIXED_LISTEN_ADDR`, `V4_LISTEN_ADDR`, `V6_LISTEN_ADDR`, `SHUTDOWN_GRACE`) are
+retired: setting any of them — to any value, including empty — fails startup
+with an error naming its `RPGW_` replacement, the same reject-don't-ignore
+treatment as removed config keys, so an upgraded deployment cannot silently
+boot on default listeners and the default config path.
 
 ### Runtime YAML -- validated and hot-reloaded
 
@@ -192,7 +203,7 @@ rotation:
 | `ip-check-interval` |             `2s` | Pause between verification probes inside that window.                                                                                                                                     |
 | `retry-backoff-max` |            `15m` | Ceiling of the same-IP retry backoff.                                                                                                                                                     |
 
-`rotation.drain-timeout` and `SHUTDOWN_GRACE` are unrelated budgets. The drain
+`rotation.drain-timeout` and `RPGW_SHUTDOWN_GRACE` are unrelated budgets. The drain
 timeout bounds one route's pre-rotation quiesce; the shutdown grace bounds the
 whole process's listener drain. They never interact: a rotation procedure never
 extends shutdown, and shutdown never waits on a rotation.
@@ -261,7 +272,7 @@ provider API is not called again for it and no outcome is recorded.
 
 Shutdown cancels the rotation engine first, so every mid-flight procedure stops
 immediately and leaves the route in its last serving state; rotations never
-extend `SHUTDOWN_GRACE` and tunnels are never broken by shutdown sequencing
+extend `RPGW_SHUTDOWN_GRACE` and tunnels are never broken by shutdown sequencing
 beyond the ordinary listener drain.
 
 ### Request-path interaction
@@ -287,7 +298,7 @@ latency is irrelevant for configuration.
 volumes:
   - ./config.yaml:/app/config.yaml:ro
 environment:
-  CONFIG_FILE: /app/config.yaml
+  RPGW_CONFIG_FILE: /app/config.yaml
 ```
 
 One case no in-process reader can observe: renaming a new file over the config
@@ -546,7 +557,7 @@ visibly truncated instead of reading as a clean end.
 ```bash
 curl http://127.0.0.1:30120/healthz # body: ok\n
 curl http://127.0.0.1:30120/status
-ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
+RPGW_ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 ./bin/rpgw version
 ```
 
@@ -639,7 +650,7 @@ go build -ldflags "-X main.version=0.1.0-dev" -o bin/rpgw ./cmd/rotation-proxy-g
 
 Graceful shutdown stops the rotation engine (mid-flight procedures abort at
 their next checkpoint; no outcome is recorded), then drains every enabled proxy
-listener and the admin listener against one shared budget, `SHUTDOWN_GRACE`
+listener and the admin listener against one shared budget, `RPGW_SHUTDOWN_GRACE`
 (default 55s). It is one deadline for the whole process, not a window per
 listener, so even a fully busy worst case exits near the budget; an idle
 process exits immediately. When the budget expires, the remaining listeners are

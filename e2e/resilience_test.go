@@ -255,7 +255,7 @@ func TestE2E_ShutdownDrainsInFlightRequest(t *testing.T) {
 	}
 }
 
-// The configured SHUTDOWN_GRACE is one shared budget for the whole drain: an
+// The configured RPGW_SHUTDOWN_GRACE is one shared budget for the whole drain: an
 // in-flight request that never completes must still let the process exit near
 // the budget with a graceful exit code instead of hanging on it.
 func TestE2E_ShutdownGraceBoundsDrain(t *testing.T) {
@@ -272,7 +272,7 @@ func TestE2E_ShutdownGraceBoundsDrain(t *testing.T) {
 	t.Cleanup(srv.Close)
 	g := NewGatewayWithEnv(t, defaultGatewayConfig([]RouteConfig{
 		{Proxy: socks.RouteValue(), Kind: "v4"},
-	}), "SHUTDOWN_GRACE="+grace.String())
+	}), "RPGW_SHUTDOWN_GRACE="+grace.String())
 
 	type result struct {
 		status int
@@ -326,11 +326,11 @@ func runGatewayOnce(t *testing.T, configPath, admin, mixed, v4, v6 string) (int,
 	var out lockedBuffer
 	cmd := exec.Command(testBinaryPath)
 	cmd.Env = []string{
-		"CONFIG_FILE=" + configPath,
-		"ADMIN_ADDR=" + admin,
-		"MIXED_LISTEN_ADDR=" + mixed,
-		"V4_LISTEN_ADDR=" + v4,
-		"V6_LISTEN_ADDR=" + v6,
+		"RPGW_CONFIG_FILE=" + configPath,
+		"RPGW_ADMIN_ADDR=" + admin,
+		"RPGW_MIXED_LISTEN_ADDR=" + mixed,
+		"RPGW_V4_LISTEN_ADDR=" + v4,
+		"RPGW_V6_LISTEN_ADDR=" + v6,
 		"PATH=" + os.Getenv("PATH"),
 	}
 	cmd.Stdout = &out
@@ -444,7 +444,7 @@ func TestE2E_ShutdownGraceBoundsStuckDial(t *testing.T) {
 		{Proxy: bhLn.Addr().String(), Kind: "v4"},
 	})
 	cfg.DialTimeout = "30s"
-	g := NewGatewayWithEnv(t, cfg, "SHUTDOWN_GRACE=2s")
+	g := NewGatewayWithEnv(t, cfg, "RPGW_SHUTDOWN_GRACE=2s")
 
 	// One CONNECT parks the gateway inside the upstream SOCKS handshake.
 	conn, err := net.Dial("tcp", g.MixedAddr)

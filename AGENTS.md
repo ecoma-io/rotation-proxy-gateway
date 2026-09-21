@@ -32,28 +32,31 @@ then replace the placeholder `proxies.auto` SOCKS routes. The file may contain
 credentials; never log, commit, or bake it into an image.
 
 ```bash
-CONFIG_FILE=config.yaml \
-ADMIN_ADDR=0.0.0.0:30120 \
-MIXED_LISTEN_ADDR=:30121 \
-V4_LISTEN_ADDR=:30122 \
-V6_LISTEN_ADDR=:30123 \
+RPGW_CONFIG_FILE=config.yaml \
+RPGW_ADMIN_ADDR=0.0.0.0:30120 \
+RPGW_MIXED_LISTEN_ADDR=:30121 \
+RPGW_V4_LISTEN_ADDR=:30122 \
+RPGW_V6_LISTEN_ADDR=:30123 \
 ./bin/rpgw
 ```
 
 Environment variables are bootstrap-only and require restart:
 
-| Env                 |         Default | Meaning                                                 |
-| ------------------- | --------------: | ------------------------------------------------------- |
-| `CONFIG_FILE`       |   `config.yaml` | Runtime YAML path                                       |
-| `ADMIN_ADDR`        | `0.0.0.0:30120` | Admin (HTTP) listener; network policy controls exposure |
-| `MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress SOCKS5 listener                      |
-| `V4_LISTEN_ADDR`    |        `:30122` | IPv4-egress-only SOCKS5 listener                        |
-| `V6_LISTEN_ADDR`    |        `:30123` | IPv6-egress-only SOCKS5 listener                        |
-| `SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown         |
+| Env                      |         Default | Meaning                                                 |
+| ------------------------ | --------------: | ------------------------------------------------------- |
+| `RPGW_CONFIG_FILE`       |   `config.yaml` | Runtime YAML path                                       |
+| `RPGW_ADMIN_ADDR`        | `0.0.0.0:30120` | Admin (HTTP) listener; network policy controls exposure |
+| `RPGW_MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress SOCKS5 listener                      |
+| `RPGW_V4_LISTEN_ADDR`    |        `:30122` | IPv4-egress-only SOCKS5 listener                        |
+| `RPGW_V6_LISTEN_ADDR`    |        `:30123` | IPv6-egress-only SOCKS5 listener                        |
+| `RPGW_SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown         |
 
 Empty proxy listener addresses disable their listener, but at least one proxy
 listener must remain enabled. All enabled addresses must be valid host:port
 addresses and must not overlap (including wildcard binds on the same port).
+Every bootstrap variable carries the `RPGW_` prefix; a set legacy unprefixed
+name fails startup with an error naming its replacement, and
+[`.env.example`](.env.example) lists the full set.
 
 Runtime settings and active routes live only in `config.yaml`:
 `log-level`, `max-retries`, `cooldown`, `dial-timeout`, `proxies.auto`,
@@ -153,10 +156,10 @@ Read [`README.md`](README.md) before changing failure classification.
   doubling, capped, jittered backoff. Probe and rotate traffic bypasses pool
   health entirely; rotate-API headers, bodies, and URLs must never reach logs,
   errors, or `/status`. `rotation.drain-timeout` (one route's pre-rotation
-  quiesce) is unrelated to `SHUTDOWN_GRACE` (whole-process listener drain).
+  quiesce) is unrelated to `RPGW_SHUTDOWN_GRACE` (whole-process listener drain).
 - Shutdown cancels the rotation engine first — procedures abort at their next
   checkpoint and never extend the budget — then drains all proxy listeners and
-  admin against one shared `SHUTDOWN_GRACE` budget (default 55s; one deadline
+  admin against one shared `RPGW_SHUTDOWN_GRACE` budget (default 55s; one deadline
   for the whole process, not a window per listener), then force-closes
   established tunnels. Keep the surrounding orchestrator's kill timer above the
   budget (`stop_grace_period: 60s` in compose).
@@ -166,7 +169,7 @@ Read [`README.md`](README.md) before changing failure classification.
 ```bash
 curl http://127.0.0.1:30120/healthz # body "ok\n"
 curl http://127.0.0.1:30120/status  # requests/failovers per listener, global rotations, safe pool state
-ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
+RPGW_ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 ./bin/rpgw version
 ```
 

@@ -299,7 +299,7 @@ func NewGateway(t testing.TB, cfg GatewayConfig) *Gateway {
 }
 
 // NewGatewayWithEnv is NewGateway with extra bootstrap environment entries
-// (for example "SHUTDOWN_GRACE=1s") appended to the standard set.
+// (for example "RPGW_SHUTDOWN_GRACE=1s") appended to the standard set.
 func NewGatewayWithEnv(t testing.TB, cfg GatewayConfig, extraEnv ...string) *Gateway {
 	return newGateway(t, cfg, extraEnv)
 }
@@ -324,11 +324,11 @@ func newGateway(t testing.TB, cfg GatewayConfig, extraEnv []string) *Gateway {
 	cmd := exec.Command(testBinaryPath)
 	cmd.Dir = dir
 	cmd.Env = append([]string{
-		"CONFIG_FILE=" + g.configPath,
-		"ADMIN_ADDR=" + g.AdminAddr,
-		"MIXED_LISTEN_ADDR=" + g.MixedAddr,
-		"V4_LISTEN_ADDR=" + g.V4Addr,
-		"V6_LISTEN_ADDR=" + g.V6Addr,
+		"RPGW_CONFIG_FILE=" + g.configPath,
+		"RPGW_ADMIN_ADDR=" + g.AdminAddr,
+		"RPGW_MIXED_LISTEN_ADDR=" + g.MixedAddr,
+		"RPGW_V4_LISTEN_ADDR=" + g.V4Addr,
+		"RPGW_V6_LISTEN_ADDR=" + g.V6Addr,
 		"PATH=" + os.Getenv("PATH"),
 	}, extraEnv...)
 	cmd.Stdout = g.output
