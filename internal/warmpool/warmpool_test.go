@@ -503,6 +503,33 @@ func TestDisabledDrainsAndReenable(t *testing.T) {
 	}
 }
 
+// Borrowing nudges the sweeper: with the tick stretched far beyond the
+// assertion window, a refill after a borrow can only come from the wake path
+// — consumption-paced replenishment instead of tick-paced.
+func TestBorrowWakesSweeper(t *testing.T) {
+	srv := newHalfServer(t, "ok")
+	store, routes := warmStore(defaultWarm(), mustURL(t, "socks5://"+srv.addr))
+	wp := newTestPool(store)
+	wp.sweepEvery = 30 * time.Second
+
+	wp.Start()
+	defer wp.Stop()
+	// The startup pass (not a tick — there is none for 30s) fills to min-idle.
+	waitFor(t, "startup fill", 5*time.Second, func() bool {
+		return wp.Snapshot().IdleTotal == 1
+	})
+
+	if hc := wp.Borrow(routes[0]); hc == nil {
+		t.Fatal("borrow after fill returned nil")
+	}
+	waitFor(t, "wake-driven refill after borrow", 5*time.Second, func() bool {
+		return wp.Snapshot().IdleTotal == 1
+	})
+	if b := wp.Snapshot().Borrowed; b != 1 {
+		t.Fatalf("borrowed = %d, want 1", b)
+	}
+}
+
 func TestStartStopLifecycle(t *testing.T) {
 	srv := newHalfServer(t, "ok")
 	store, _ := warmStore(defaultWarm(), mustURL(t, "socks5://"+srv.addr))

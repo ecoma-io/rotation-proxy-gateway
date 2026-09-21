@@ -44,17 +44,22 @@ Before optimizing:
 
 ## What each benchmark measures
 
-| Benchmark                           | Path exercised                                                                         | What it isolates                                 |
-| ----------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------ |
-| `BenchmarkDirect_SmallGET`          | client → target with no proxy: the floor                                               | pure HTTP baseline                               |
-| `BenchmarkProxied_SmallGET`         | client → gateway → SOCKS5 → target, small GET                                          | setup latency + relay for one full request       |
-| `BenchmarkProxied_SmallGETParallel` | same, fresh tunnel per request, `GOMAXPROCS` workers                                   | per-request setup under concurrency              |
-| `BenchmarkProxied_TunnelSetup`      | inbound SOCKS5 greet/CONNECT → route pick → outbound SOCKS5 setup, then close; no HTTP | setup-latency floor: the double handshake alone  |
-| `BenchmarkProxied_BulkGET_1MiB`     | one tunnel reused, 1MiB HTTP response relayed per iteration (`SetBytes` reports MB/s)  | relay throughput, setup excluded                 |
-| `BenchmarkHA_SingleProxyDowntime`   | 4 routes, continuous load; one route down 2.5s mid-window, back at 5s                  | availability and tail latency across one failure |
-| `BenchmarkHA_ConcurrentDowntime`    | same, but two of four routes fail at the same instant                                  | fallback behavior under concurrent failures      |
-| `BenchmarkHA_RotationUnderTraffic`  | 2 manual routes rotating every 1.5s under continuous load                              | what rotation windows cost a serving pool        |
-| `BenchmarkHA_BurstExhaust`          | 2-worker steady load → 32-worker burst → steady load again, all on 4 routes            | burst absorption and post-burst recovery         |
+| Benchmark                             | Path exercised                                                                         | What it isolates                                  |
+| ------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `BenchmarkDirect_SmallGET`            | client → target with no proxy: the floor                                               | pure HTTP baseline                                |
+| `BenchmarkProxied_SmallGET`           | client → gateway → SOCKS5 → target, small GET                                          | setup latency + relay for one full request        |
+| `BenchmarkProxied_SmallGETParallel`   | same, fresh tunnel per request, `GOMAXPROCS` workers                                   | per-request setup under concurrency               |
+| `BenchmarkProxied_TunnelSetup`        | inbound SOCKS5 greet/CONNECT → route pick → outbound SOCKS5 setup, then close; no HTTP | setup-latency floor: the double handshake alone   |
+| `BenchmarkProxied_BulkGET_1MiB`       | one tunnel reused, 1MiB HTTP response relayed per iteration (`SetBytes` reports MB/s)  | relay throughput, setup excluded                  |
+| `BenchmarkHA_SingleProxyDowntime`     | 4 routes, continuous load; one route down 2.5s mid-window, back at 5s                  | availability and tail latency across one failure  |
+| `BenchmarkHA_ConcurrentDowntime`      | same, but two of four routes fail at the same instant                                  | fallback behavior under concurrent failures       |
+| `BenchmarkHA_RotationUnderTraffic`    | 2 manual routes rotating every 1.5s under continuous load                              | what rotation windows cost a serving pool         |
+| `BenchmarkHA_BurstExhaust`            | 2-worker steady load → 32-worker burst → steady load again, all on 4 routes            | burst absorption and post-burst recovery          |
+| `BenchmarkWarmAB_SteadyTunnels`       | paired gateways (warm off vs on), 2 workers, fresh tunnel + small GET per op           | steady-state latency effect of borrowing          |
+| `BenchmarkWarmAB_TunnelSetupOnly`     | paired gateways, 1 worker, tunnels opened and closed with no payload                   | pure setup cost a parked connection removes       |
+| `BenchmarkWarmAB_BurstExhaust`        | paired gateways: low → 32-worker burst → low, on 4 routes                              | burst fallback and post-burst recovery under warm |
+| `BenchmarkWarmHA_SingleProxyDowntime` | paired gateways over the HA single-failure scenario, warm off vs on                    | failure-window behavior with parked connections   |
+| `BenchmarkWarmHA_ConcurrentDowntime`  | paired gateways over the concurrent-failure scenario, warm off vs on                   | discard/fallback when half the pool dies          |
 
 The gap between `Direct` and `Proxied` small GET is the full per-request cost
 of one gateway hop plus one SOCKS5 hop: the per-tunnel inbound and outbound
@@ -97,6 +102,46 @@ go test ./e2e/ -run=NONE -bench=HA -benchmem -count=5 > /tmp/ha-before.txt
 One scenario window is several seconds long, so each HA benchmark takes
 roughly (count × iterations × window) wall-clock; keep that in mind when
 raising `-count`.
+
+## Cold vs warm A/B
+
+The `BenchmarkWarmAB_*` set (warmab_test.go) and `BenchmarkWarmHA_*` set
+(warmha_test.go) are **paired**: one iteration runs the identical scenario
+against two fresh gateways — `warm-pool.enabled: false` (control, reported
+under `cold_`) and `true` (candidate, under `warm_`) — inside the same
+process, back to back, so machine drift lands on both sides of the pair.
+benchstat over `-count` runs then reads each `cold_*`/`warm_*` column pair.
+
+The upstream latency is the scenario axis (`rtt=0s/10ms/30ms`
+sub-benchmarks): the sims delay every SOCKS5 reply by that amount, shaping
+the upstream as a remote endpoint whose greeting and CONNECT each cost one
+network round trip — exactly the setup a parked half-handshake removes. At
+`rtt=0s` upstream setup is nearly free loopback, the hardest case for any
+warm pool.
+
+`warm_borrow_ratio` (borrowed ÷ successful ops) proves which path actually
+served: near 1.0 means the pool kept up with consumption (borrow wakes the
+replenisher); a low value means the window fell back to cold dials — an
+honest measurement of a pool outpaced, not a broken benchmark.
+
+```bash
+# /tmp on this class of machine can be a small tmpfs; the e2e binary build
+# needs real space — point TMPDIR at the root filesystem when in doubt.
+TMPDIR=~/.tmp-bench go test ./e2e/ -run=NONE -bench='WarmAB|WarmHA' -count=5 \
+  | tee /tmp/warmab.txt
+benchstat /tmp/warmab.txt
+```
+
+First measurement of the warm pool (i7-10700K, 2026-09-21, `count=5`
+medians, min-idle 2 / max-idle 4 per route): steady and setup-only p50/p95
+improve by **one upstream RTT** — 21.1→10.9ms at rtt=10ms (−48%), 61.3→31.1ms
+at rtt=30ms (−49%) — with borrow_ratio ≈ 1.0; at rtt=0s the win shrinks to
+~20% (0.38→0.30ms), the expected floor. Under a 32-worker burst the pool
+falls back cold (borrow_ratio 0.28–0.62) and the burst window tracks the
+control within noise, while the low-load phases around it keep the full
+steady-state win. Absolute numbers age; the **shape** is the reproducible
+claim: one RTT of upstream setup removed per borrow, zero regression when
+the pool is exhausted.
 
 ## Interpretation caveats — read before drawing conclusions
 

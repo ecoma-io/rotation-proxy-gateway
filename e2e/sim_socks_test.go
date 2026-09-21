@@ -54,6 +54,12 @@ type SocksSim struct {
 	// resolved.
 	TunnelTo string
 
+	// Latency, when positive, delays every protocol reply (greeting, auth,
+	// CONNECT) by this duration, modeling a remote endpoint's processing and
+	// network round trips instead of a free loopback hop. Benchmarks shape
+	// the upstream with it; functional tests leave it at zero.
+	Latency atomic.Int64
+
 	Hits atomic.Uint64
 
 	// Connected counts CONNECT requests read to the end: accepts minus
@@ -117,6 +123,14 @@ func (s *SocksSim) RouteValue() string {
 	return s.Addr
 }
 
+// delay holds the reply for the configured Latency, modeling endpoint
+// processing and network RTT on the leg the client is waiting on.
+func (s *SocksSim) delay() {
+	if d := time.Duration(s.Latency.Load()); d > 0 {
+		time.Sleep(d)
+	}
+}
+
 func (s *SocksSim) handle(conn net.Conn) {
 	s.Hits.Add(1)
 	s.Live.Add(1)
@@ -149,6 +163,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 			_, _ = conn.Write([]byte{0x05, 0xff})
 			return
 		}
+		s.delay()
 		if _, err := conn.Write([]byte{0x05, 0x02}); err != nil {
 			return
 		}
@@ -172,10 +187,12 @@ func (s *SocksSim) handle(conn net.Conn) {
 			_, _ = conn.Write([]byte{0x01, 0x01})
 			return
 		}
+		s.delay()
 		if _, err := conn.Write([]byte{0x01, 0x00}); err != nil {
 			return
 		}
 	} else {
+		s.delay()
 		if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
 			return
 		}
@@ -251,6 +268,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 		return
 	}
 	defer func() { _ = up.Close() }()
+	s.delay()
 	if _, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
 		return
 	}

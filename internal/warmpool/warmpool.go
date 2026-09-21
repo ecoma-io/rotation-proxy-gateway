@@ -84,8 +84,16 @@ type Pool struct {
 	started bool
 	workers int
 
-	// wake coalesces replenish wakeups (capacity 1). Never closed.
-	wake chan struct{}
+	// wake coalesces replenish wakeups toward workers (capacity 1). Never
+	// closed. sweepWake is the request-path nudge to the sweeper: a borrow
+	// opened a deficit, so run a sweep pass now instead of at the next tick.
+	// Both are capacity 1 and never closed.
+	wake      chan struct{}
+	sweepWake chan struct{}
+
+	// sweepEvery is the level-triggered cadence; 1s in production, stretched
+	// by tests that must prove wakeups work without a tick landing by luck.
+	sweepEvery time.Duration
 
 	wg sync.WaitGroup
 
@@ -150,13 +158,15 @@ func New(store *pool.Store, log zerolog.Logger, dial DialHalfFunc) *Pool {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Pool{
-		store:   store,
-		log:     log,
-		dial:    dial,
-		ctx:     ctx,
-		cancel:  cancel,
-		buckets: map[*pool.Proxy]*routeBucket{},
-		wake:    make(chan struct{}, 1),
+		store:      store,
+		log:        log,
+		dial:       dial,
+		ctx:        ctx,
+		cancel:     cancel,
+		buckets:    map[*pool.Proxy]*routeBucket{},
+		wake:       make(chan struct{}, 1),
+		sweepWake:  make(chan struct{}, 1),
+		sweepEvery: sweepInterval,
 	}
 }
 
@@ -178,13 +188,16 @@ func (wp *Pool) Start() {
 
 func (wp *Pool) sweeper() {
 	defer wp.wg.Done()
-	ticker := time.NewTicker(sweepInterval)
+	// One immediate pass fills the pool at startup instead of one interval in.
+	wp.sweep()
+	ticker := time.NewTicker(wp.sweepEvery)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-wp.ctx.Done():
 			return
 		case <-ticker.C:
+		case <-wp.sweepWake:
 		}
 		wp.sweep()
 	}
@@ -324,6 +337,14 @@ func (wp *Pool) totalIdleLocked() int {
 func (wp *Pool) wakeNow() {
 	select {
 	case wp.wake <- struct{}{}:
+	default:
+	}
+}
+
+// nudgeSweep asks the sweeper for an immediate pass without blocking.
+func (wp *Pool) nudgeSweep() {
+	select {
+	case wp.sweepWake <- struct{}{}:
 	default:
 	}
 }
@@ -497,6 +518,10 @@ func (wp *Pool) Borrow(p *pool.Proxy) *socksdial.HalfConn {
 		return nil
 	}
 	wp.borrowed.Add(1)
+	// Handing one out opens a deficit; nudge the sweeper (non-blocking,
+	// coalesced) so steady consumption refills at consumption rate instead of
+	// waiting for the next tick.
+	wp.nudgeSweep()
 	return wc.hc
 }
 

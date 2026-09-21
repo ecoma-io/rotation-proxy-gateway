@@ -20,7 +20,7 @@ func warmEnabled() *WarmPoolConfig {
 }
 
 // warmStatus fetches the warm-pool view, failing when the section is absent.
-func warmStatus(t *testing.T, g *Gateway) *WarmView {
+func warmStatus(t testing.TB, g *Gateway) *WarmView {
 	t.Helper()
 	st, err := g.Status()
 	if err != nil {
@@ -33,7 +33,7 @@ func warmStatus(t *testing.T, g *Gateway) *WarmView {
 }
 
 // waitWarm polls until cond holds on the warm-pool view.
-func waitWarm(t *testing.T, g *Gateway, what string, cond func(*WarmView) bool, timeout time.Duration) *WarmView {
+func waitWarm(t testing.TB, g *Gateway, what string, cond func(*WarmView) bool, timeout time.Duration) *WarmView {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
