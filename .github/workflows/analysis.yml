@@ -30,6 +30,10 @@ on:
   # leaving that check pending forever rather than failing, which is a
   # block with nothing to fix.
   pull_request:
+  # Same reason as ci.yml: the merge queue's candidate ref fires
+  # merge_group, and without this trigger its analysis checks never start,
+  # leaving the queue entry pending forever.
+  merge_group:
   # One weekly cron covers every job in this workflow, which is a
   # consequence of the merge rather than a coincidence: a workflow's
   # schedule triggers each job in it, so two crons would mean each analysis

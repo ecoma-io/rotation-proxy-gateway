@@ -13,6 +13,12 @@ name: CI
 
 on:
   pull_request:
+  # The merge queue's candidate ref fires merge_group, not pull_request —
+  # without this trigger the queue's required checks never start on the
+  # candidate and the entry sits in AWAITING_CHECKS forever. The pr-title
+  # step self-skips on non-PR events (the squash title is already linted
+  # on the pull request itself), so every job stays green here.
+  merge_group:
   push:
     branches: [main]
   workflow_dispatch:
