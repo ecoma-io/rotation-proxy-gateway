@@ -109,8 +109,9 @@ func TestE2E_InvalidConfigKeepsServing(t *testing.T) {
 
 	// The old global: block is rejected on reload (the gateway removed the HTTP
 	// era's settings), as are the removed route weight and balance block,
-	// malformed YAML, duplicate routes, and an empty pool. The last-known-good
-	// config keeps serving through every rejection.
+	// malformed YAML, duplicate routes, an empty pool, and provider URLs that
+	// carry a scheme but no host. The last-known-good config keeps serving
+	// through every rejection.
 	cases := map[string]string{
 		"malformed yaml": "log-level: [unclosed\nmax-retries: nope\n",
 		"duplicate route": fmt.Sprintf(`log-level: info
@@ -169,6 +170,33 @@ proxies:
     - {proxy: '` + socks.RouteValue() + `', kind: v4}
   manual: []
 `,
+		// Scheme-only provider URLs pass url.Parse+IsAbs but can never dial;
+		// both are rejected with the last-known-good config still serving.
+		"scheme-only ip-check-url": `log-level: info
+max-retries: 3
+cooldown: {base: 5s, max: 1m}
+dial-timeout: 5s
+rotation:
+  ip-check-url: https://
+proxies:
+  auto:
+    - {proxy: '` + socks.RouteValue() + `', kind: v4}
+  manual: []
+`,
+		"scheme-only api url": fmt.Sprintf(`log-level: info
+max-retries: 3
+cooldown: {base: 5s, max: 1m}
+dial-timeout: 5s
+proxies:
+  auto:
+    - {proxy: '%s', kind: v4}
+  manual:
+    - proxy: '%s'
+      kind: v4
+      rotate-interval: 90s
+      api:
+        url: http://
+`, socks.RouteValue(), deadRouteValue(t)),
 	}
 	for name, raw := range cases {
 		t.Run(name, func(t *testing.T) {

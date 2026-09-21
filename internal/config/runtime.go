@@ -593,6 +593,12 @@ func (r RotationSettings) validate() error {
 		// The verification answer must resist tampering by the very network
 		// path under test, so plaintext check endpoints are rejected outright.
 		errs = append(errs, errors.New("rotation.ip-check-url must use https"))
+	case u.Hostname() == "":
+		// url.Parse accepts "https://" with an empty host, but such a URL is
+		// indistinguishable from a paste error and can only ever fail every
+		// probe — rejected here like validateProxyURL rejects a host-less
+		// route endpoint.
+		errs = append(errs, errors.New("rotation.ip-check-url must include a host"))
 	}
 	if r.DrainTimeout <= 0 {
 		errs = append(errs, fmt.Errorf("rotation.drain-timeout must be positive, got %s", r.DrainTimeout))
@@ -810,6 +816,13 @@ func parseRotateAPI(raw apiFileConfig) (RotateAPI, error) {
 	u, err := url.Parse(raw.URL)
 	if err != nil || !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") {
 		return RotateAPI{}, errors.New("api.url must be an absolute http or https URL")
+	}
+	if u.Hostname() == "" {
+		// url.Parse accepts "http://" with an empty host, but a host-less
+		// provider URL is indistinguishable from a paste error and would fail
+		// every rotate call forever — rejected like validateProxyURL's missing
+		// host.
+		return RotateAPI{}, errors.New("api.url must include a host")
 	}
 	method := http.MethodPost
 	if raw.Method != "" {
