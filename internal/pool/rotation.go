@@ -4,6 +4,7 @@
 package pool
 
 import (
+	"errors"
 	"time"
 
 	"rotation-proxy-gateway/internal/config"
@@ -50,6 +51,11 @@ func (p *Proxy) SetRotationPhase(phase RotationState) {
 // verified route is the least recently used and absorbs traffic first. Dial
 // health is left to MarkRotated. The flag clears under p.mu so SetRotationPhase's
 // guarded check cannot slip between the state write and the flag clear.
+//
+// The rotation engine must not call this directly with a candidate that only
+// an unlocked check cleared: it records unconditionally, so two procedures
+// that verified the same address could both commit it. CommitRotation is the
+// engine's seam — the collision check and this record as one section.
 func (p *Proxy) EndRotation(ip string, at time.Time) {
 	p.mu.Lock()
 	p.rotationState = RotationIdle
@@ -59,6 +65,37 @@ func (p *Proxy) EndRotation(ip string, at time.Time) {
 	p.consecutiveSameIP = 0
 	p.rotating.Store(false)
 	p.mu.Unlock()
+}
+
+// ErrRotationCollision reports that CommitRotation rejected a candidate egress
+// IP because another manual route already holds it as its current verified
+// address. Fixed text only: it flows into sanitized logs.
+var ErrRotationCollision = errors.New("egress IP collides with another manual route")
+
+// CommitRotation records ip as p's verified new egress IP and returns the
+// route to serving — unless another manual route in this pool already holds
+// the same address, in which case nothing is written and the caller treats
+// the candidate as rejected, not the rotation as failed. The collision scan
+// and the record are one critical section: two rotation procedures that
+// verified the same candidate concurrently cannot both commit it — the loser
+// observes the winner's address under the lock. Dial health stays with
+// MarkRotated, which the caller runs only after a successful commit.
+func (pl *Pool) CommitRotation(p *Proxy, ip string, at time.Time) error {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	for _, e := range pl.entries {
+		if e == p || e.Origin != config.RouteOriginManual {
+			continue
+		}
+		e.mu.Lock()
+		collides := e.lastIP != "" && e.lastIP == ip
+		e.mu.Unlock()
+		if collides {
+			return ErrRotationCollision
+		}
+	}
+	p.EndRotation(ip, at)
+	return nil
 }
 
 // MarkStale returns a route to serving after a rotation that did not change
