@@ -22,6 +22,7 @@ import (
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/sanitize"
 	"rotation-proxy-gateway/internal/socksdial"
+	"rotation-proxy-gateway/internal/warmpool"
 
 	"github.com/rs/zerolog"
 )
@@ -715,7 +716,7 @@ func (s *Server) CloseConns() int {
 
 // AdminMux serves the health and status endpoints for the admin listener.
 func (s *Server) AdminMux() *http.ServeMux {
-	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s}, nil)
+	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s}, nil, nil)
 }
 
 // AdminMux serves aggregate health/status for all proxy listener views sharing
@@ -724,7 +725,9 @@ func (s *Server) AdminMux() *http.ServeMux {
 // commands (protocol rejects never advance it) and failovers counts in-band
 // route fallbacks, distinct from rotations. The pool snapshot comes from the
 // current generation so /status changes atomically with serving behavior.
-func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64) *http.ServeMux {
+// warm, when non-nil, reports the warm-pool view (bounds, gauges, lifecycle
+// counters); it is omitted entirely when no warm pool backs the process.
+func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64, warm func() warmpool.Status) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -757,6 +760,9 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 		}
 		if rotations != nil {
 			status["rotations"] = rotations()
+		}
+		if warm != nil {
+			status["warmPool"] = warm()
 		}
 		_ = json.NewEncoder(w).Encode(status)
 	})

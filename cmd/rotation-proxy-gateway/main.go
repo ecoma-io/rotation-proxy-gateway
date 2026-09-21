@@ -22,6 +22,7 @@ import (
 	"rotation-proxy-gateway/internal/proxyserver"
 	"rotation-proxy-gateway/internal/rotation"
 	"rotation-proxy-gateway/internal/sanitize"
+	"rotation-proxy-gateway/internal/warmpool"
 
 	"github.com/rs/zerolog"
 )
@@ -131,6 +132,11 @@ func run() error {
 	// both origins; manual routes additionally carry rotation state.
 	store := pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.AllRoutes(), runtimeCfg.CooldownBase, runtimeCfg.CooldownMax, runtimeCfg.Balance))
 	engine := rotation.New(store, log)
+	// The warm pool is strictly background: it keeps half-established upstream
+	// connections ready without touching the serving path (nothing borrows
+	// from it yet) or route health. It follows config generations on its own;
+	// a disabled config parks it at zero idle connections.
+	warm := warmpool.New(store, log, nil)
 
 	listeners := make([]runningListener, 0, 3)
 	listenerViews := make(map[string]*proxyserver.Server, 3)
@@ -165,7 +171,7 @@ func run() error {
 
 	started := time.Now()
 	adminSrv := &http.Server{
-		Handler:           proxyserver.AdminMux(version, started, store, listenerViews, engine.Rotations),
+		Handler:           proxyserver.AdminMux(version, started, store, listenerViews, engine.Rotations, warm.Snapshot),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
@@ -205,6 +211,7 @@ func run() error {
 	engineCtx, engineCancel := context.WithCancel(context.Background())
 	defer engineCancel()
 	go engine.Run(engineCtx)
+	warm.Start()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -232,11 +239,11 @@ func run() error {
 	for {
 		select {
 		case err := <-errCh:
-			shutdownAll(log, engineCancel, listeners, adminSrv, bootstrap.ShutdownGrace)
+			shutdownAll(log, engineCancel, warm.Stop, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return err
 		case sig := <-sigCh:
 			log.Info().Str("signal", sig.String()).Str("grace", bootstrap.ShutdownGrace.String()).Msg("shutting down")
-			shutdownAll(log, engineCancel, listeners, adminSrv, bootstrap.ShutdownGrace)
+			shutdownAll(log, engineCancel, warm.Stop, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return nil
 		case <-poller.Changes():
 			// The poller hash-gates on applied content, so one signal means one
@@ -258,9 +265,14 @@ func run() error {
 // forceCloseWait, 1s) times the three listeners, plus the admin shutdown —
 // with the default 55s grace that is ~58s, and the surrounding orchestrator's
 // kill timer (compose stop_grace_period: 60s) must stay above it.
-func shutdownAll(log zerolog.Logger, engineCancel context.CancelFunc, listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
+func shutdownAll(log zerolog.Logger, engineCancel context.CancelFunc, warmStop func(), listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
 	engineCancel()
 	log.Debug().Msg("rotation engine canceled")
+	// The warm pool stops next: its parked upstream connections close within
+	// a bounded wait, before listener drain, so its sockets never outlive the
+	// sessions they exist to accelerate.
+	warmStop()
+	log.Debug().Msg("warm pool stopped")
 	ctx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
 	start := time.Now()
