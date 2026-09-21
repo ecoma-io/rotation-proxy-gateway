@@ -7,6 +7,7 @@ package proxyserver
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
 	"encoding/json"
@@ -65,10 +66,22 @@ const (
 var errInboundAuth = errors.New("inbound authentication rejected")
 
 // inboundAccount is the RFC 1929 credential pair a server demands from every
-// client. A nil pointer keeps the historical NO AUTHENTICATION handshake.
+// client, held as SHA-256 digests of the configured fields: hashing the
+// configured pair once keeps the per-session cost at hashing the presented
+// fields, and the fixed digest length keeps the configured field lengths out
+// of the comparison. A nil pointer keeps the historical NO AUTHENTICATION
+// handshake.
 type inboundAccount struct {
-	username []byte
-	password []byte
+	usernameSum [sha256.Size]byte
+	passwordSum [sha256.Size]byte
+}
+
+// newInboundAccount reduces one configured credential pair to its digest form.
+func newInboundAccount(username, password []byte) *inboundAccount {
+	return &inboundAccount{
+		usernameSum: sha256.Sum256(username),
+		passwordSum: sha256.Sum256(password),
+	}
 }
 
 // WarmBorrower is the serving path's window into the warm pool. Borrow is a
@@ -263,10 +276,10 @@ func (s *Server) UseWarmPool(w WarmBorrower) {
 
 // UseInboundAccount arms mandatory RFC 1929 username/password authentication
 // for every session on this listener. It must be called before Serve;
-// afterwards the field is read-only. The slices are retained as-is, so the
-// caller must not mutate them afterwards.
+// afterwards the field is read-only. The configured pair is reduced to
+// digests immediately, so the caller's slices are not retained.
 func (s *Server) UseInboundAccount(username, password []byte) {
-	s.account = &inboundAccount{username: username, password: password}
+	s.account = newInboundAccount(username, password)
 }
 
 // dialWarmFirst establishes the upstream tunnel for one attempt: a parked
@@ -674,11 +687,10 @@ func readUserPassAuth(br *bufio.Reader, w io.Writer, account *inboundAccount) er
 	if _, err := io.ReadFull(br, passwd); err != nil {
 		return fmt.Errorf("read auth password: %w", err)
 	}
-	// Constant-time on both fields: the handshake is the one place a timing
+	// Constant-time across the pair: the handshake is the one place a timing
 	// side channel would discriminate between a known-username/wrong-password
 	// guess and a wrong username.
-	if subtle.ConstantTimeCompare(uname, account.username) != 1 ||
-		subtle.ConstantTimeCompare(passwd, account.password) != 1 {
+	if !credentialsMatch(account, uname, passwd) {
 		w.Write([]byte{authUPVersion, authUPFailure}) //nolint:errcheck // the connection closes either way
 		return errInboundAuth
 	}
@@ -686,6 +698,22 @@ func readUserPassAuth(br *bufio.Reader, w io.Writer, account *inboundAccount) er
 		return fmt.Errorf("write auth reply: %w", err)
 	}
 	return nil
+}
+
+// credentialsMatch compares presented RFC 1929 credentials against the
+// configured account without leaking which field mismatched or either side's
+// field lengths. Every field is reduced to a fixed-length SHA-256 digest
+// first — subtle.ConstantTimeCompare returns immediately on a length
+// mismatch, so comparing the variable-length fields directly would expose the
+// configured lengths — and both comparisons always execute; their results are
+// combined with & and returned, so the caller branches once on the pair and a
+// wrong username can never skip the password comparison (and vice versa).
+func credentialsMatch(account *inboundAccount, username, password []byte) bool {
+	usernameSum := sha256.Sum256(username)
+	passwordSum := sha256.Sum256(password)
+	userOK := subtle.ConstantTimeCompare(usernameSum[:], account.usernameSum[:])
+	passOK := subtle.ConstantTimeCompare(passwordSum[:], account.passwordSum[:])
+	return userOK&passOK == 1
 }
 
 // socksTarget builds the request target from one inbound frame's address

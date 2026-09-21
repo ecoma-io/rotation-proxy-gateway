@@ -2,6 +2,8 @@ package proxyserver
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"io"
 	"net"
@@ -81,7 +83,7 @@ func authIngressRequest(t *testing.T, account *inboundAccount, greeting []byte, 
 	return nil, nil, socksRequest{}, nil
 }
 
-var testAccount = &inboundAccount{username: []byte("gw-user"), password: []byte("gw-pass")}
+var testAccount = newInboundAccount([]byte("gw-user"), []byte("gw-pass"))
 
 func connectFrame(t *testing.T, target string) []byte {
 	t.Helper()
@@ -204,6 +206,125 @@ func TestReadSocksRequestUserPassMalformedClosesSilently(t *testing.T) {
 			t.Fatalf("auth reply = %v, want none", authStatus)
 		}
 	})
+}
+
+// credentialsMatch is the pure comparison behind the RFC 1929 exchange: both
+// presented fields are digested to a fixed length and both constant-time
+// comparisons run before the combined result exists.
+func TestCredentialsMatch(t *testing.T) {
+	defaultAccount := newInboundAccount([]byte("gw-user"), []byte("gw-pass"))
+	for _, tc := range []struct {
+		name     string
+		account  *inboundAccount // nil runs against the default account
+		username string
+		password string
+		want     bool
+	}{
+		{name: "correct pair", username: "gw-user", password: "gw-pass", want: true},
+		{name: "wrong username only", username: "gw-use", password: "gw-pass", want: false},
+		{name: "wrong password only", username: "gw-user", password: "gw_pas", want: false},
+		{name: "both wrong", username: "other", password: "other", want: false},
+		{name: "username shorter", username: "gw", password: "gw-pass", want: false},
+		{name: "username empty", username: "", password: "gw-pass", want: false},
+		// The length-leak case: a 255-byte presented username must fail exactly
+		// like any other mismatch, never along a different code path.
+		{name: "username much longer", username: strings.Repeat("u", 255), password: "gw-pass", want: false},
+		{name: "password shorter", username: "gw-user", password: "gw", want: false},
+		{name: "password empty", username: "gw-user", password: "", want: false},
+		{name: "password longer", username: "gw-user", password: strings.Repeat("p", 255), want: false},
+		{
+			name:     "colons in the configured password, correct pair",
+			account:  newInboundAccount([]byte("gw-user"), []byte("se:cr:et:pa:ss")),
+			username: "gw-user",
+			password: "se:cr:et:pa:ss",
+			want:     true,
+		},
+		{
+			name:     "colons in the configured password, truncated at a colon",
+			account:  newInboundAccount([]byte("gw-user"), []byte("se:cr:et:pa:ss")),
+			username: "gw-user",
+			password: "se:cr:et",
+			want:     false,
+		},
+		{
+			name:     "unicode bytes, correct pair",
+			account:  newInboundAccount([]byte("gw-usër"), []byte("pässwörd✓")),
+			username: "gw-usër",
+			password: "pässwörd✓",
+			want:     true,
+		},
+		{
+			// Ë and ✓/✗ are multi-byte: same byte lengths as the configured
+			// fields, entirely different bytes.
+			name:     "unicode bytes, same byte length different bytes",
+			account:  newInboundAccount([]byte("gw-usër"), []byte("pässwörd✓")),
+			username: "gw-usËr",
+			password: "pässwörd✗",
+			want:     false,
+		},
+		{
+			// A zero-byte password is a legal configured pair (RFC 1929 allows
+			// 0-255) and must match only its empty presentation.
+			name:     "empty configured password, empty presented",
+			account:  newInboundAccount([]byte("gw-user"), []byte("")),
+			username: "gw-user",
+			password: "",
+			want:     true,
+		},
+		{
+			name:     "empty configured password, nonempty presented",
+			account:  newInboundAccount([]byte("gw-user"), []byte("")),
+			username: "gw-user",
+			password: "x",
+			want:     false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			acct := tc.account
+			if acct == nil {
+				acct = defaultAccount
+			}
+			if got := credentialsMatch(acct, []byte(tc.username), []byte(tc.password)); got != tc.want {
+				t.Fatalf("credentialsMatch(%q, %q) = %v, want %v", tc.username, tc.password, got, tc.want)
+			}
+		})
+	}
+}
+
+// The comparison must stay unconditional across the pair: credentialsMatch
+// digests both presented fields and runs both constant-time comparisons before
+// any branch exists, so the only quantity the exchange can observe is the
+// combined result. This table pins that combined result for every mismatch
+// combination against independently computed per-field digest comparisons; a
+// regression that swaps a field's digest, inverts the combination, or drops a
+// comparison's contribution from the result fails here.
+func TestCredentialsMatchCombinedResult(t *testing.T) {
+	account := newInboundAccount([]byte("gw-user"), []byte("gw-pass"))
+	usernames := []string{
+		"gw-user",                // correct
+		"gw-User",                // wrong, same length
+		"gw",                     // wrong, shorter
+		"",                       // wrong, empty
+		strings.Repeat("u", 255), // wrong, much longer
+	}
+	passwords := []string{
+		"gw-pass",                // correct
+		"gw-Pass",                // wrong, same length
+		"gw",                     // wrong, shorter
+		"",                       // wrong, empty
+		strings.Repeat("p", 255), // wrong, longer
+	}
+	for _, username := range usernames {
+		for _, password := range passwords {
+			userSum := sha256.Sum256([]byte(username))
+			passSum := sha256.Sum256([]byte(password))
+			userOK := subtle.ConstantTimeCompare(userSum[:], account.usernameSum[:]) == 1
+			passOK := subtle.ConstantTimeCompare(passSum[:], account.passwordSum[:]) == 1
+			if want := userOK && passOK; want != credentialsMatch(account, []byte(username), []byte(password)) {
+				t.Errorf("credentialsMatch(%q, %q): want the combined result %v", username, password, want)
+			}
+		}
+	}
 }
 
 // authConnectReply performs the full account-gated handshake against a live
