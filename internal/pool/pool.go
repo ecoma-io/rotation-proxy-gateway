@@ -54,6 +54,12 @@ type Proxy struct {
 	cooldownUntil atomic.Int64 // dial cooldown deadline, relNanos; 0 = none
 	authBlocked   atomic.Bool
 	rotating      atomic.Bool
+	// rotationEpoch is the route's rotation generation counter: it advances
+	// exactly when a rotation procedure begins (BeginRotation), so state
+	// stamped with an older epoch — a parked upstream connection — provably
+	// predates the route's next verified egress IP and can never be reused
+	// across a rotation, whatever way the procedure ends.
+	rotationEpoch atomic.Uint64
 
 	// Pair-scoped cooldown state: (route, target) refusals recorded by
 	// ReportTargetFailure — an upstream that answered CONNECT itself with a
@@ -232,6 +238,27 @@ func (p *Proxy) availableAt(nowNano int64) bool {
 func (p *Proxy) cooldownNano() int64 { return p.cooldownUntil.Load() }
 
 func (p *Proxy) authBlockedNow() bool { return p.authBlocked.Load() }
+
+// RotatingNow reports whether a rotation procedure currently holds the route
+// out of picks.
+func (p *Proxy) RotatingNow() bool { return p.rotating.Load() }
+
+// AuthBlockedNow reports whether the route is hard-blocked for failed
+// upstream authentication.
+func (p *Proxy) AuthBlockedNow() bool { return p.authBlocked.Load() }
+
+// CooldownActive reports whether a dial cooldown still holds the route out of
+// ordinary picks, on the same monotonic clock the pick path uses. The
+// rotating and auth-blocked states are deliberately not folded in: callers
+// gate those separately.
+func (p *Proxy) CooldownActive() bool {
+	cu := p.cooldownUntil.Load()
+	return cu != 0 && relNanos(time.Now()) < cu
+}
+
+// RotationEpoch returns the route's rotation generation counter; see the
+// field comment for the stamping contract.
+func (p *Proxy) RotationEpoch() uint64 { return p.rotationEpoch.Load() }
 
 func (p *Proxy) recencyPass() uint64 { return p.pass.Load() }
 
@@ -610,6 +637,18 @@ func (pl *Pool) Size() int {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
 	return len(pl.entries)
+}
+
+// RoutePointers returns the pool's current route entries, keyed by pointer
+// identity: Reconfigure keeps the same *Proxy for an unchanged URL+kind+origin,
+// so a consumer that keys its own state by *Proxy survives reloads exactly as
+// long as the route itself does. It takes pl.mu — callers holding the pool
+// lock must not call it, and collectors should gather this set before
+// acquiring their own locks so the two never nest.
+func (pl *Pool) RoutePointers() []*Proxy {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	return append([]*Proxy(nil), pl.entries...)
 }
 
 // CountAllowed reports how many routes pass the allow filter — the asking

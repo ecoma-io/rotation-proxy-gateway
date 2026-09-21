@@ -13,8 +13,17 @@ import (
 // first phase of its rotation procedure. The route stays out of picks until
 // EndRotation or MarkStale returns it to serving; in-flight requests picked
 // before BeginRotation keep running and drain on their own.
+//
+// It is also the only writer of the rotation epoch, advanced after the
+// rotating flag is set: anything stamped with an older epoch was established
+// before this procedure began and — however the procedure ends — predates the
+// route's next verified egress IP. The flag-then-epoch order means a reader
+// that still sees rotating == false also still sees the old epoch, so nothing
+// can start through the beginning of a rotation and validate as the new
+// generation.
 func (p *Proxy) BeginRotation(phase RotationState) {
 	p.rotating.Store(true)
+	p.rotationEpoch.Add(1)
 	p.mu.Lock()
 	p.rotationState = phase
 	p.nextRetryIn = 0

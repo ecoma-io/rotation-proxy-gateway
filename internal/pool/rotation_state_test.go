@@ -154,6 +154,87 @@ func TestRotationLifecycleTransitions(t *testing.T) {
 	}
 }
 
+// TestRotationEpochAdvancesOnlyAtBegin pins the warm-pool isolation contract:
+// the epoch moves exactly once per procedure, at BeginRotation, and no
+// terminal transition (EndRotation, MarkStale, AbandonRotation) touches it —
+// state stamped with the old epoch stays invalid even when the procedure ends
+// without changing the egress IP.
+func TestRotationEpochAdvancesOnlyAtBegin(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := newManualPool(t, c, "socks5://m1:1", "socks5://m2:2")
+	p := pl.entries[0]
+	other := pl.entries[1]
+
+	if got := p.RotationEpoch(); got != 0 {
+		t.Fatalf("fresh route epoch = %d, want 0", got)
+	}
+	p.BeginRotation(RotationDraining)
+	first := p.RotationEpoch()
+	if first != 1 {
+		t.Fatalf("epoch after first BeginRotation = %d, want 1", first)
+	}
+	if got := other.RotationEpoch(); got != 0 {
+		t.Fatalf("unrelated route epoch moved: %d", got)
+	}
+
+	// Phases, terminal transitions, and a later procedure's begin: only the
+	// begin advances the counter.
+	p.SetRotationPhase(RotationRotating)
+	p.EndRotation("203.0.113.9", c.now)
+	if got := p.RotationEpoch(); got != first {
+		t.Fatalf("epoch after EndRotation = %d, want %d", got, first)
+	}
+	p.BeginRotation(RotationVerifying)
+	pl.MarkStale(p, time.Second, 1)
+	if got := p.RotationEpoch(); got != first+1 {
+		t.Fatalf("epoch after MarkStale = %d, want %d", got, first+1)
+	}
+	p.BeginRotation(RotationDraining)
+	p.AbandonRotation()
+	if got := p.RotationEpoch(); got != first+2 {
+		t.Fatalf("epoch after AbandonRotation = %d, want %d", got, first+2)
+	}
+}
+
+// TestRotationPredicatesAndRoutePointers covers the narrow exported surface
+// background consumers read: the rotating/cooldown predicates and the
+// pointer-identity route enumeration. The clock is pinned past processStart
+// because CooldownActive reads the real clock while cooldown deadlines are
+// stored through the pool's injectable one; a future-pinned fake clock keeps
+// the two consistent (deadline still in the real future).
+func TestRotationPredicatesAndRoutePointers(t *testing.T) {
+	c := &clock{now: processStart.Add(time.Hour)}
+	pl := newManualPool(t, c, "socks5://m1:1", "socks5://m2:2")
+
+	pts := pl.RoutePointers()
+	if len(pts) != 2 || pts[0] != pl.entries[0] || pts[1] != pl.entries[1] {
+		t.Fatalf("RoutePointers = %v, want the pool's entries", pts)
+	}
+	pts[0] = nil // a copy: mutating it must not reach the pool
+	if pl.RoutePointers()[0] == nil {
+		t.Fatal("RoutePointers leaked the internal slice")
+	}
+
+	p := pl.entries[0]
+	if p.RotatingNow() || p.AuthBlockedNow() || p.CooldownActive() {
+		t.Fatal("fresh route reports rotating/auth-blocked/cooling")
+	}
+	p.BeginRotation(RotationDraining)
+	if !p.RotatingNow() {
+		t.Fatal("route mid-rotation does not report rotating")
+	}
+	p.EndRotation("203.0.113.9", c.now)
+
+	pl.ReportFailure(p, nil)
+	if !p.CooldownActive() {
+		t.Fatal("route after a reported failure does not report cooling")
+	}
+	p.MarkRotated()
+	if p.CooldownActive() {
+		t.Fatal("route after MarkRotated still cooling")
+	}
+}
+
 func TestMarkStaleRecordsRetryAndDeprioritizes(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newManualPool(t, c, "socks5://m1:1", "socks5://m2:2")
