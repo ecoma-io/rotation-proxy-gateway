@@ -50,6 +50,7 @@ Environment variables are bootstrap-only and require restart:
 | `RPGW_V4_LISTEN_ADDR`    |        `:30122` | IPv4-egress-only SOCKS5 listener                        |
 | `RPGW_V6_LISTEN_ADDR`    |        `:30123` | IPv6-egress-only SOCKS5 listener                        |
 | `RPGW_SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown         |
+| `RPGW_ACCOUNT`           |         _unset_ | Require RFC 1929 auth on proxy listeners                |
 
 Empty proxy listener addresses disable their listener, but at least one proxy
 listener must remain enabled. All enabled addresses must be valid host:port
@@ -127,16 +128,24 @@ Read [`README.md`](README.md) before changing failure classification.
   one family is valid: mixed uses it, while a dedicated listener without a
   matching route remains live and replies `05 01` (general failure) on
   `no_route`.
-- Inbound protocol is SOCKS5 (RFC 1928). Only NO AUTHENTICATION REQUIRED is
-  accepted; a client offering no `0x00` method gets `05 ff`. Only `CONNECT` is
+- Inbound protocol is SOCKS5 (RFC 1928). Without `RPGW_ACCOUNT`, only NO
+  AUTHENTICATION REQUIRED is accepted; a client offering no `0x00` method
+  gets `05 ff`. With `RPGW_ACCOUNT=username:password` set, every proxy
+  listener requires RFC 1929 username/password auth: negotiation selects
+  `0x02` when offered — a greeting without `0x02`, `0x00`-only included, gets
+  `05 ff` — wrong credentials get the RFC 1929 failure reply and a close, and
+  a malformed auth frame closes without a reply; the comparison is
+  constant-time, auth failures are pre-selection local errors that never
+  advance `requests` nor touch route health. Only `CONNECT` is
   supported; `BIND` and `UDP ASSOCIATE` get `05 07`. Success replies `05 00`
   with a zero BND.ADDR/BND.PORT that clients must ignore. Malformed or
   truncated frames close without a reply. Domain targets are forwarded as
   names: DNS happens at the outbound route (socks5h), never in the gateway. A
-  30s read deadline bounds the greeting/request exchange and is cleared once
-  the tunnel is established; established tunnels have no timeouts. One client
-  connection carries one tunnel; keep-alive/reuse is the client's choice.
-  Userinfo must never appear in logs, `/status`, errors, or responses.
+  30s read deadline bounds the greeting, the auth exchange, and the request,
+  and is cleared once the tunnel is established; established tunnels have no
+  timeouts. One client connection carries one tunnel; keep-alive/reuse is the
+  client's choice. Userinfo and the inbound account must never appear in
+  logs, `/status`, errors, or responses.
 - Logs contain process-local `request_id` and `listener`; `target` and
   `upstream` are host-only. `debug` shows flow, `info` terminal successes, and
   `warn` fallback/terminal failures. Established tunnels log a close record

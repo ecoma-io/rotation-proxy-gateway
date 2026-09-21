@@ -18,8 +18,6 @@ body:
         - Reintroducing an HTTP proxy inbound listener — the inbound protocol
           is SOCKS5 (RFC 1928) by design; the removed `global` block keys
           (`target-tls-insecure`, `max-body-buffer`) are not coming back.
-        - Inbound username/password authentication (RFC 1929) — only NO
-          AUTHENTICATION REQUIRED is accepted.
         - Manual reload triggers (SIGHUP, filesystem events) — the 1s
           content-hash poller is a design, not a gap; see README
           "Reload behavior" for the blind spot no watcher fixes.
