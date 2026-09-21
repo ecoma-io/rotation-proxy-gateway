@@ -9,8 +9,6 @@ services:
   rpgw:
     build:
       context: .
-      args:
-        VERSION: 0.1.0-dev
     container_name: rpgw
     ports:
       - "30121:30121" # mixed IPv4/IPv6 egress SOCKS5 listener
