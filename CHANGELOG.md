@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/ecoma-io/rotation-proxy-gateway/compare/v0.2.0...v0.3.0) (2026-09-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* prefix all bootstrap environment variables with RPGW_ ([#30](https://github.com/ecoma-io/rotation-proxy-gateway/issues/30))
+
+### Features
+
+* prefix all bootstrap environment variables with RPGW_ ([#30](https://github.com/ecoma-io/rotation-proxy-gateway/issues/30)) ([b853530](https://github.com/ecoma-io/rotation-proxy-gateway/commit/b8535307afa1358d31dd8ff39e370c07e76ef6c7)), closes [#29](https://github.com/ecoma-io/rotation-proxy-gateway/issues/29)
+* **proxyserver:** require inbound RFC 1929 auth when RPGW_ACCOUNT is set ([#33](https://github.com/ecoma-io/rotation-proxy-gateway/issues/33)) ([43c206d](https://github.com/ecoma-io/rotation-proxy-gateway/commit/43c206d7fc07a78aaba923c873d94e463dac5abc))
+
 ## [0.2.0](https://github.com/ecoma-io/rotation-proxy-gateway/compare/v0.1.0...v0.2.0) (2026-09-21)
 
 
