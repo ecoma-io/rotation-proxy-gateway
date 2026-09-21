@@ -57,7 +57,8 @@ addresses and must not overlap (including wildcard binds on the same port).
 
 Runtime settings and active routes live only in `config.yaml`:
 `log-level`, `max-retries`, `cooldown`, `dial-timeout`, `proxies.auto`,
-`proxies.manual`, and the `rotation` block. The process polls the file each
+`proxies.manual`, the `rotation` block, and the optional `balance` and
+`warm-pool` blocks. The process polls the file each
 second and reloads when its content hash changes, so in-place edits and atomic
 replacements both reload under any mount style. A failed parse/validation
 leaves the last-known-good pool and runtime settings serving. Do not add a
@@ -106,6 +107,19 @@ Read [`README.md`](README.md) before changing failure classification.
   malformed target content, cancellation, and broken tunnel—and local inbound
   request errors (malformed target encoding, oversized configured
   credentials, invalid target) do not alter health and are not retried.
+- The optional `warm-pool` block (default off) keeps bounded half-established
+  upstream connections — TCP + greeting + auth, never a target `CONNECT` —
+  that requests borrow before cold-dialing; a miss falls through cold and
+  never waits. The pool never writes route health (replenish pauses for
+  rotating, auth-blocked, or cooling routes), stamps parked connections with
+  the rotation epoch so a rotation closes the old generation, and keeps
+  failure classes identical: a refused `CONNECT` through a borrow stays
+  `connect_target` (pair-scoped); a dead borrowed transport discards its
+  siblings with no health report. Everything is bounded (per-route min/max
+  idle, global idle cap, replenish concurrency, backoff, idle TTL), and
+  reload-disable, route removal, and shutdown close parked connections.
+  Enable it where upstream RTT is real — see the warm A/B benchmarks in
+  `e2e/BENCH.md`.
 - The kind filter applies to ordinary LRU selection and all-cooling fallback;
   v4/v6 listeners must never leak into the other kind. A pool containing only
   one family is valid: mixed uses it, while a dedicated listener without a
@@ -185,7 +199,8 @@ binary `healthcheck` subcommand (no shell in the scratch image).
 - `internal/config` — bootstrap environment, Viper YAML validation, route parsing (auto + manual), rotation settings, content-hash change poller
 - `internal/pool` — LRU filtering, cooldown/auth state, in-flight work, rotation state, immutable generation snapshots
 - `internal/proxyserver` — inbound SOCKS5 (RFC 1928) server plus the admin mux
-- `internal/socksdial` — the shared SOCKS5 dialer used by the proxy server and the rotation probes
+- `internal/socksdial` — the shared SOCKS5 dialer used by the proxy server and the rotation probes; `DialHalf` parks a half-handshake (TCP + greeting + auth) the warm pool completes later with `CompleteConnect`
+- `internal/warmpool` — background pool of half-established upstream connections, bounded per route and process-wide, epoch-invalidated by rotation, borrowed on the serving path
 - `internal/rotation` — manual-route rotation engine: scheduling under the concurrency cap, drain, probes, rotate calls, verification, backoff
 - `cmd/rotation-proxy-gateway` — lifecycle, signals, watcher, admin endpoints
 - `e2e` — black-box tests and benchmarks driving the real binary as a
