@@ -55,10 +55,23 @@ func TestIngressAddressTypePreservedToEgress(t *testing.T) {
 		host     string
 		atyp     byte
 		wantAddr []byte
+		// wantHost is the address string the simulator renders from the
+		// egress frame; it differs from the ingress host only for the
+		// v4-mapped case, where Go's canonical rendering of the 16 bytes is
+		// the dotted quad. The wire contract is ATYP + DST.ADDR bytes.
+		wantHost string
 	}{
-		{"ipv4 frame stays ATYP 0x01", "198.51.100.7", 0x01, []byte{198, 51, 100, 7}},
-		{"ipv6 frame stays ATYP 0x04", "2001:db8::1", 0x04, append([]byte{0x20, 0x01, 0x0d, 0xb8}, append(make([]byte, 11), 0x01)...)},
-		{"domain frame stays ATYP 0x03", "example.test", 0x03, []byte("example.test")},
+		{"ipv4 frame stays ATYP 0x01", "198.51.100.7", 0x01, []byte{198, 51, 100, 7}, "198.51.100.7"},
+		{"ipv6 frame stays ATYP 0x04", "2001:db8::1", 0x04, append([]byte{0x20, 0x01, 0x0d, 0xb8}, append(make([]byte, 11), 0x01)...), "2001:db8::1"},
+		{"domain frame stays ATYP 0x03", "example.test", 0x03, []byte("example.test"), "example.test"},
+		// The two discriminating shapes: a frame whose address type
+		// disagrees with the host string's apparent family. For every
+		// agreeing frame above, a gateway that flattened the target back to
+		// a string and re-derived the type would emit byte-identical
+		// egress; only these catch a re-inference regression.
+		{"dotted-quad name stays ATYP 0x03", "198.51.100.7", 0x03, []byte("198.51.100.7"), "198.51.100.7"},
+		{"v4-mapped frame stays ATYP 0x04", "::ffff:198.51.100.7", 0x04, append(append(make([]byte, 10), 0xff, 0xff), 198, 51, 100, 7), "198.51.100.7"},
+		{"255-byte domain is carried whole", strings.Repeat("a", 255), 0x03, []byte(strings.Repeat("a", 255)), strings.Repeat("a", 255)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -66,7 +79,9 @@ func TestIngressAddressTypePreservedToEgress(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			conn, err := dialSocksTunnelFrame(context.Background(), gw.MixedAddr, frame)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			conn, err := dialSocksTunnelFrame(ctx, gw.MixedAddr, frame)
 			if err != nil {
 				t.Fatalf("tunnel: %v", err)
 			}
@@ -93,8 +108,8 @@ func TestIngressAddressTypePreservedToEgress(t *testing.T) {
 			if !bytes.Equal(rec.Addr, tc.wantAddr) {
 				t.Fatalf("egress DST.ADDR = %v, want %v", rec.Addr, tc.wantAddr)
 			}
-			if rec.Host != tc.host || rec.Port != 443 {
-				t.Fatalf("egress target = %q:%d, want %q:443", rec.Host, rec.Port, tc.host)
+			if rec.Host != tc.wantHost || rec.Port != 443 {
+				t.Fatalf("egress target = %q:%d, want %q:443", rec.Host, rec.Port, tc.wantHost)
 			}
 		})
 	}
@@ -154,14 +169,21 @@ func TestSchemedRouteLineRejectedKeepsServing(t *testing.T) {
 		{Proxy: other.Addr, Kind: "v4"},
 	})
 	gw.ReloadConfigRaw(renderConfig(cfg))
-	gw.WaitForCondition(reloadSettle, "a scheme rejection warning in the logs",
-		func(*Status) bool { return strings.Contains(gw.Logs(), "carry no scheme") })
+	gw.WaitForCondition(reloadSettle, "a rejected reload to keep the previous configuration serving",
+		func(*Status) bool {
+			return strings.Contains(gw.Logs(), "carry no scheme") &&
+				strings.Contains(gw.Logs(), "reload failed; keeping previous configuration")
+		})
 	st, err := gw.Status()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(st.Pool) != 2 {
 		t.Fatalf("pool after the rejected reload has %d routes, want the last-known-good 2", len(st.Pool))
+	}
+	if st.Pool[0].Proxy != sim.Addr || st.Pool[1].Proxy != other.Addr {
+		t.Fatalf("pool after the rejected reload = [%s, %s], want the last-known-good routes [%s, %s]",
+			st.Pool[0].Proxy, st.Pool[1].Proxy, sim.Addr, other.Addr)
 	}
 	if got := st.Pool[0].Successes; got != 1 {
 		t.Fatalf("successes after the rejected reload = %d, want the serving state preserved (1)", got)
