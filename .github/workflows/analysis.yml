@@ -93,10 +93,16 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
 
+      # Merge-queue refs are temporary: the queue can retire a candidate while
+      # its analysis is still running, making a SARIF upload to that ref fail.
+      # Keep the full build and query run required on the candidate, but do not
+      # upload results that cannot be safely associated with a retired ref.
+      # Normal pull-request and main-push runs still upload their results.
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
           category: "/language:${{ matrix.language }}"
+          upload: ${{ github.event_name == 'merge_group' && 'never' || 'always' }}
 
   semgrep:
     name: Semgrep
