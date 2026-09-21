@@ -153,6 +153,31 @@ operations): a borrowed connection from a dying route adds one
 discard-and-redial leg before the route-level fallback serves the request.
 Reported as observed; it is the one measured cost of borrowing.
 
+## Real-proxy probes
+
+`TestRealProxy_*` (realproxy_test.go) are opt-in measurements against a live
+config — skipped unless `RPGW_REAL_CONFIG` points at one — and never print
+route URLs or credentials (host:port identities only). The probe target is a
+dual-stack domain on 443 resolved at the upstream: an IPv4-literal or
+plain-80 target is refused by exactly the providers worth measuring.
+HandshakeRTT times the two outbound legs separately (the first leg is
+exactly what a borrow removes); ParkSurvival parks a half-established
+connection for 0–5 minutes and reports whether it is still completable —
+the curve that picks `idle-ttl` against a provider's real idle-kill window.
+
+```bash
+RPGW_REAL_CONFIG=./config.yaml go test ./e2e/ -run TestRealProxy -v \
+  -timeout 15m
+```
+
+First run (three provider routes, 2026-09-21): dial+greet+auth p50
+151–173 ms and CONNECT p50 93–98 ms — one borrow removes ~155 ms (~62 % of
+upstream setup) on real remote providers, several times the simulated
+10–30 ms axis. Idle survival: two of three routes killed a parked
+connection by 45 s, the third by 90 s — `idle-ttl` should sit under the
+observed kill floor (30 s for those providers; the kill may be the
+provider's or a middlebox's, the remedy is the same).
+
 ## Interpretation caveats — read before drawing conclusions
 
 - The setup-latency benchmarks (`SmallGET`, `SmallGETParallel`, `TunnelSetup`)
