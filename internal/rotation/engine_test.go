@@ -1046,6 +1046,59 @@ func TestProcedureAbortsMidFlightWhenReloadRemovesRoute(t *testing.T) {
 	}
 }
 
+// TestProcedureAbortsWhenRemovedDuringRotateCall parks a procedure inside
+// its rotate API call, publishes a reload that removes the route, and only
+// then releases the call. The rotate-API→verify boundary is a phase boundary
+// and must be a checkpoint: the procedure stops there, so not one verify
+// probe runs through the removed route's endpoint — the ip-check server's
+// hit count stays at its baseline-probe count.
+func TestProcedureAbortsWhenRemovedDuringRotateCall(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	api := newAPIServer(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	})
+	spec := manualRoute(t, "m1.test", time.Minute, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.e.runProcedure(context.Background(), s.gen, spec,
+			s.pl.Lookup(routeID(spec.RouteSpec)), routeID(spec.RouteSpec))
+	}()
+	<-entered // the procedure is parked inside its rotate API call
+	baselineHits := ips.hits.Load()
+	if baselineHits != 1 {
+		t.Fatalf("baseline probe hits = %d, want exactly one before the rotate call", baselineHits)
+	}
+
+	// The reload removes the route while the provider call is in flight.
+	s.e.store.Publish(&config.RuntimeConfig{Rotation: fastSettings()})
+	close(release)
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("procedure kept running after the route was removed")
+	}
+	if got := ips.hits.Load(); got != baselineHits {
+		t.Fatalf("ip-check hits after removal = %d, want %d (no verify probes ran)", got, baselineHits)
+	}
+	if got := s.e.Rotations(); got != 0 {
+		t.Fatalf("Rotations = %d, want 0 for an abandoned procedure", got)
+	}
+	st := snapshotHost(t, s.pl, "m1.test")
+	if st.Rotation.State != "idle" || st.Rotation.LastIP != "" {
+		t.Fatalf("abandoned procedure recorded an outcome: %+v", st.Rotation)
+	}
+}
+
 func waitRotationState(t *testing.T, pl *pool.Pool, host, state string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -1160,9 +1213,8 @@ func TestReloadRemoveReaddOverlapKeepsCapHonest(t *testing.T) {
 	}
 	waitUntil(t, "procedure #2 parked in the rotate call", func() bool { return inFlight.Load() == 2 })
 
-	// The provider moves the IP, so the released stale procedure's verify
-	// succeeds immediately and it reaches the gone() checkpoint without
-	// waiting out the IP-check window.
+	// The released stale procedure stops at the post-API gone() checkpoint —
+	// before any verify probe of the removed route's endpoint.
 	ips.set("198.51.100.9")
 	release <- struct{}{}
 	<-done1

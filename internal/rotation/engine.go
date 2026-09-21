@@ -297,6 +297,13 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 
 	// 3. Call the provider rotate API, directly — never through the pool.
 	retryAfter, apiErr := e.callRotateAPI(ctx, spec.API)
+	// The provider call can sit in flight for its whole timeout; a reload
+	// that removed or replaced the route meanwhile is caught here, at the
+	// phase boundary, instead of after a verify window of probes through the
+	// removed route's endpoint.
+	if gone() {
+		return true
+	}
 
 	// 4. Verify: the egress IP must actually have changed. Carriers can hand
 	// back the same address, which does not count as a rotation. A candidate
