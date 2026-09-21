@@ -148,6 +148,9 @@ func run() error {
 		}
 		srv := proxyserver.NewRuntime(store, log, version, name, kinds...)
 		srv.UseWarmPool(warm)
+		if bootstrap.Account != nil {
+			srv.UseInboundAccount(bootstrap.Account.Username, bootstrap.Account.Password)
+		}
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			return fmt.Errorf("%s listener: %w", name, err)
