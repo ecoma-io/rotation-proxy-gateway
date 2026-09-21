@@ -79,7 +79,10 @@ capped at max):
   eligible for every other target. The pair's escalation streak is counted
   independently per target, so repeated refusals of one destination cap out
   at `cooldown.max` for that pair alone; a success through the pair clears
-  its cooldown and resets its streak, and touches no other pair.
+  its cooldown and resets its streak, and touches no other pair — and a
+  verified rotation of the route clears all its pair cooldowns at once,
+  because every tracked refusal was answered from the old egress IP
+  ([manual rotation routes](rotation.md)).
 
 Both scopes feed the all-cooling fallback: when every allowed route is cooling
 for the request's target under either scope, the fallback hands out the route

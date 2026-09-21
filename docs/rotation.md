@@ -96,10 +96,11 @@ Each attempt runs: **drain → baseline probe → rotate call → verify**.
 4. **Verify.** The gateway re-probes until `ip-check-timeout` elapses. The
    attempt **succeeds only if the reported IP differs from the baseline and is
    not the current IP of any other manual route** (a cross-route collision does
-   not count). Success records the new IP as the route's baseline, clears the
-   route-scope dial cooldown learned against the old IP — pair-scoped target
-   cooldowns are unaffected and lapse on their own deadlines — and never clears
-   an authentication block: credentials did not rotate with the IP.
+   not count). Success records the new IP as the route's baseline, clears both
+   dial-cooldown scopes learned against the old IP — the route-scope cooldown
+   and every pair-scoped (route, target) cooldown, whose refusals were answered
+   from the old address — and never clears an authentication block:
+   credentials did not rotate with the IP.
 
 **An unchanged IP is not a failure of the route.** The route returns to serving
 immediately in the `stale` state, and the gateway retries forever — the next

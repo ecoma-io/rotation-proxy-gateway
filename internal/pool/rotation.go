@@ -114,15 +114,18 @@ func (pl *Pool) MarkStale(p *Proxy, nextRetryIn time.Duration, consecutiveSameIP
 }
 
 // MarkRotated clears dial-failure health accumulated against the previous
-// egress IP: the cooldown and consecutive-failure count describe an address
-// the route no longer uses. Authentication blocks are deliberately unchanged —
-// credentials did not rotate with the IP.
+// egress IP: the route-scoped cooldown and consecutive-failure count, and
+// every (route, target) pair cooldown — the pair refusals were answered from
+// the old address too — all describe an address the route no longer uses.
+// Authentication blocks are deliberately unchanged — credentials did not
+// rotate with the IP.
 func (p *Proxy) MarkRotated() {
 	p.mu.Lock()
 	p.consecutiveFailures = 0
 	p.lastDialError = ""
 	p.mu.Unlock()
 	p.cooldownUntil.Store(0)
+	p.clearAllTargetCooldowns()
 }
 
 // AbandonRotation returns a route to serving when its rotation procedure is

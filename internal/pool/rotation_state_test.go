@@ -274,6 +274,60 @@ func TestMarkRotatedClearsDialHealthNotAuth(t *testing.T) {
 	}
 }
 
+// A completed rotation clears the pair-scoped cooldowns earned through the
+// old egress IP alongside the route-scoped one: the refusals were answered
+// from an address the route no longer serves from, so the pairs come back
+// immediately eligible with fresh escalation streaks. Credentials did not
+// rotate, so an auth block still survives.
+func TestMarkRotatedClearsPairCooldowns(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := newManualPool(t, c, "socks5://m1:1", "socks5://m2:2")
+	m1 := pl.entries[0]
+
+	// Two refused targets through the old egress IP, one escalated twice.
+	pairFail(pl, m1, "refused.test:443")
+	pairFail(pl, m1, "refused.test:443")
+	pairFail(pl, m1, "other.test:443")
+	if s := findStatus(t, pl.Snapshot(), "m1:1"); s.TargetCooldowns != 2 {
+		t.Fatalf("pair view before rotation = %+v", s)
+	}
+	// While the pairs cool, the refused target defers to the peer route.
+	if got := pl.PickFor(nil, nil, "refused.test:443"); got == nil || got.URL.Host != "m2:2" {
+		t.Fatalf("pick while pair cools = %v, want m2:2", got)
+	}
+
+	// Complete a rotation: route-scoped and pair-scoped cooldowns learned
+	// against the old IP clear together.
+	pl.ReportFailure(m1, nil)
+	m1.MarkRotated()
+	m1.EndRotation("203.0.113.9", c.now)
+
+	if cd := pl.CoolingFor(m1, "refused.test:443"); cd != 0 {
+		t.Fatalf("CoolingFor after rotation = %s, want the pair immediately eligible", cd)
+	}
+	if cd := pl.CoolingFor(m1, "other.test:443"); cd != 0 {
+		t.Fatalf("CoolingFor(sibling pair) after rotation = %s, want 0", cd)
+	}
+	if s := findStatus(t, pl.Snapshot(), "m1:1"); !s.Available || s.TargetCooldowns != 0 {
+		t.Fatalf("pair view after rotation = %+v", s)
+	}
+	// EndRotation leaves the freshly verified route least recently used, so it
+	// absorbs the next pick for the formerly refused target.
+	if got := pl.PickFor(nil, nil, "refused.test:443"); got == nil || got.URL.Host != "m1:1" {
+		t.Fatalf("pick after rotation = %v, want the rotated m1:1", got)
+	}
+	// The escalation streaks rotated away too: a fresh refusal starts at the base.
+	if cd := pairFail(pl, m1, "refused.test:443"); cd != 30*time.Second {
+		t.Fatalf("refusal after rotation = %s, want a fresh 30s streak", cd)
+	}
+
+	pl.ReportAuthBlocked(m1, errors.New("endpoint rejected credentials"))
+	m1.MarkRotated()
+	if !m1.AuthBlockedNow() {
+		t.Fatal("rotation cleared an auth block")
+	}
+}
+
 func TestReconfigureKeepsRotationStateForUnchangedIdentity(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	specs := []config.RouteSpec{manualSpec(t, "socks5://m1:1")}
