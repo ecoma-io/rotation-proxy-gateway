@@ -94,6 +94,22 @@ func TestPollerReadFailureKeepsBaseline(t *testing.T) {
 		}
 	}
 
+	// Content below is replaced atomically (tmp + rename). An in-place
+	// truncate+write leaves a readable empty window between the truncate and
+	// the write, and a tick landing inside it fires a second, legitimate
+	// change once the real content appears — the exactly-once guarantee this
+	// test asserts only holds across a reader-atomic transition.
+	replaceFile := func(content string) {
+		t.Helper()
+		tmp := path + ".tmp"
+		if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	// Put a directory where the file was: reads fail for any uid, simulating
 	// a hostile replace window lasting several ticks.
 	if err := os.Remove(path); err != nil {
@@ -109,15 +125,11 @@ func TestPollerReadFailureKeepsBaseline(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("a: 1\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	replaceFile("a: 1\n")
 	assertQuiet("restored unchanged", 60*time.Millisecond)
 
 	// A real content change still signals, exactly once.
-	if err := os.WriteFile(path, []byte("a: 2\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	replaceFile("a: 2\n")
 	select {
 	case <-p.Changes():
 	case <-time.After(2 * time.Second):
