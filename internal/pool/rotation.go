@@ -13,8 +13,17 @@ import (
 // first phase of its rotation procedure. The route stays out of picks until
 // EndRotation or MarkStale returns it to serving; in-flight requests picked
 // before BeginRotation keep running and drain on their own.
+//
+// It is also the only writer of the rotation epoch, advanced after the
+// rotating flag is set: anything stamped with an older epoch was established
+// before this procedure began and — however the procedure ends — predates the
+// route's next verified egress IP. The flag-then-epoch order means a reader
+// that still sees rotating == false also still sees the old epoch, so nothing
+// can start through the beginning of a rotation and validate as the new
+// generation.
 func (p *Proxy) BeginRotation(phase RotationState) {
 	p.rotating.Store(true)
+	p.rotationEpoch.Add(1)
 	p.mu.Lock()
 	p.rotationState = phase
 	p.nextRetryIn = 0
@@ -54,8 +63,8 @@ func (p *Proxy) EndRotation(ip string, at time.Time) {
 
 // MarkStale returns a route to serving after a rotation that did not change
 // its egress IP. It records the retry wait and the run of same-IP rotations,
-// and jumps the route to the weighted recency back so picks prefer fresher
-// routes until the next rotation attempt. The flag clears under p.mu, as in
+// and jumps the route to the recency back so picks prefer fresher routes
+// until the next rotation attempt. The flag clears under p.mu, as in
 // EndRotation.
 func (pl *Pool) MarkStale(p *Proxy, nextRetryIn time.Duration, consecutiveSameIP int) {
 	p.mu.Lock()

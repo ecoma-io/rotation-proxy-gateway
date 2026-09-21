@@ -111,7 +111,7 @@ func TestReconfigureRetainsCanonicalState(t *testing.T) {
 		"socks5://c.test:1080",
 		"socks5://b.test:1080",
 		"socks5://TEST-user:TEST-pass@a.test:1080",
-	), 30*time.Second, time.Minute, config.KindBalance{})
+	), 30*time.Second, time.Minute)
 	if len(next.entries) != 3 {
 		t.Fatalf("reconfigure len = %d, want 3", len(next.entries))
 	}
@@ -125,7 +125,7 @@ func TestReconfigureRetainsCanonicalState(t *testing.T) {
 		t.Fatalf("reconfigure lost state: %+v", snap)
 	}
 
-	changed := next.Reconfigure(mustRouteSpecs(t, "socks5://TEST-user:TEST-other@a.test:1080"), 30*time.Second, time.Minute, config.KindBalance{})
+	changed := next.Reconfigure(mustRouteSpecs(t, "socks5://TEST-user:TEST-other@a.test:1080"), 30*time.Second, time.Minute)
 	if len(changed.entries) != 1 || changed.entries[0] == oldA {
 		t.Fatal("changed credentials reused old route object, want fresh state")
 	}

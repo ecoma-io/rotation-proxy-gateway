@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -46,9 +47,49 @@ type SocksSim struct {
 	// other target tunnels normally, modeling a route that works but refuses
 	// one destination — the issue #5 incident shape.
 	RefuseHost string
+	// TunnelTo, when set, replaces the destination the tunnel is established
+	// to: the CONNECT request is still parsed and recorded exactly as
+	// received, but the sim dials this address instead. Address-type tests
+	// use it to send reserved names (example.test) that must be recorded, not
+	// resolved.
+	TunnelTo string
+
+	// Latency, when positive, delays every protocol reply (greeting, auth,
+	// CONNECT) by this duration, modeling a remote endpoint's processing and
+	// network round trips instead of a free loopback hop. Benchmarks shape
+	// the upstream with it; functional tests leave it at zero.
+	Latency atomic.Int64
 
 	Hits atomic.Uint64
+
+	// Connected counts CONNECT requests read to the end: accepts minus
+	// connected is the number of connections that stopped at the greeting,
+	// method, or auth phase — the shape a pre-CONNECT parked warm connection
+	// has while parked. Live is the current accepted-but-not-closed count.
+	Connected atomic.Uint64
+	Live      atomic.Int64
+
 	Addr string
+
+	mu   sync.Mutex
+	reqs []SocksConnectRecord
+}
+
+// SocksConnectRecord is the raw CONNECT request one tunnel carried. ATYP and
+// Addr are the wire bytes as received — the assertions of the address-type
+// preservation tests.
+type SocksConnectRecord struct {
+	ATYP byte
+	Addr []byte
+	Host string
+	Port int
+}
+
+// Connects returns every CONNECT request received so far, in order.
+func (s *SocksSim) Connects() []SocksConnectRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]SocksConnectRecord(nil), s.reqs...)
 }
 
 // NewSocksSim starts the simulator on 127.0.0.1:0.
@@ -72,17 +113,31 @@ func NewSocksSim(t testing.TB, mode SocksMode, user, pass string) *SocksSim {
 	return s
 }
 
-// RouteValue renders the config proxy line for this simulator.
+// RouteValue renders the config proxy line for this simulator: a bare
+// host:port when the simulator accepts no credentials, the bare
+// user:pass@host:port form when it demands them.
 func (s *SocksSim) RouteValue() string {
 	if s.User != "" {
-		return fmt.Sprintf("socks5://%s:%s@%s", s.User, s.Pass, s.Addr)
+		return fmt.Sprintf("%s:%s@%s", s.User, s.Pass, s.Addr)
 	}
-	return "socks5://" + s.Addr
+	return s.Addr
+}
+
+// delay holds the reply for the configured Latency, modeling endpoint
+// processing and network RTT on the leg the client is waiting on.
+func (s *SocksSim) delay() {
+	if d := time.Duration(s.Latency.Load()); d > 0 {
+		time.Sleep(d)
+	}
 }
 
 func (s *SocksSim) handle(conn net.Conn) {
-	defer func() { _ = conn.Close() }()
 	s.Hits.Add(1)
+	s.Live.Add(1)
+	defer func() {
+		s.Live.Add(-1)
+		_ = conn.Close()
+	}()
 	if s.Down.Load() {
 		return
 	}
@@ -108,6 +163,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 			_, _ = conn.Write([]byte{0x05, 0xff})
 			return
 		}
+		s.delay()
 		if _, err := conn.Write([]byte{0x05, 0x02}); err != nil {
 			return
 		}
@@ -131,10 +187,12 @@ func (s *SocksSim) handle(conn net.Conn) {
 			_, _ = conn.Write([]byte{0x01, 0x01})
 			return
 		}
+		s.delay()
 		if _, err := conn.Write([]byte{0x01, 0x00}); err != nil {
 			return
 		}
 	} else {
+		s.delay()
 		if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
 			return
 		}
@@ -144,6 +202,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 	if _, err := io.ReadFull(br, req); err != nil || req[0] != 0x05 || req[1] != 0x01 {
 		return
 	}
+	rec := SocksConnectRecord{ATYP: req[3]}
 	var host string
 	switch req[3] {
 	case 0x01:
@@ -151,6 +210,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 		if _, err := io.ReadFull(br, b); err != nil {
 			return
 		}
+		rec.Addr = append([]byte(nil), b...)
 		host = net.IP(b).String()
 	case 0x03:
 		n, err := br.ReadByte()
@@ -161,12 +221,14 @@ func (s *SocksSim) handle(conn net.Conn) {
 		if _, err := io.ReadFull(br, b); err != nil {
 			return
 		}
+		rec.Addr = append([]byte(nil), b...)
 		host = string(b)
 	case 0x04:
 		b := make([]byte, 16)
 		if _, err := io.ReadFull(br, b); err != nil {
 			return
 		}
+		rec.Addr = append([]byte(nil), b...)
 		host = net.IP(b).String()
 	default:
 		return
@@ -175,7 +237,16 @@ func (s *SocksSim) handle(conn net.Conn) {
 	if _, err := io.ReadFull(br, portBytes); err != nil {
 		return
 	}
-	target := net.JoinHostPort(host, strconv.Itoa(int(portBytes[0])<<8|int(portBytes[1])))
+	rec.Host = host
+	rec.Port = int(portBytes[0])<<8 | int(portBytes[1])
+	s.mu.Lock()
+	s.reqs = append(s.reqs, rec)
+	s.mu.Unlock()
+	target := net.JoinHostPort(host, strconv.Itoa(rec.Port))
+	if s.TunnelTo != "" {
+		target = s.TunnelTo
+	}
+	s.Connected.Add(1)
 
 	if s.Mode == SocksRejectTarget {
 		refuse := true
@@ -197,6 +268,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 		return
 	}
 	defer func() { _ = up.Close() }()
+	s.delay()
 	if _, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
 		return
 	}

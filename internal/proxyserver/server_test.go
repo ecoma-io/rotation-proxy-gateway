@@ -22,6 +22,7 @@ import (
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/logging"
 	"rotation-proxy-gateway/internal/pool"
+	"rotation-proxy-gateway/internal/socksdial"
 
 	"github.com/rs/zerolog"
 )
@@ -221,6 +222,19 @@ func socksRequestFrame(cmd byte, target string) ([]byte, error) {
 // the code: callers decide what a test expects.
 func socksConnectReply(t *testing.T, gatewayAddr, target string, cmd byte) (net.Conn, byte) {
 	t.Helper()
+	frame, err := socksRequestFrame(cmd, target)
+	if err != nil {
+		t.Fatalf("encode request for %s: %v", target, err)
+	}
+	return socksConnectReplyFrame(t, gatewayAddr, frame)
+}
+
+// socksConnectReplyFrame performs the greeting exchange, sends frame verbatim
+// as the CONNECT request, and returns the tunnel plus the reply code. Tests
+// that must control the frame's address type exactly (a frame whose ATYP
+// disagrees with the host string's apparent family) go through here.
+func socksConnectReplyFrame(t *testing.T, gatewayAddr string, frame []byte) (net.Conn, byte) {
+	t.Helper()
 	conn, err := net.Dial("tcp", gatewayAddr)
 	if err != nil {
 		t.Fatalf("dial gateway %s: %v", gatewayAddr, err)
@@ -237,10 +251,6 @@ func socksConnectReply(t *testing.T, gatewayAddr, target string, cmd byte) (net.
 	if method[0] != socksVersion || method[1] != socksAuthNone {
 		t.Fatalf("method selection = %#02x %#02x, want 05 00", method[0], method[1])
 	}
-	frame, err := socksRequestFrame(cmd, target)
-	if err != nil {
-		t.Fatalf("encode request for %s: %v", target, err)
-	}
 	if _, err := conn.Write(frame); err != nil {
 		t.Fatalf("write request: %v", err)
 	}
@@ -254,6 +264,38 @@ func socksConnectReply(t *testing.T, gatewayAddr, target string, cmd byte) (net.
 	// Established tunnels carry no timeouts.
 	_ = conn.SetDeadline(time.Time{})
 	return conn, reply[1]
+}
+
+// socksRequestFrameWithATYP renders a CONNECT request carrying exactly atyp,
+// whatever the host string looks like — the ingress-side twin of the e2e
+// suite's socksConnectFrameWithATYP.
+func socksRequestFrameWithATYP(cmd byte, host string, port uint16, atyp byte) ([]byte, error) {
+	var addr []byte
+	switch atyp {
+	case socksAtypIPv4:
+		ip := net.ParseIP(host)
+		if ip == nil || ip.To4() == nil {
+			return nil, fmt.Errorf("host %q does not encode as IPv4", host)
+		}
+		addr = ip.To4()
+	case socksAtypDomain:
+		if len(host) == 0 || len(host) > 255 {
+			return nil, fmt.Errorf("target hostname length %d is invalid", len(host))
+		}
+		addr = append([]byte{byte(len(host))}, host...)
+	case socksAtypIPv6:
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return nil, fmt.Errorf("host %q does not encode as IPv6", host)
+		}
+		addr = ip.To16()
+	default:
+		return nil, fmt.Errorf("unsupported ATYP %#02x", atyp)
+	}
+	frame := make([]byte, 0, len(addr)+6)
+	frame = append(frame, socksVersion, cmd, 0x00, atyp)
+	frame = append(frame, addr...)
+	return append(frame, byte(port>>8), byte(port)), nil
 }
 
 // socksDialVia connects through the gateway to target and returns the tunnel
@@ -445,54 +487,101 @@ func startAbortTarget(t *testing.T) string {
 
 // --- protocol surface ------------------------------------------------------
 
+// ingressRequestFromFrame feeds frame to readSocksRequest through a complete
+// greeting exchange and returns the parsed request.
+func ingressRequestFromFrame(t *testing.T, frame []byte) socksRequest {
+	t.Helper()
+	serverSide, clientSide := net.Pipe()
+	defer func() { _ = serverSide.Close(); _ = clientSide.Close() }()
+	type outcome struct {
+		req socksRequest
+		err error
+	}
+	results := make(chan outcome, 1)
+	go func() {
+		req, err := readSocksRequest(bufio.NewReader(serverSide), serverSide)
+		results <- outcome{req: req, err: err}
+	}()
+	if _, err := clientSide.Write(socksGreetingFrame(socksAuthNone)); err != nil {
+		t.Fatal(err)
+	}
+	method := make([]byte, 2)
+	if _, err := io.ReadFull(clientSide, method); err != nil {
+		t.Fatalf("read method selection: %v", err)
+	}
+	if method[0] != socksVersion || method[1] != socksAuthNone {
+		t.Fatalf("method selection = %#02x %#02x, want 05 00", method[0], method[1])
+	}
+	if _, err := clientSide.Write(frame); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-results:
+		if got.err != nil {
+			t.Fatalf("readSocksRequest: %v", got.err)
+		}
+		return got.req
+	case <-time.After(time.Second):
+		t.Fatal("readSocksRequest did not finish")
+	}
+	return socksRequest{}
+}
+
 func TestReadSocksRequestAcceptsConnectTargets(t *testing.T) {
-	for _, tc := range []struct{ name, target string }{
-		{"ipv4", "127.0.0.1:8080"},
-		{"domain", "example.test:443"},
-		{"ipv6", "[2001:db8::1]:443"},
+	// The parsed request must carry the frame's own address type — the type
+	// the outbound CONNECT will reproduce, never re-inferred from the host.
+	for _, tc := range []struct {
+		name     string
+		target   string
+		wantType socksdial.AddrType
+	}{
+		{"ipv4", "127.0.0.1:8080", socksdial.AddrIPv4},
+		{"domain", "example.test:443", socksdial.AddrDomain},
+		{"ipv6", "[2001:db8::1]:443", socksdial.AddrIPv6},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			serverSide, clientSide := net.Pipe()
-			defer func() { _ = serverSide.Close(); _ = clientSide.Close() }()
-			type outcome struct {
-				req socksRequest
-				err error
-			}
-			results := make(chan outcome, 1)
-			go func() {
-				req, err := readSocksRequest(bufio.NewReader(serverSide), serverSide)
-				results <- outcome{req: req, err: err}
-			}()
-			if _, err := clientSide.Write(socksGreetingFrame(socksAuthNone)); err != nil {
-				t.Fatal(err)
-			}
-			method := make([]byte, 2)
-			if _, err := io.ReadFull(clientSide, method); err != nil {
-				t.Fatalf("read method selection: %v", err)
-			}
-			if method[0] != socksVersion || method[1] != socksAuthNone {
-				t.Fatalf("method selection = %#02x %#02x, want 05 00", method[0], method[1])
-			}
 			frame, err := socksRequestFrame(socksCmdConnect, tc.target)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := clientSide.Write(frame); err != nil {
-				t.Fatal(err)
+			req := ingressRequestFromFrame(t, frame)
+			if req.target.Addr() != tc.target || req.cmd != socksCmdConnect {
+				t.Fatalf("request = %+v, want target %q cmd CONNECT", req, tc.target)
 			}
-			select {
-			case got := <-results:
-				if got.err != nil {
-					t.Fatalf("readSocksRequest: %v", got.err)
-				}
-				if got.req.target != tc.target || got.req.cmd != socksCmdConnect {
-					t.Fatalf("request = %+v, want target %q cmd CONNECT", got.req, tc.target)
-				}
-			case <-time.After(time.Second):
-				t.Fatal("readSocksRequest did not finish")
+			if req.target.Type != tc.wantType {
+				t.Fatalf("target type = %d, want %d", req.target.Type, tc.wantType)
 			}
 		})
 	}
+}
+
+// The parser must keep the frame's own address type even when the host
+// string's apparent family disagrees — a domain frame whose name is a dotted
+// quad, and an IPv6 frame carrying v4-mapped bytes. These are the only
+// discriminating inputs: for agreeing frames, a type re-derived from the
+// string is byte-for-byte indistinguishable from the carried one, so a
+// regression to string-shape re-inference would pass every agreeing case.
+func TestReadSocksRequestKeepsFrameTypeOverHostShape(t *testing.T) {
+	t.Run("dotted-quad name stays a domain", func(t *testing.T) {
+		frame, err := socksRequestFrameWithATYP(socksCmdConnect, "1.2.3.4", 443, socksAtypDomain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := ingressRequestFromFrame(t, frame)
+		if req.target.Type != socksdial.AddrDomain || req.target.Host != "1.2.3.4" || req.target.Addr() != "1.2.3.4:443" {
+			t.Fatalf("request = %+v, want 1.2.3.4:443 kept as a domain target", req.target)
+		}
+	})
+	t.Run("v4-mapped bytes stay ipv6", func(t *testing.T) {
+		frame, err := socksRequestFrameWithATYP(socksCmdConnect, "::ffff:127.0.0.1", 443, socksAtypIPv6)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := ingressRequestFromFrame(t, frame)
+		if req.target.Type != socksdial.AddrIPv6 || req.target.Addr() != "127.0.0.1:443" {
+			t.Fatalf("request = %+v, want the v4-mapped bytes kept as an IPv6 target", req.target)
+		}
+	})
 }
 
 // A client may pipeline payload behind the CONNECT frame in one write. The
@@ -500,7 +589,7 @@ func TestReadSocksRequestAcceptsConnectTargets(t *testing.T) {
 // rather than being dropped with the handshake buffers.
 func TestPipelinedBytesAfterConnectReachRelay(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute)
 	_, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
 	target := startRawEchoTarget(t)
 
@@ -566,7 +655,7 @@ func (c *countingConn) Read(b []byte) (int, error) {
 // The field-by-field framing this replaced needed four reads (greeting head,
 // methods, request head, target) for the same burst.
 func TestInboundFramingReadBudget(t *testing.T) {
-	pl := pool.NewRoutes(nil, 30*time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(nil, 30*time.Second, time.Minute)
 	s := newRuntimeServer(pl, defaultRuntime(), testLogger())
 
 	// A real TCP socket, not net.Pipe: the pipe is synchronous, so a burst
@@ -623,14 +712,40 @@ func TestInboundFramingReadBudget(t *testing.T) {
 	}
 }
 
-func TestJoinSocksTarget(t *testing.T) {
-	got, err := joinSocksTarget("example.test", []byte{0x01, 0xbb})
-	if err != nil || got != "example.test:443" {
-		t.Fatalf("joinSocksTarget = %q, %v; want example.test:443", got, err)
-	}
-	if _, err := joinSocksTarget("example.test", []byte{0x00, 0x00}); err == nil || !strings.Contains(err.Error(), "zero target port") {
-		t.Fatalf("zero port error = %v, want a zero-target-port failure", err)
-	}
+func TestSocksTargetBuild(t *testing.T) {
+	t.Run("domain keeps the hostname", func(t *testing.T) {
+		got, err := socksTarget(socksdial.AddrDomain, []byte("example.test"), []byte{0x01, 0xbb})
+		if err != nil {
+			t.Fatalf("socksTarget: %v", err)
+		}
+		if got.Addr() != "example.test:443" || got.Host != "example.test" || got.Type != socksdial.AddrDomain {
+			t.Fatalf("socksTarget = %+v, want the example.test:443 domain target", got)
+		}
+	})
+	t.Run("ipv4 renders the frame bytes", func(t *testing.T) {
+		got, err := socksTarget(socksdial.AddrIPv4, []byte{127, 0, 0, 1}, []byte{0x1f, 0x90})
+		if err != nil {
+			t.Fatalf("socksTarget: %v", err)
+		}
+		if got.Addr() != "127.0.0.1:8080" || got.Type != socksdial.AddrIPv4 {
+			t.Fatalf("socksTarget = %+v, want the 127.0.0.1:8080 IPv4 target", got)
+		}
+	})
+	t.Run("ipv6 renders the frame bytes", func(t *testing.T) {
+		addr := append([]byte{0x20, 0x01, 0x0d, 0xb8}, append(make([]byte, 11), 0x01)...) // 2001:db8::1
+		got, err := socksTarget(socksdial.AddrIPv6, addr, []byte{0x00, 0x35})
+		if err != nil {
+			t.Fatalf("socksTarget: %v", err)
+		}
+		if got.Addr() != "[2001:db8::1]:53" || got.Type != socksdial.AddrIPv6 {
+			t.Fatalf("socksTarget = %+v, want the [2001:db8::1]:53 IPv6 target", got)
+		}
+	})
+	t.Run("zero port", func(t *testing.T) {
+		if _, err := socksTarget(socksdial.AddrDomain, []byte("example.test"), []byte{0x00, 0x00}); err == nil || !strings.Contains(err.Error(), "zero target port") {
+			t.Fatalf("zero port error = %v, want a zero-target-port failure", err)
+		}
+	})
 }
 
 func TestWriteSocksReplyShape(t *testing.T) {
@@ -650,21 +765,35 @@ func TestWriteSocksReplyShape(t *testing.T) {
 // client may name: IPv4, a domain name, and IPv6.
 func TestSocksConnectRelaysBothDirections(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute)
 	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
 
 	t.Run("ipv4", func(t *testing.T) {
 		testRelayRoundTrip(t, addr, startRawEchoTarget(t))
 	})
 	t.Run("domain", func(t *testing.T) {
+		// A genuine ATYP 0x03 frame: the relay round trip must succeed with
+		// domain framing end to end, not just on refusal paths. The echo
+		// target's dotted-quad address rides as the domain name; the fake
+		// upstream dials that literal, so nothing resolves.
 		target := startRawEchoTarget(t)
-		_, port, err := net.SplitHostPort(target)
+		host, portText, err := net.SplitHostPort(target)
 		if err != nil {
 			t.Fatal(err)
 		}
-		// The upstream dials the target text as given, so a dotted quad sent
-		// as a domain name exercises the domain framing without DNS.
-		testRelayRoundTrip(t, addr, net.JoinHostPort("127.0.0.1", port))
+		port, err := strconv.Atoi(portText)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frame, err := socksRequestFrameWithATYP(socksCmdConnect, host, uint16(port), socksAtypDomain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, code := socksConnectReplyFrame(t, addr, frame)
+		if code != socksReplySuccess {
+			t.Fatalf("CONNECT reply = 0x%02x, want success 0x00", code)
+		}
+		relayRoundTripOnConn(t, conn)
 	})
 	t.Run("ipv6", func(t *testing.T) {
 		ln, err := net.Listen("tcp6", "[::1]:0")
@@ -685,7 +814,13 @@ func TestSocksConnectRelaysBothDirections(t *testing.T) {
 
 func testRelayRoundTrip(t *testing.T, gatewayAddr, target string) {
 	t.Helper()
-	conn := socksDialVia(t, gatewayAddr, target)
+	relayRoundTripOnConn(t, socksDialVia(t, gatewayAddr, target))
+}
+
+// relayRoundTripOnConn proves an established tunnel carries bytes both ways.
+func relayRoundTripOnConn(t *testing.T, conn net.Conn) {
+	t.Helper()
+	defer func() { _ = conn.Close() }()
 	if got := readBanner(t, conn); got != "banner\n" {
 		t.Fatalf("banner = %q", got)
 	}
@@ -700,7 +835,6 @@ func testRelayRoundTrip(t *testing.T, gatewayAddr, target string) {
 	if !bytes.Equal(echo, payload) {
 		t.Fatalf("echo = %q, want %q", echo, payload)
 	}
-	_ = conn.Close()
 }
 
 // The tunnel is a raw byte stream: a plain HTTP round trip over it must work
@@ -708,7 +842,7 @@ func testRelayRoundTrip(t *testing.T, gatewayAddr, target string) {
 func TestTunnelCarriesHTTPTraffic(t *testing.T) {
 	target := startEchoTarget(t)
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute)
 	_, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
 
 	conn := socksDialVia(t, addr, target)
@@ -731,7 +865,7 @@ func TestTunnelCarriesHTTPTraffic(t *testing.T) {
 // the same write as its CONNECT must reach the target untouched.
 func TestPipelinedClientBytesReachTarget(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
 	target := startRawEchoTarget(t)
 
@@ -785,7 +919,7 @@ func TestPipelinedClientBytesReachTarget(t *testing.T) {
 // the server logs exactly one bad_request line per reject.
 func TestProtocolRejectsNeverTouchPoolOrCounters(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
 	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
@@ -877,10 +1011,10 @@ func TestProtocolRejectsNeverTouchPoolOrCounters(t *testing.T) {
 func TestDialFailureCooldownsRouteExcludedAndFallsBack(t *testing.T) {
 	dead := &url.URL{Scheme: "socks5", User: url.UserPassword("route-user", "route-password"), Host: "dead.test:1080"}
 	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), 30*time.Second, time.Minute)
 	var logs safeLogBuffer
 	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs))
-	s.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+	s.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
 		if pu.Host == dead.Host {
 			return nil, &ProxyDialError{Err: errors.New("connect refused")}
 		}
@@ -927,7 +1061,7 @@ func TestDialFailureCooldownsRouteExcludedAndFallsBack(t *testing.T) {
 func TestHandshakeFailureFallsBackWithSocksConnectKind(t *testing.T) {
 	reject := startSocks5Proxy(t, socksOptions{connectRaw: []byte{0x05, 0x00, 0x00, 0x06}})
 	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(reject.URL, good.URL), time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(reject.URL, good.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
 	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
@@ -956,7 +1090,7 @@ func TestHandshakeFailureFallsBackWithSocksConnectKind(t *testing.T) {
 func TestAuthFailureFallsBackWithoutDialCooldown(t *testing.T) {
 	bad := startSocks5Proxy(t, socksOptions{user: "TEST-user", pass: "TEST-pass"})
 	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(bad.URL, good.URL), time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(bad.URL, good.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
 	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
@@ -1001,7 +1135,7 @@ func TestAuthFailureFallsBackWithoutDialCooldown(t *testing.T) {
 // itself stays available.
 func TestSingleRejectingRouteExhaustsToGeneralFailure(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
 	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
@@ -1043,7 +1177,7 @@ func TestSingleRejectingRouteExhaustsToGeneralFailure(t *testing.T) {
 // touches route-level health.
 func TestConnectTargetRefusalKeepsRouteForOtherTargets(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05, refuseHost: "blocked.test"})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
 	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
@@ -1085,11 +1219,11 @@ func TestConnectTargetRefusalKeepsRouteForOtherTargets(t *testing.T) {
 // every route would fail identically, so cooldown would only poison the pool.
 func TestSetupErrorRepliesFailureWithoutPoolMutation(t *testing.T) {
 	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(good.URL), time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(good.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
 	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs))
 	dials := 0
-	s.dial = func(context.Context, *url.URL, string, time.Duration) (net.Conn, error) {
+	s.dial = func(context.Context, *url.URL, socksdial.Target, time.Duration) (net.Conn, error) {
 		dials++
 		return nil, &SocksProtocolError{Op: "encode target", Err: errors.New("TEST oversized configured credentials")}
 	}
@@ -1125,7 +1259,7 @@ func TestSetupErrorRepliesFailureWithoutPoolMutation(t *testing.T) {
 // debug with both byte counts, and never touches route health.
 func TestCloseRecordAfterClientCloses(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
 	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
@@ -1167,7 +1301,7 @@ func TestCloseRecordAfterClientCloses(t *testing.T) {
 // warn and resets the client side, so a truncated stream stays truncated.
 func TestUpstreamBreakLogsBrokenCloseAndResetsClient(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
 	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
@@ -1227,7 +1361,7 @@ func waitTrackedConns(t *testing.T, s *Server, want int) {
 // their handshake.
 func TestCloseConnsClosesTunnelsAndHandshakes(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
 
 	tunnel := socksDialVia(t, addr, startParkedTarget(t))
@@ -1270,7 +1404,7 @@ func TestCloseConnsDoesNotHoldConnectionMapLockWhileClosing(t *testing.T) {
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}), defaultRuntime(), testLogger())
+	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute), defaultRuntime(), testLogger())
 	if !s.beginSession(conn) {
 		t.Fatal("beginSession refused a connection on a live server")
 	}
@@ -1306,7 +1440,7 @@ func TestCloseConnsDoesNotHoldConnectionMapLockWhileClosing(t *testing.T) {
 }
 
 func TestShutdownWithNoSessionsReturnsNil(t *testing.T) {
-	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}), defaultRuntime(), testLogger())
+	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute), defaultRuntime(), testLogger())
 	done := make(chan error, 1)
 	go func() { done <- s.Shutdown(context.Background()) }()
 	select {
@@ -1322,7 +1456,7 @@ func TestShutdownWithNoSessionsReturnsNil(t *testing.T) {
 // Shutdown waits for a live session instead of tearing it down early.
 func TestShutdownWaitsForActiveSession(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
 
 	tunnel := socksDialVia(t, addr, startParkedTarget(t))
@@ -1348,7 +1482,7 @@ func TestShutdownWaitsForActiveSession(t *testing.T) {
 // reports the deadline.
 func TestShutdownDeadlineForceClosesActiveSession(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
 
 	tunnel := socksDialVia(t, addr, startParkedTarget(t))
@@ -1375,7 +1509,7 @@ func TestAdminStatusCountsConnectsAndFallbacks(t *testing.T) {
 	dead := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
 	_ = closed.Close()
 	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), 30*time.Second, time.Minute)
 	s := NewRuntime(pool.NewStore(defaultRuntime(), pl), testLogger(), "9.9.9-test", "mixed", config.EgressV4, config.EgressV6)
 	addr := startServer(t, s)
 	admin := httptest.NewServer(s.AdminMux())

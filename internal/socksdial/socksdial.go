@@ -1,6 +1,12 @@
 // Package socksdial dials TCP targets through SOCKS5 upstream routes. It is
-// shared by the HTTP proxy server and the rotation engine so both speak
-// identical SOCKS semantics and error classification.
+// shared by the proxy server and the rotation engine so both speak identical
+// SOCKS semantics and error classification. Every dial carries its target's
+// address type explicitly: the CONNECT request encodes exactly the type the
+// caller hands over and never re-infers it from the host string. Dialing is
+// staged: DialHalf establishes the endpoint connection through method/auth
+// negotiation, and CompleteConnect sends the CONNECT for one target — so a
+// caller may park the half connection between the stages. Dial is the two
+// stages back to back.
 package socksdial
 
 import (
@@ -42,8 +48,8 @@ func (e *ProxyAuthError) Error() string { return "SOCKS authentication failed: "
 
 // SocksProtocolError covers local request-scoped failures that behave the
 // same on every route: an unsupported upstream scheme, oversized configured
-// credentials, and invalid target parsing or encoding. It must not change
-// route health or trigger a retry.
+// credentials, and invalid target encoding. It must not change route health
+// or trigger a retry.
 type SocksProtocolError struct {
 	Op  string
 	Err error
@@ -121,13 +127,77 @@ func IsConnectTargetError(err error) bool {
 	return errors.As(err, &replyErr)
 }
 
-// Dial establishes a TCP connection to targetAddr through a SOCKS5 upstream.
-// The returned connection is ready for arbitrary byte transport.
-func Dial(ctx context.Context, pu *url.URL, targetAddr string, timeout time.Duration) (net.Conn, error) {
-	if pu.Scheme != "socks5" {
-		return nil, &SocksProtocolError{Op: "validate scheme", Err: fmt.Errorf("unsupported upstream scheme %q", pu.Scheme)}
+// AddrType is a SOCKS5 address type (ATYP, RFC 1928): the wire encoding a
+// CONNECT request carries for its target. The values match the RFC constants
+// so a type can travel to and from raw frames without a mapping table.
+type AddrType uint8
+
+const (
+	// AddrIPv4 sends the target as a 4-byte IPv4 address (ATYP 0x01).
+	AddrIPv4 AddrType = 0x01
+	// AddrDomain sends the target as a length-prefixed hostname (ATYP 0x03):
+	// the SOCKS endpoint resolves it, and nothing between the caller and the
+	// wire may resolve or rewrite it.
+	AddrDomain AddrType = 0x03
+	// AddrIPv6 sends the target as a 16-byte IPv6 address (ATYP 0x04).
+	AddrIPv6 AddrType = 0x04
+)
+
+// Target is one CONNECT destination whose address type is fixed by the
+// caller. The type is authoritative: encoding reproduces exactly the type
+// given here and never re-derives it from Host, so a target the inbound
+// client framed as IPv4, IPv6, or a domain arrives at the SOCKS endpoint
+// framed the same way.
+type Target struct {
+	// Host is the literal address or hostname. It is never resolved locally.
+	Host string
+	Port uint16
+	Type AddrType
+}
+
+// Addr renders the host:port identity used for pool state and logs.
+func (t Target) Addr() string {
+	return net.JoinHostPort(t.Host, strconv.Itoa(int(t.Port)))
+}
+
+// TargetFromAddr parses host:port and classifies the host into its address
+// type once, at target creation. It exists for dials that originate inside
+// the gateway — the rotation engine's ip-check endpoint, whose address comes
+// from configuration rather than from an inbound frame. Callers reproducing
+// an inbound frame must carry the frame's own ATYP instead of re-deriving it
+// here.
+func TargetFromAddr(addr string) (Target, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return Target{}, fmt.Errorf("invalid target address: %w", err)
 	}
-	return dialSocks5(ctx, pu, targetAddr, timeout)
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return Target{}, fmt.Errorf("invalid target port %q", portStr)
+	}
+	t := Target{Host: host, Port: uint16(port), Type: AddrDomain}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil {
+			t.Type = AddrIPv4
+		} else {
+			t.Type = AddrIPv6
+		}
+	}
+	return t, nil
+}
+
+// Dial establishes a TCP connection to t through a SOCKS5 upstream, encoding
+// t.Type as the CONNECT address type. The returned connection is ready for
+// arbitrary byte transport. It is the staged dial with no pause between
+// stages, and it keeps the single-budget behavior the undivided dial had:
+// CompleteConnect receives the remainder of the one deadline window DialHalf
+// armed.
+func Dial(ctx context.Context, pu *url.URL, t Target, timeout time.Duration) (net.Conn, error) {
+	hc, err := DialHalf(ctx, pu, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return hc.CompleteConnect(t, time.Until(hc.deadline))
 }
 
 // DialTCP dials addr directly; endpoint failures wrap ProxyDialError.
@@ -156,161 +226,49 @@ func dialTCP(ctx context.Context, addr string, timeout time.Duration) (net.Conn,
 	return conn, nil
 }
 
-// failSetup and failHandshake close the endpoint connection and wrap the
-// cause in the error class the proxy server's failure classification reads.
-// Plain functions rather than closures over conn: the failure paths then
-// allocate no extra escape-to-heap bookkeeping per call.
-func failSetup(conn net.Conn, op string, err error) (net.Conn, error) {
-	_ = conn.Close()
-	return nil, &SocksProtocolError{Op: op, Err: err}
-}
+// dialSocks5's two stages live in halfconn.go: DialHalf performs everything
+// up to and including method/auth negotiation, and (*HalfConn).CompleteConnect
+// frames and finishes the CONNECT for one target.
 
-func failHandshake(conn net.Conn, op string, err error) (net.Conn, error) {
-	_ = conn.Close()
-	return nil, &SocksHandshakeError{Op: op, Err: err}
-}
-
-// dialSocks5 tunnels to targetAddr through a SOCKS5 proxy per RFC 1928 with
-// optional username/password authentication per RFC 1929. Hostnames are sent
-// as domain names so the SOCKS endpoint resolves them.
-func dialSocks5(ctx context.Context, pu *url.URL, targetAddr string, timeout time.Duration) (net.Conn, error) {
-	conn, err := dialTCP(ctx, upstreamHostPort(pu), timeout)
-	if err != nil {
-		return nil, err
+// socksConnectRequest encodes the CONNECT request — VER CMD RSV ATYP
+// DST.ADDR DST.PORT — carrying exactly t.Type. IPv4 goes out as four address
+// bytes, IPv6 as sixteen, and a domain as the original hostname with its
+// length prefix for the endpoint to resolve. The caller's type is never
+// second-guessed from Host, and a mismatched Host fails locally as a setup
+// error rather than silently changing address families.
+func socksConnectRequest(t Target) ([]byte, error) {
+	if t.Port == 0 {
+		return nil, errors.New("target port is zero")
 	}
-	user, pass := "", ""
-	if pu.User != nil {
-		user = pu.User.Username()
-		pass, _ = pu.User.Password()
-	}
-	wantAuth := user != "" || pass != ""
-
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return failHandshake(conn, "set handshake deadline", err)
-	}
-	br := handshakeBufPool.Get().(*bufio.Reader)
-	br.Reset(conn)
-	defer func() {
-		br.Reset(nil)
-		handshakeBufPool.Put(br)
-	}()
-
-	// VER NMETHODS METHODS...: no auth, plus username/password when the route
-	// carries credentials (RFC 1929). One exact-cap buffer, one write.
-	greet := make([]byte, 0, 4)
-	greet = append(greet, 0x05, 0x01, 0x00)
-	if wantAuth {
-		greet[1] = 0x02
-		greet = append(greet, 0x02)
-	}
-	if _, err := conn.Write(greet); err != nil {
-		return failHandshake(conn, "send greeting", err)
-	}
-	var hdr [4]byte
-	choice := hdr[:2]
-	if _, err := io.ReadFull(br, choice); err != nil {
-		return failHandshake(conn, "read greeting", err)
-	}
-	if choice[0] != 0x05 {
-		return failHandshake(conn, "read greeting", fmt.Errorf("unexpected SOCKS version 0x%02x", choice[0]))
-	}
-	switch choice[1] {
-	case 0x00: // no auth needed
-	case 0x02:
-		if !wantAuth {
-			_ = conn.Close()
-			return nil, &ProxyAuthError{Reason: "endpoint requires credentials but none are configured"}
-		}
-		if len(user) > 255 || len(pass) > 255 {
-			return failSetup(conn, "encode credentials", fmt.Errorf("username or password exceeds SOCKS5 length limit"))
-		}
-		// ULEN UNAME PLEN PASSWD, one exact-cap buffer: credentials are
-		// bounded by the 255-byte length checks above.
-		b := make([]byte, 0, 3+len(user)+len(pass))
-		b = append(b, 0x01, byte(len(user)))
-		b = append(b, user...)
-		b = append(b, byte(len(pass)))
-		b = append(b, pass...)
-		if _, err := conn.Write(b); err != nil {
-			return failHandshake(conn, "send authentication", err)
-		}
-		reply := hdr[:2]
-		if _, err := io.ReadFull(br, reply); err != nil {
-			return failHandshake(conn, "read authentication", err)
-		}
-		if reply[0] != 0x01 {
-			return failHandshake(conn, "read authentication", fmt.Errorf("unexpected auth version 0x%02x", reply[0]))
-		}
-		if reply[1] != 0x00 {
-			_ = conn.Close()
-			return nil, &ProxyAuthError{Reason: "endpoint rejected credentials"}
-		}
-	case 0xff:
-		_ = conn.Close()
-		return nil, &ProxyAuthError{Reason: "endpoint accepted no offered authentication method"}
-	default:
-		return failHandshake(conn, "negotiate authentication", fmt.Errorf("unsupported method 0x%02x", choice[1]))
-	}
-
-	host, portStr, err := net.SplitHostPort(targetAddr)
-	if err != nil {
-		return failSetup(conn, "parse target", err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port <= 0 || port > 65535 {
-		return failSetup(conn, "parse target", fmt.Errorf("invalid target port %q", portStr))
-	}
-	req, err := socksConnectRequest(host, uint16(port))
-	if err != nil {
-		return failSetup(conn, "encode target", err)
-	}
-	if _, err := conn.Write(req); err != nil {
-		return failHandshake(conn, "send connect", err)
-	}
-	head := hdr[:4]
-	if _, err := io.ReadFull(br, head); err != nil {
-		return failHandshake(conn, "read connect", err)
-	}
-	if head[0] != 0x05 || head[2] != 0x00 {
-		return failHandshake(conn, "read connect", fmt.Errorf("invalid SOCKS response"))
-	}
-	if head[1] != 0x00 {
-		// The endpoint spoke a complete reply refusing this target: the route
-		// works, the (route, target) pair does not. SocksReplyError inside the
-		// handshake error is what splits pair-scoped from route-scoped health.
-		return failHandshake(conn, "connect target", &SocksReplyError{Reply: head[1]})
-	}
-	if err := discardSocksBoundAddress(br, head[3]); err != nil {
-		return failHandshake(conn, "read bound address", err)
-	}
-	if err := conn.SetDeadline(time.Time{}); err != nil {
-		_ = conn.Close()
-		return nil, &SocksHandshakeError{Op: "clear handshake deadline", Err: err}
-	}
-	return withBufferedPrefix(conn, br), nil
-}
-
-func socksConnectRequest(host string, port uint16) ([]byte, error) {
-	// VER CMD RSV ATYP DST.ADDR DST.PORT; the largest form carries a 255-byte
-	// domain name. One exact-cap buffer instead of an append-grown one.
+	// The largest form carries a 255-byte domain name. One exact-cap buffer
+	// instead of an append-grown one.
 	req := make([]byte, 0, 4+1+255+2)
 	req = append(req, 0x05, 0x01, 0x00)
-	if ip := net.ParseIP(host); ip != nil {
-		if v4 := ip.To4(); v4 != nil {
-			req = append(req, 0x01)
-			req = append(req, v4...)
-		} else {
-			req = append(req, 0x04)
-			req = append(req, ip.To16()...)
+	switch t.Type {
+	case AddrIPv4:
+		ip := net.ParseIP(t.Host)
+		if ip == nil || ip.To4() == nil {
+			return nil, errors.New("target host does not encode as an IPv4 address")
 		}
-	} else {
-		if len(host) == 0 || len(host) > 255 {
-			return nil, fmt.Errorf("target hostname length %d is invalid", len(host))
+		req = append(req, byte(AddrIPv4))
+		req = append(req, ip.To4()...)
+	case AddrIPv6:
+		ip := net.ParseIP(t.Host)
+		if ip == nil {
+			return nil, errors.New("target host does not encode as an IPv6 address")
 		}
-		req = append(req, 0x03, byte(len(host)))
-		req = append(req, host...)
+		req = append(req, byte(AddrIPv6))
+		req = append(req, ip.To16()...)
+	case AddrDomain:
+		if len(t.Host) == 0 || len(t.Host) > 255 {
+			return nil, fmt.Errorf("target hostname length %d is invalid", len(t.Host))
+		}
+		req = append(req, byte(AddrDomain), byte(len(t.Host)))
+		req = append(req, t.Host...)
+	default:
+		return nil, fmt.Errorf("unsupported target address type %d", t.Type)
 	}
-	return append(req, byte(port>>8), byte(port)), nil
+	return append(req, byte(t.Port>>8), byte(t.Port)), nil
 }
 
 func discardSocksBoundAddress(br *bufio.Reader, atyp byte) error {

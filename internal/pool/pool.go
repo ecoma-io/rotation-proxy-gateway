@@ -41,19 +41,20 @@ type Proxy struct {
 	// pass, so once a pick is visible at all, its in-flight holder is already
 	// counted.
 	//
-	// pass is the weighted recency clock: every serving event advances it by
-	// the cached stride below, so heavier routes drift back more slowly and
-	// are re-picked proportionally more often. Equal weights reproduce plain
-	// least-recently-used round-robin exactly. The stride is precomputed from
-	// the weight (strideUnits/weight) whenever the weight changes, keeping the
-	// pick path free of both a division and a second atomic load.
+	// pass is the recency clock: every serving event advances it by one step,
+	// so the smallest pass is the least-recently-served route and first-seen
+	// order breaks ties — plain round-robin over the eligible set.
 	pass          atomic.Uint64
-	strideStep    atomic.Uint64
-	weight        atomic.Uint64
 	inFlight      atomic.Int64
 	cooldownUntil atomic.Int64 // dial cooldown deadline, relNanos; 0 = none
 	authBlocked   atomic.Bool
 	rotating      atomic.Bool
+	// rotationEpoch is the route's rotation generation counter: it advances
+	// exactly when a rotation procedure begins (BeginRotation), so state
+	// stamped with an older epoch — a parked upstream connection — provably
+	// predates the route's next verified egress IP and can never be reused
+	// across a rotation, whatever way the procedure ends.
+	rotationEpoch atomic.Uint64
 
 	// Pair-scoped cooldown state: (route, target) refusals recorded by
 	// ReportTargetFailure — an upstream that answered CONNECT itself with a
@@ -87,21 +88,6 @@ type Proxy struct {
 	consecutiveSameIP int
 }
 
-// strideUnits scales the weighted recency clock. One serving event advances a
-// route's pass by strideUnits/weight: at the MaxRouteWeight ceiling the stride
-// still keeps ~4 decimal digits of resolution, and the uint64 pass only
-// overflows past ~2^40 serving events — unreachable in practice.
-const strideUnits = uint64(1) << 24
-
-// normalizeWeight guards hand-built specs that bypass YAML validation: a
-// weight below the default behaves as the default.
-func normalizeWeight(w int) uint64 {
-	if w < config.DefaultRouteWeight {
-		return config.DefaultRouteWeight
-	}
-	return uint64(w)
-}
-
 // processStart anchors the cooldown clock. Cooldown deadlines are stored as
 // nanoseconds relative to it, not as UnixNano: t.Sub(processStart) uses the
 // monotonic reading whenever both times carry one, so cooldowns measure real
@@ -116,7 +102,6 @@ func relNanos(t time.Time) int64 { return int64(t.Sub(processStart)) }
 func newProxy(route config.RouteSpec, anchor uint64) *Proxy {
 	origin := effectiveOrigin(route.Origin)
 	p := &Proxy{URL: route.URL, Kind: route.Kind, Origin: origin}
-	p.setWeight(route.Weight)
 	p.pass.Store(anchor)
 	if origin == config.RouteOriginManual {
 		p.rotationState = RotationIdle
@@ -233,22 +218,28 @@ func (p *Proxy) cooldownNano() int64 { return p.cooldownUntil.Load() }
 
 func (p *Proxy) authBlockedNow() bool { return p.authBlocked.Load() }
 
-func (p *Proxy) recencyPass() uint64 { return p.pass.Load() }
+// RotatingNow reports whether a rotation procedure currently holds the route
+// out of picks.
+func (p *Proxy) RotatingNow() bool { return p.rotating.Load() }
 
-// stride is how far one serving event pushes the route back on the weighted
-// recency clock: heavier routes drift more slowly and absorb proportionally
-// more picks. The division happens once per weight change, not per pick.
-func (p *Proxy) stride() uint64 { return p.strideStep.Load() }
+// AuthBlockedNow reports whether the route is hard-blocked for failed
+// upstream authentication.
+func (p *Proxy) AuthBlockedNow() bool { return p.authBlocked.Load() }
 
-// setWeight applies a reloaded configuration weight in place. Weight is not
-// route identity: retuning it must never reset cooldown, authentication, or
-// rotation state, so Reconfigure updates kept entries instead of rebuilding
-// them.
-func (p *Proxy) setWeight(w int) {
-	weight := normalizeWeight(w)
-	p.weight.Store(weight)
-	p.strideStep.Store(strideUnits / weight)
+// CooldownActive reports whether a dial cooldown still holds the route out of
+// ordinary picks, on the same monotonic clock the pick path uses. The
+// rotating and auth-blocked states are deliberately not folded in: callers
+// gate those separately.
+func (p *Proxy) CooldownActive() bool {
+	cu := p.cooldownUntil.Load()
+	return cu != 0 && relNanos(time.Now()) < cu
 }
+
+// RotationEpoch returns the route's rotation generation counter; see the
+// field comment for the stamping contract.
+func (p *Proxy) RotationEpoch() uint64 { return p.rotationEpoch.Load() }
+
+func (p *Proxy) recencyPass() uint64 { return p.pass.Load() }
 
 func (p *Proxy) rotatingNow() bool { return p.rotating.Load() }
 
@@ -261,7 +252,6 @@ type Status struct {
 	Proxy               string            `json:"proxy"`
 	Kind                config.EgressKind `json:"kind"`
 	Origin              string            `json:"origin"`
-	Weight              uint64            `json:"weight"`
 	Available           bool              `json:"available"`
 	InFlight            int               `json:"inFlight"`
 	ConsecutiveFailures int               `json:"consecutiveFailures"`
@@ -288,7 +278,7 @@ type RotationStatus struct {
 	ConsecutiveSameIP int    `json:"consecutiveSameIP"`
 }
 
-// Pool is a set of upstream SOCKS routes with weighted least-recently-used
+// Pool is a set of upstream SOCKS routes with least-recently-used round-robin
 // rotation, endpoint dial cooldowns, and authentication blocks. All methods
 // are safe for concurrent use.
 type Pool struct {
@@ -297,76 +287,32 @@ type Pool struct {
 	base    time.Duration
 	max     time.Duration
 
-	// Family-balance state, both guarded by mu. kindStride holds each
-	// family's stride (strideUnits per configured share; 0 = no share), and
-	// kindPass is the family recency clock advanced by every serving event
-	// through serve. When any stride is positive, mixed picks first choose
-	// the family with the smaller kindPass, then the weighted route order
-	// picks inside it. Reconfigure carries kindPass across generations so a
-	// reload does not reset the split's phase. scratch is the per-pick family
-	// bucket used by pickBalanced, reused across picks to keep the balanced
-	// path allocation-free. availScratch is the per-pick available-routes
-	// buffer, reused under the same lock for the same reason.
-	kindPass     [2]uint64
-	kindStride   [2]uint64
-	scratch      [2][]*Proxy
+	// availScratch is the per-pick available-routes buffer, reused under mu
+	// across picks to keep the pick path allocation-free.
 	availScratch []*Proxy
 
 	// Now is the clock used for cooldowns; tests replace it.
 	Now func() time.Time
 }
 
-// NewRoutes builds a pool from validated, kinded routes of both origins. The
-// balance shares shape the mixed listener's family split; a zero KindBalance
-// keeps every family's share following the routes' own weights.
-func NewRoutes(routes []config.RouteSpec, base, max time.Duration, balance config.KindBalance) *Pool {
+// NewRoutes builds a pool from validated, kinded routes of both origins.
+func NewRoutes(routes []config.RouteSpec, base, max time.Duration) *Pool {
 	entries := make([]*Proxy, 0, len(routes))
 	for _, route := range routes {
 		entries = append(entries, newProxy(route, 0))
 	}
-	pl := &Pool{entries: entries, base: base, max: max, Now: time.Now}
-	pl.setBalance(balance)
-	return pl
-}
-
-// setBalance installs per-generation family strides. Callers hold no lock
-// only during construction; Reconfigure calls it on the new pool before
-// publishing it.
-func (pl *Pool) setBalance(balance config.KindBalance) {
-	pl.kindStride[kindIndex(config.EgressV4)] = balanceStride(balance.V4)
-	pl.kindStride[kindIndex(config.EgressV6)] = balanceStride(balance.V6)
-}
-
-// balanceStride converts a configured share into a family-clock stride; no
-// share means the family never wins the clock comparison and only serves as
-// standby.
-func balanceStride(share int) uint64 {
-	if share < 1 {
-		return 0
-	}
-	return strideUnits / uint64(share)
-}
-
-func kindIndex(kind config.EgressKind) int {
-	if kind == config.EgressV6 {
-		return 1
-	}
-	return 0
+	return &Pool{entries: entries, base: base, max: max, Now: time.Now}
 }
 
 // Reconfigure returns a new immutable route-list snapshot. Route state is
 // retained only for canonical URL+kind+origin matches; moving a route between
 // proxies.auto and proxies.manual rebuilds it because its role changed.
-// Retained entries pick up a changed configured weight in place — weight is
-// not identity, so retuning it keeps their health state, pair-scoped target
-// cooldowns included, exactly as their route cooldowns. Family-balance
-// clocks carry over so a reload does not reset the split's phase, and a
-// changed ratio applies through the new strides. Existing in-flight
-// operations may safely keep using the original pool.
-func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration, balance config.KindBalance) *Pool {
+// Retained entries keep their health state, pair-scoped target cooldowns
+// included, exactly as their route cooldowns. Existing in-flight operations
+// may safely keep using the original pool.
+func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration) *Pool {
 	pl.mu.Lock()
 	entries := append([]*Proxy(nil), pl.entries...)
-	kindPass := pl.kindPass
 	now := pl.Now
 	pl.mu.Unlock()
 
@@ -388,87 +334,30 @@ func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration, 
 	next := make([]*Proxy, 0, len(routes))
 	for _, route := range routes {
 		if prior, ok := kept[routeKey(route.URL, route.Kind, route.Origin)]; ok {
-			prior.setWeight(route.Weight)
 			next = append(next, prior)
 		} else {
 			next = append(next, newProxy(route, minPass))
 		}
 	}
-	fresh := &Pool{entries: next, base: base, max: max, Now: now, kindPass: kindPass}
-	fresh.setBalance(balance)
-	return fresh
+	return &Pool{entries: next, base: base, max: max, Now: now}
 }
 
 func routeKey(u *url.URL, kind config.EgressKind, origin config.RouteOrigin) string {
 	return config.CanonicalRouteID(u) + "|" + string(kind) + "|" + string(effectiveOrigin(origin))
 }
 
-// serve records one serving step for p: an in-flight hold plus one weighted
-// step back on the recency clock. The in-flight increment lands before the
-// pass advance: any observer that can already see the route as picked (an
-// advanced pass) therefore also sees the in-flight count, so a rotation drain
-// can never miss its holder. advanceFamily is false for dedicated-listener
-// picks, whose traffic must leave the family clocks untouched. With family
-// balance engaged on the mixed path, the event also advances p's family clock
-// by its stride, including on the all-cooling fallback path so standby service
-// keeps the split's bookkeeping honest.
-func (pl *Pool) serve(p *Proxy, advanceFamily bool) {
+// serve records one serving step for p: an in-flight hold plus one step back
+// on the recency clock. The in-flight increment lands before the pass
+// advance: any observer that can already see the route as picked (an advanced
+// pass) therefore also sees the in-flight count, so a rotation drain can
+// never miss its holder.
+func (pl *Pool) serve(p *Proxy) {
 	p.inFlight.Add(1)
-	p.pass.Add(p.stride())
-	if advanceFamily {
-		if k := kindIndex(p.Kind); pl.kindStride[k] > 0 {
-			pl.kindPass[k] += pl.kindStride[k]
-		}
-	}
+	p.pass.Add(1)
 }
 
-// balanced reports whether any family has a configured share, which is what
-// engages the two-level mixed pick.
-func (pl *Pool) balanced() bool {
-	return pl.kindStride[0] > 0 || pl.kindStride[1] > 0
-}
-
-// preferredKind names the family the balance ratio asks for next: among
-// positive-share kinds, the one whose family clock is furthest behind. Equal
-// clocks prefer v4, keeping the choice deterministic. A zero share never wins
-// against a positive one; it only serves through pickBalanced's standby
-// defer. Callers hold pl.mu.
-func (pl *Pool) preferredKind() int {
-	hasV4, hasV6 := pl.kindStride[0] > 0, pl.kindStride[1] > 0
-	switch {
-	case hasV4 && (!hasV6 || pl.kindPass[0] <= pl.kindPass[1]):
-		return 0
-	case hasV6:
-		return 1
-	default:
-		return 0 // unreachable through balanced()
-	}
-}
-
-// pickBalanced chooses within the available routes under the family split:
-// the preferred family serves if it has a live route here, otherwise the
-// other one does — availability beats the ratio — and within a family the
-// weighted recency order decides. Callers hold pl.mu, which also owns the
-// scratch buckets; serve below advances the winning family's clock. Returns
-// nil when avail is empty, which callers exclude beforehand.
-func (pl *Pool) pickBalanced(avail []*Proxy) *Proxy {
-	pl.scratch[0] = pl.scratch[0][:0]
-	pl.scratch[1] = pl.scratch[1][:0]
-	for _, p := range avail {
-		k := kindIndex(p.Kind)
-		pl.scratch[k] = append(pl.scratch[k], p)
-	}
-	first := pl.preferredKind()
-	for _, k := range [2]int{first, 1 - first} {
-		if len(pl.scratch[k]) > 0 {
-			return minRecencyPass(pl.scratch[k])
-		}
-	}
-	return nil
-}
-
-// minRecencyPass returns the candidate with the smallest weighted recency
-// pass, first-seen order breaking ties.
+// minRecencyPass returns the candidate with the smallest recency pass,
+// first-seen order breaking ties.
 func minRecencyPass(candidates []*Proxy) *Proxy {
 	chosen := candidates[0]
 	chosenPass := chosen.recencyPass()
@@ -480,11 +369,10 @@ func minRecencyPass(candidates []*Proxy) *Proxy {
 	return chosen
 }
 
-// jumpToBack pushes a route behind the whole pool by its own weighted step —
-// the weighted generalization of storing a fresh global sequence. Rare by
-// design (rotation stale returns): per-pick demotion uses serve so the pass
-// differentials that encode the weights survive. The scan stays off the pick
-// hot path by living only here.
+// jumpToBack pushes a route behind the whole pool by one step past the
+// furthest-back entry. Rare by design (rotation stale returns): per-pick
+// demotion uses serve so the recency differentials survive. The scan stays
+// off the pick hot path by living only here.
 func (pl *Pool) jumpToBack(p *Proxy) {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
@@ -494,51 +382,27 @@ func (pl *Pool) jumpToBack(p *Proxy) {
 			base = v
 		}
 	}
-	p.pass.Store(base + p.stride())
+	p.pass.Store(base + 1)
 }
 
 // PickFor returns the next allowed proxy for target, excluding entries
 // already tried for the current request. Among available entries it picks the
-// smallest weighted recency pass (stable order on ties): every serving event
-// advances a route's pass by strideUnits/weight, so picks distribute
-// proportionally to the configured weights and equal weights give true
-// round-robin. With a configured family balance, the pick is two-level on the
-// mixed path: the family clock whose stride tracks the configured share
-// chooses the family first, then the weighted order picks inside it; a family
-// without a live route here defers to the other, so availability beats the
-// ratio. Availability is two-scoped: a route cooling at route level is out
-// for every target, and a route whose (route, target) pair is cooling — an
+// smallest recency pass with first-seen order breaking ties: every serving
+// event advances a route's pass by one step, giving true round-robin.
+// Availability is two-scoped: a route cooling at route level is out for every
+// target, and a route whose (route, target) pair is cooling — an
 // upstream-refused CONNECT — is out only for this target. When every allowed,
 // non-excluded, non-auth-blocked entry is cooling for target under either
 // scope, it returns the allowed route that recovers soonest for that target —
-// weight- and family-independent, because soonest recovery is the only
-// criterion that matters there. Routes held by an in-progress rotation are
-// skipped on both paths. It returns nil when no allowed entry remains. The
-// kind filter is applied equally to both paths so a dedicated v4/v6 listener
-// never crosses into another egress kind.
+// blind to selection order, because soonest recovery is the only criterion
+// that matters there. Routes held by an in-progress rotation are skipped on
+// both paths. It returns nil when no allowed entry remains. The kind filter
+// bounds which routes can serve, which is what keeps a dedicated v4/v6
+// listener inside its own egress family.
 //
 // Every successful pick holds one in-flight count on the returned route; the
 // caller releases it via Release when the request or tunnel finishes.
 func (pl *Pool) PickFor(exclude map[*Proxy]bool, allow func(*Proxy) bool, target string) *Proxy {
-	return pl.pick(exclude, allow, target, true)
-}
-
-// PickForDedicated is the dedicated-listener variant of PickFor. Selection,
-// including the all-cooling fallback, is identical, but the pick consults no
-// family ratio and advances no family clock, so a dedicated listener's traffic
-// never shifts the mixed split's phase. The kind filter (allow) still bounds
-// which routes it can serve, which is what keeps a dedicated listener inside
-// its own egress family.
-func (pl *Pool) PickForDedicated(exclude map[*Proxy]bool, allow func(*Proxy) bool, target string) *Proxy {
-	return pl.pick(exclude, allow, target, false)
-}
-
-// pick is the shared selection core. mixed=false is the dedicated path: pure
-// weighted recency within the allowed set, no family ratio, no family-clock
-// advance. Both paths hold pl.mu, which also owns the balanced path's scratch
-// buckets and the family clocks; pair-cooldown reads take the entry's
-// targetMu inside it, keeping targetMu the innermost lock everywhere.
-func (pl *Pool) pick(exclude map[*Proxy]bool, allow func(*Proxy) bool, target string, mixed bool) *Proxy {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
 	nowNano := relNanos(pl.Now())
@@ -575,16 +439,13 @@ func (pl *Pool) pick(exclude map[*Proxy]bool, allow func(*Proxy) bool, target st
 	pl.availScratch = avail[:0]
 	if len(avail) == 0 {
 		if fallback != nil {
-			pl.serve(fallback, mixed)
+			pl.serve(fallback)
 		}
 		return fallback
 	}
 
 	chosen := minRecencyPass(avail)
-	if mixed && pl.balanced() {
-		chosen = pl.pickBalanced(avail)
-	}
-	pl.serve(chosen, mixed)
+	pl.serve(chosen)
 	return chosen
 }
 
@@ -610,6 +471,18 @@ func (pl *Pool) Size() int {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
 	return len(pl.entries)
+}
+
+// RoutePointers returns the pool's current route entries, keyed by pointer
+// identity: Reconfigure keeps the same *Proxy for an unchanged URL+kind+origin,
+// so a consumer that keys its own state by *Proxy survives reloads exactly as
+// long as the route itself does. It takes pl.mu — callers holding the pool
+// lock must not call it, and collectors should gather this set before
+// acquiring their own locks so the two never nest.
+func (pl *Pool) RoutePointers() []*Proxy {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	return append([]*Proxy(nil), pl.entries...)
 }
 
 // CountAllowed reports how many routes pass the allow filter — the asking
@@ -651,12 +524,12 @@ func (p *Proxy) InFlight() int { return int(p.inFlight.Load()) }
 // It does not clear an authentication block: unchanged credentials cannot be
 // expected to recover without a reload that replaces the route. A success
 // says nothing about other targets' pairs, so only this target's entry goes.
-// The completed request advances the route one extra weighted step, so a
-// route that just served lets its peers absorb the next picks — the weighted
-// form of the old fresh-sequence bump. The cooldown clear happens under p.mu
-// together with the counter reset: cooldownUntil is last-writer-wins, and the
-// two writes must land as one unit so a concurrent failure cannot leave a
-// live cooldown over a zeroed failure streak (or the reverse).
+// The completed request advances the route one extra recency step, so a
+// route that just served lets its peers absorb the next picks. The cooldown
+// clear happens under p.mu together with the counter reset: cooldownUntil is
+// last-writer-wins, and the two writes must land as one unit so a concurrent
+// failure cannot leave a live cooldown over a zeroed failure streak (or the
+// reverse).
 func (pl *Pool) ReportSuccess(p *Proxy, target string) {
 	p.mu.Lock()
 	p.consecutiveFailures = 0
@@ -665,7 +538,7 @@ func (pl *Pool) ReportSuccess(p *Proxy, target string) {
 	p.cooldownUntil.Store(0)
 	p.mu.Unlock()
 	p.clearTargetCooldown(target)
-	p.pass.Add(p.stride())
+	p.pass.Add(1)
 }
 
 // ReportFailure records an upstream endpoint TCP dial failure and puts the
@@ -837,7 +710,6 @@ func (pl *Pool) Snapshot() []Status {
 			Proxy:               e.URL.Host,
 			Kind:                e.Kind,
 			Origin:              string(e.Origin),
-			Weight:              e.weight.Load(),
 			Available:           !e.authBlocked.Load() && !e.rotating.Load() && !cooling,
 			InFlight:            int(e.inFlight.Load()),
 			ConsecutiveFailures: e.consecutiveFailures,

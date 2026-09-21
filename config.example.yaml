@@ -32,16 +32,30 @@ cooldown:
 # Timeout covering SOCKS endpoint TCP dialing and SOCKS setup.
 dial-timeout: 10s
 
-# Optional family split for the mixed listener: shares are relative, so v4 7
-# + v6 3 sends about 70% of mixed traffic through v4 routes regardless of how
-# many routes each family has. Route weight still distributes picks inside
-# one family. A family with no share only serves as standby; a family with no
-# live route always defers to the other. The dedicated v4/v6 listeners ignore
-# this block. Delete it to let each family's share follow its routes' own
-# weights.
-balance:
-  v4: 7
-  v6: 3
+# Optional background pool of half-established upstream connections: TCP +
+# SOCKS greeting + auth, no CONNECT — parked connections are never
+# target-specific. A request that selects a route borrows one instead of
+# redoing the greeting round trip; a miss falls through to the ordinary cold
+# dial, so requests never wait. The pool never touches route health, and a
+# rotation closes the old generation of parked connections. It pays where
+# upstream round trips are real (see e2e/BENCH.md); off by default. Every
+# value below is also the default.
+warm-pool:
+  enabled: false
+  # Parked connections per route: keep at least min idle, at most max.
+  min-idle-per-proxy: 1
+  max-idle-per-proxy: 2
+  # Process-wide ceiling on idle parked connections across all routes.
+  max-total-idle: 64
+  # Concurrent background dials replenishing the pool, process-wide.
+  max-replenish-concurrency: 2
+  # Cap on replenish dials in flight toward ONE route (0 = uncapped). Set it
+  # when the pool mixes providers and one tolerates fewer concurrent
+  # handshakes than the fleet cap: a provider with R routes sees at most
+  # R × this many concurrent warm dials.
+  # max-replenish-per-route: 1
+  # A parked connection nobody borrowed is closed after this long.
+  idle-ttl: 45s
 
 # Manual-route rotation knobs. Every value below is also the default.
 rotation:
@@ -71,17 +85,15 @@ rotation:
   retry-backoff-max: 15m
 
 proxies:
-  # Static SOCKS5 routes selected by the local health-aware pool. Accepted proxy
-  # forms are socks5://host:port, socks5://user:pass@host:port,
-  # host:port:user:pass, and user:pass@host:port. Bracket IPv6 literals.
+  # Static SOCKS5 routes selected by the local health-aware pool. The route
+  # line carries no scheme — the endpoint protocol is always SOCKS5 — so the
+  # accepted forms are host:port, user:pass@host:port, and
+  # host:port:user:pass. A line containing socks5:// or any other scheme is
+  # rejected. Bracket IPv6 literals.
   auto:
-    - proxy: socks5://username:password@v4-provider.example:1080
+    - proxy: username:password@v4-provider.example:1080
       kind: v4
-      # Optional selection weight (whole number, 1-1000, default 1): picks
-      # distribute proportionally, so weight 3 serves about three times the
-      # traffic of a weight-1 peer. Equal or absent weights give round-robin.
-      weight: 3
-    - proxy: socks5://username:password@[2001:db8::1]:1080
+    - proxy: username:password@[2001:db8::1]:1080
       kind: v6
 
   # API-rotated routes. The provider swaps the route's public egress IP when
@@ -89,10 +101,8 @@ proxies:
   # rotate-interval, drains the route first, and verifies the IP actually
   # changed afterwards.
   manual:
-    - proxy: socks5://username:password@v6-provider.example:1080
+    - proxy: username:password@v6-provider.example:1080
       kind: v6
-      # Selection weight, same meaning as on auto routes.
-      weight: 1
       # Minimum time between two rotations of this route. It is also the
       # first backoff step when a rotation did not change the IP.
       rotate-interval: 90s

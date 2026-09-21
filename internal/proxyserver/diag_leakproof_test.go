@@ -16,12 +16,13 @@ import (
 
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
+	"rotation-proxy-gateway/internal/socksdial"
 )
 
 // Test-first: AdminMux /status currently can expose raw arbitrary errors.
 func TestStatusLeakProof(t *testing.T) {
 	u, _ := url.Parse("socks5://proxy.test:1080")
-	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, 30*time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, 30*time.Second, time.Minute)
 	p := pl.PickFor(nil, nil, "t:443")
 	raw := errors.New("dial socks5://TESTUSER:TESTP/ss?w@rd@proxy.test:1080: refused\x1b[31m" + strings.Repeat("z", 600))
 	pl.ReportFailure(p, raw)
@@ -115,10 +116,10 @@ func TestLogErrorValueLeakProof(t *testing.T) {
 func TestStatusAndLogsStayCleanAfterServingFailures(t *testing.T) {
 	dead := &url.URL{Scheme: "socks5", User: url.UserPassword("route-user", "route-password"), Host: "dead.test:1080"}
 	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
 	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs))
-	s.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+	s.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
 		if pu.Host == dead.Host {
 			return nil, &ProxyDialError{Err: errors.New("dial socks5://route-user:route-password@dead.test:1080: connect refused")}
 		}

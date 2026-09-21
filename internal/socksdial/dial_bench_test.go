@@ -77,10 +77,12 @@ func benchSOCKSUpstream(b *testing.B) *url.URL {
 // connect request, reply and bound-address read — per established tunnel.
 func BenchmarkDial(b *testing.B) {
 	pu := benchSOCKSUpstream(b)
+	// Loop-invariant: the benchmark measures the dial, not target construction.
+	target := Target{Host: "example.test", Port: 443, Type: AddrDomain}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		conn, err := Dial(context.Background(), pu, "example.test:443", time.Second)
+		conn, err := Dial(context.Background(), pu, target, time.Second)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -93,10 +95,11 @@ func BenchmarkDialAuthenticated(b *testing.B) {
 	pu := benchSOCKSUpstream(b)
 	u := *pu
 	u.User = url.UserPassword("bench-user", "bench-pass")
+	target := Target{Host: "example.test", Port: 443, Type: AddrDomain}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		conn, err := Dial(context.Background(), &u, "example.test:443", time.Second)
+		conn, err := Dial(context.Background(), &u, target, time.Second)
 		if err != nil {
 			b.Fatal(err)
 		}

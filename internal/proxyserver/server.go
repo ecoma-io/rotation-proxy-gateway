@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +21,8 @@ import (
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/sanitize"
+	"rotation-proxy-gateway/internal/socksdial"
+	"rotation-proxy-gateway/internal/warmpool"
 
 	"github.com/rs/zerolog"
 )
@@ -47,6 +48,15 @@ const (
 	socksReplyCmdUnsupported = 0x07
 )
 
+// WarmBorrower is the serving path's window into the warm pool. Borrow is a
+// non-blocking pop: nil means dial cold, exactly as before the pool existed.
+// DiscardRoute drops the route's parked siblings after a borrowed connection
+// failed at the transport level — they likely died with it.
+type WarmBorrower interface {
+	Borrow(*pool.Proxy) *socksdial.HalfConn
+	DiscardRoute(*pool.Proxy)
+}
+
 // Server is the inbound SOCKS5 listener handler.
 type Server struct {
 	store    *pool.Store
@@ -54,7 +64,11 @@ type Server struct {
 	version  string
 	listener string
 	allow    func(*pool.Proxy) bool
-	dial     func(context.Context, *url.URL, string, time.Duration) (net.Conn, error)
+	dial     func(context.Context, *url.URL, socksdial.Target, time.Duration) (net.Conn, error)
+	// warm lends parked half connections. Nil (and the zero value of every
+	// test Server) keeps the cold dial path. It is set once, before Serve
+	// starts, and read-only afterwards.
+	warm WarmBorrower
 
 	cmu   sync.Mutex
 	conns map[net.Conn]struct{}
@@ -211,17 +225,39 @@ func (s *Server) generation() *pool.Generation {
 	return s.store.Load()
 }
 
-// MixedListener is the listener name of the mixed v4/v6 egress view. The name
-// decides the pick path: dedicated views pick through PickForDedicated so
-// their traffic never advances the family-balance clocks the mixed view splits
-// by.
+// MixedListener is the listener name of the mixed v4/v6 egress view.
 const MixedListener = "mixed"
 
-func (s *Server) pick(gen *pool.Generation, exclude map[*pool.Proxy]bool, target string) *pool.Proxy {
-	if s.listener == MixedListener {
-		return gen.Pool.PickFor(exclude, s.allow, target)
+// UseWarmPool arms the warm-connection borrow path. It must be called before
+// Serve; afterwards the field is read-only.
+func (s *Server) UseWarmPool(w WarmBorrower) {
+	s.warm = w
+}
+
+// dialWarmFirst establishes the upstream tunnel for one attempt: a parked
+// half connection when the warm pool has one for this route, the cold dial
+// otherwise. A borrowed connection that the endpoint itself refuses
+// (non-zero CONNECT reply) surfaces as-is so the caller's classification
+// gives it the pair-scoped treatment — identical to the cold path. A
+// borrowed connection that fails at the transport level says nothing about
+// the route today: its siblings are discarded, no route health is reported
+// for the attempt, and the cold dial decides the outcome.
+func (s *Server) dialWarmFirst(ctx context.Context, p *pool.Proxy, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
+	if s.warm != nil {
+		if hc := s.warm.Borrow(p); hc != nil {
+			conn, err := hc.CompleteConnect(target, timeout)
+			if err == nil {
+				s.log.Debug().Str("upstream", upstreamLogValue(p)).Msg("warm connection completed")
+				return conn, nil
+			}
+			if isConnectTargetError(err) {
+				return nil, err
+			}
+			s.log.Debug().Str("upstream", upstreamLogValue(p)).Msg("warm connection died; dialing cold")
+			s.warm.DiscardRoute(p)
+		}
 	}
-	return gen.Pool.PickForDedicated(exclude, s.allow, target)
+	return s.dial(ctx, p.URL, target, timeout)
 }
 
 type sessionSettings struct {
@@ -304,11 +340,15 @@ func (s *Server) serveConn(conn net.Conn) {
 // It loads one generation for the whole session so route picks and health
 // reports stay consistent across reloads. handshakeDeadline is the inbound
 // framing window serveConn armed; the retry chain must fit inside it.
-func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadline time.Time, log zerolog.Logger) {
+func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, handshakeDeadline time.Time, log zerolog.Logger) {
 	gen := s.generation()
 	settings := generationSettings(gen)
 	start := time.Now()
-	logTarget := socksTargetLogValue(target)
+	// host:port is the pool-state and log identity; target.Type is the wire
+	// address type the outbound CONNECT carries. Both descend from the
+	// inbound frame, retries included.
+	targetAddr := target.Addr()
+	logTarget := socksTargetLogValue(targetAddr)
 	log.Debug().Str("target", logTarget).Msg("tunnel start")
 
 	exclude := map[*pool.Proxy]bool{}
@@ -327,7 +367,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 				Msg("inbound handshake deadline expired before the next attempt")
 			return
 		}
-		p := s.pick(gen, exclude, target)
+		p := gen.Pool.PickFor(exclude, s.allow, targetAddr)
 		if p == nil {
 			break
 		}
@@ -340,12 +380,12 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 				Int("attempt", attempts).Int("excluded", len(exclude))
 			// A pick from the all-cooling fallback arrives with cooldown left;
 			// the size of that bet is the whole point of the line.
-			if cd := gen.Pool.CoolingFor(p, target); cd > 0 {
+			if cd := gen.Pool.CoolingFor(p, targetAddr); cd > 0 {
 				ev = ev.Str("cooldown_remaining", logDuration(cd))
 			}
 			ev.Msg("route selected")
 		}
-		up, err := s.dial(s.baseCtx, p.URL, target, settings.dialTimeout)
+		up, err := s.dialWarmFirst(s.baseCtx, p, target, settings.dialTimeout)
 		if err != nil {
 			switch {
 			case isProxyDialError(err):
@@ -360,7 +400,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 				// only the (route, target) pair is refused, so the cooldown
 				// lands on the pair and the route stays eligible for every
 				// other target. Same retry treatment as socks_connect.
-				cooldown := gen.Pool.ReportTargetFailure(p, target, err)
+				cooldown := gen.Pool.ReportTargetFailure(p, targetAddr, err)
 				exclude[p] = true
 				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
 					Int("attempt", attempts).Str("error_kind", errorKindConnectTarget).
@@ -395,7 +435,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 			}
 			continue
 		}
-		gen.Pool.ReportSuccess(p, target)
+		gen.Pool.ReportSuccess(p, targetAddr)
 		upstream, chosen = up, p
 		break
 	}
@@ -449,10 +489,11 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 	recordTunnelClose(log, logTarget, chosen, start, first, second)
 }
 
-// socksRequest is one parsed inbound CONNECT-able request: the host:port
-// target and the requested command.
+// socksRequest is one parsed inbound CONNECT-able request: the target, whose
+// address type is the inbound frame's own ATYP (the wire truth the outbound
+// CONNECT must reproduce), and the requested command.
 type socksRequest struct {
-	target string
+	target socksdial.Target
 	cmd    byte
 }
 
@@ -512,7 +553,7 @@ func readSocksRequest(br *bufio.Reader, w io.Writer) (socksRequest, error) {
 		if _, err := io.ReadFull(br, addr); err != nil {
 			return socksRequest{}, fmt.Errorf("read IPv4 target: %w", err)
 		}
-		target, err := joinSocksTarget(net.IP(addr[:4]).String(), addr[4:])
+		target, err := socksTarget(socksdial.AddrIPv4, addr[:4], addr[4:])
 		if err != nil {
 			return socksRequest{}, err
 		}
@@ -533,7 +574,7 @@ func readSocksRequest(br *bufio.Reader, w io.Writer) (socksRequest, error) {
 		if _, err := io.ReadFull(br, portBytes); err != nil {
 			return socksRequest{}, fmt.Errorf("read domain port: %w", err)
 		}
-		target, err := joinSocksTarget(string(name), portBytes)
+		target, err := socksTarget(socksdial.AddrDomain, name, portBytes)
 		if err != nil {
 			return socksRequest{}, err
 		}
@@ -543,7 +584,7 @@ func readSocksRequest(br *bufio.Reader, w io.Writer) (socksRequest, error) {
 		if _, err := io.ReadFull(br, addr); err != nil {
 			return socksRequest{}, fmt.Errorf("read IPv6 target: %w", err)
 		}
-		target, err := joinSocksTarget(net.IP(addr[:16]).String(), addr[16:])
+		target, err := socksTarget(socksdial.AddrIPv6, addr[:16], addr[16:])
 		if err != nil {
 			return socksRequest{}, err
 		}
@@ -553,14 +594,27 @@ func readSocksRequest(br *bufio.Reader, w io.Writer) (socksRequest, error) {
 	}
 }
 
-// joinSocksTarget validates the port and renders host:port. A zero port is a
-// parse failure: there is no meaningful CONNECT target without one.
-func joinSocksTarget(host string, portBytes []byte) (string, error) {
+// socksTarget builds the request target from one inbound frame's address
+// bytes: the port is validated, the host is rendered as the host:port
+// identity pool state and logs key on, and the address type is the frame's
+// own ATYP — carried through to the outbound CONNECT, never re-inferred from
+// the host string. A zero port is a parse failure: there is no meaningful
+// CONNECT target without one.
+func socksTarget(atyp socksdial.AddrType, host, portBytes []byte) (socksdial.Target, error) {
 	port := binary.BigEndian.Uint16(portBytes)
 	if port == 0 {
-		return "", errors.New("zero target port")
+		return socksdial.Target{}, errors.New("zero target port")
 	}
-	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
+	var hostStr string
+	switch atyp {
+	case socksdial.AddrDomain:
+		hostStr = string(host)
+	case socksdial.AddrIPv4, socksdial.AddrIPv6:
+		// The canonical text of the frame's own address bytes; encoding at the
+		// outbound route round-trips these bytes exactly.
+		hostStr = net.IP(host).String()
+	}
+	return socksdial.Target{Host: hostStr, Port: port, Type: atyp}, nil
 }
 
 // writeSocksReply writes a full SOCKS reply with a zero IPv4 BND.ADDR/PORT.
@@ -697,7 +751,7 @@ func (s *Server) CloseConns() int {
 
 // AdminMux serves the health and status endpoints for the admin listener.
 func (s *Server) AdminMux() *http.ServeMux {
-	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s}, nil)
+	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s}, nil, nil)
 }
 
 // AdminMux serves aggregate health/status for all proxy listener views sharing
@@ -706,7 +760,9 @@ func (s *Server) AdminMux() *http.ServeMux {
 // commands (protocol rejects never advance it) and failovers counts in-band
 // route fallbacks, distinct from rotations. The pool snapshot comes from the
 // current generation so /status changes atomically with serving behavior.
-func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64) *http.ServeMux {
+// warm, when non-nil, reports the warm-pool view (bounds, gauges, lifecycle
+// counters); it is omitted entirely when no warm pool backs the process.
+func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64, warm func() warmpool.Status) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -731,14 +787,11 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 			"listeners": perListener,
 			"pool":      gen.Pool.Snapshot(),
 		}
-		// The active family split is part of the serving contract, so /status
-		// reports exactly what the current generation enforces — omitted when
-		// no balance block is configured.
-		if bal := gen.Config.Balance; bal.V4 > 0 || bal.V6 > 0 {
-			status["balance"] = map[string]int{"v4": bal.V4, "v6": bal.V6}
-		}
 		if rotations != nil {
 			status["rotations"] = rotations()
+		}
+		if warm != nil {
+			status["warmPool"] = warm()
 		}
 		_ = json.NewEncoder(w).Encode(status)
 	})

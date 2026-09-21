@@ -25,7 +25,7 @@ func TestSettingsFollowPublishedGeneration(t *testing.T) {
 		CooldownMax:  time.Minute,
 		Routes:       []config.RouteSpec{{URL: a, Kind: config.EgressV4}},
 	}
-	store := pool.NewStore(initial, pool.NewRoutes(initial.Routes, time.Second, time.Minute, config.KindBalance{}))
+	store := pool.NewStore(initial, pool.NewRoutes(initial.Routes, time.Second, time.Minute))
 	server := NewRuntime(store, logging.Nop(), "test", "mixed", config.EgressV4, config.EgressV6)
 
 	b, err := url.Parse("socks5://b.test:1080")
@@ -46,7 +46,7 @@ func TestSettingsFollowPublishedGeneration(t *testing.T) {
 	if got, want := server.settings(), (sessionSettings{maxRetries: 4, dialTimeout: 6 * time.Second}); got != want {
 		t.Fatalf("settings = %+v, want %+v", got, want)
 	}
-	if picked := server.pick(server.generation(), nil, "t:443"); picked == nil || picked.URL.Host != "b.test:1080" {
+	if picked := server.generation().Pool.PickFor(nil, server.allow, "t:443"); picked == nil || picked.URL.Host != "b.test:1080" {
 		t.Fatalf("published pool pick = %+v, want b.test:1080", picked)
 	}
 }
@@ -70,7 +70,7 @@ func TestGenerationIsolatesInFlightWork(t *testing.T) {
 		CooldownMax:  time.Minute,
 		Routes:       []config.RouteSpec{{URL: a, Kind: config.EgressV4}},
 	}
-	store := pool.NewStore(initial, pool.NewRoutes(initial.Routes, time.Second, time.Minute, config.KindBalance{}))
+	store := pool.NewStore(initial, pool.NewRoutes(initial.Routes, time.Second, time.Minute))
 	server := NewRuntime(store, logging.Nop(), "test", "mixed", config.EgressV4, config.EgressV6)
 
 	inFlight := server.generation()
@@ -88,7 +88,7 @@ func TestGenerationIsolatesInFlightWork(t *testing.T) {
 	if got := generationSettings(inFlight); got != inFlightSettings {
 		t.Fatalf("in-flight settings changed: got %+v, want %+v", got, inFlightSettings)
 	}
-	if picked := server.pick(inFlight, nil, "t:443"); picked == nil || picked.URL.Host != "a.test:1080" {
+	if picked := inFlight.Pool.PickFor(nil, server.allow, "t:443"); picked == nil || picked.URL.Host != "a.test:1080" {
 		t.Fatalf("in-flight pool pick = %+v, want a.test:1080", picked)
 	}
 	current := server.generation()
@@ -98,7 +98,7 @@ func TestGenerationIsolatesInFlightWork(t *testing.T) {
 	if current.Config.MaxRetries != 5 {
 		t.Fatalf("current settings = %+v, want MaxRetries 5", current.Config)
 	}
-	if picked := server.pick(current, nil, "t:443"); picked == nil || picked.URL.Host != "b.test:1080" {
+	if picked := current.Pool.PickFor(nil, server.allow, "t:443"); picked == nil || picked.URL.Host != "b.test:1080" {
 		t.Fatalf("current pool pick = %+v, want b.test:1080", picked)
 	}
 }
@@ -111,7 +111,7 @@ func TestListenerSelectsOnlyAllowedEgressKind(t *testing.T) {
 	pl := pool.NewRoutes([]config.RouteSpec{
 		{URL: v4.URL, Kind: config.EgressV4},
 		{URL: v6.URL, Kind: config.EgressV6},
-	}, time.Second, time.Minute, config.KindBalance{})
+	}, time.Second, time.Minute)
 	runtime := pool.NewStore(&config.RuntimeConfig{
 		MaxRetries:  2,
 		DialTimeout: time.Second,
@@ -153,7 +153,7 @@ func TestListenerSelectsOnlyAllowedEgressKind(t *testing.T) {
 
 func TestListenerLogsItsNameAndAdminAggregatesStatus(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes([]config.RouteSpec{{URL: fs.URL, Kind: config.EgressV4}}, time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes([]config.RouteSpec{{URL: fs.URL, Kind: config.EgressV4}}, time.Second, time.Minute)
 	runtime := pool.NewStore(&config.RuntimeConfig{MaxRetries: 1, DialTimeout: time.Second}, pl)
 	var logs safeLogBuffer
 	srv := NewRuntime(runtime, captureLogger(&logs), "test", "v4", config.EgressV4)
@@ -166,7 +166,7 @@ func TestListenerLogsItsNameAndAdminAggregatesStatus(t *testing.T) {
 		t.Fatal("listener tunnel record missing")
 	}
 
-	admin := httptest.NewServer(AdminMux("test", time.Now(), runtime, map[string]*Server{"v4": srv}, nil))
+	admin := httptest.NewServer(AdminMux("test", time.Now(), runtime, map[string]*Server{"v4": srv}, nil, nil))
 	defer admin.Close()
 	status, err := http.Get(admin.URL + "/status")
 	if err != nil {
@@ -192,7 +192,7 @@ func TestListenerNoEligibleRouteRepliesGeneralFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, time.Second, time.Minute)
 	runtime := pool.NewStore(&config.RuntimeConfig{MaxRetries: 1, DialTimeout: time.Second}, pl)
 	srv := NewRuntime(runtime, testLogger(), "test", "v6", config.EgressV6)
 	addr := startServer(t, srv)

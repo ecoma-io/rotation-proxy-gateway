@@ -26,17 +26,6 @@ const (
 	// 60s docker stop_grace_period and a 90s systemd TimeoutStopSec.
 	DefaultShutdownGrace = 55 * time.Second
 
-	// Route selection weight defaults and bounds. Weight shapes how often a
-	// route is picked relative to its peers; 1 makes every route equal.
-	DefaultRouteWeight = 1
-	MaxRouteWeight     = 1000
-
-	// MaxBalanceShare bounds one egress family's share in the balance block.
-	// Shares are relative, so only their ratio matters; the magnitude bound
-	// matches MaxRouteWeight so the family clock keeps the same stride
-	// resolution as a route weight at the extreme.
-	MaxBalanceShare = 1000
-
 	// Rotation defaults. These bound how manual routes rotate their egress IP
 	// through their provider API; every one is overridable in the rotation
 	// block of the runtime YAML.
@@ -46,6 +35,22 @@ const (
 	DefaultIPCheckInterval  = 2 * time.Second
 	DefaultRetryBackoffMax  = 15 * time.Minute
 	DefaultRotateAPITimeout = 10 * time.Second
+
+	// Warm-pool defaults. The pool keeps half-established upstream
+	// connections (TCP + greeting + auth, no CONNECT) ready in the
+	// background; every bound is deliberately conservative, and the feature
+	// is off unless warm-pool.enabled says otherwise.
+	DefaultWarmMinIdlePerProxy = 1
+	DefaultWarmMaxIdlePerProxy = 2
+	DefaultWarmMaxTotalIdle    = 64
+	// DefaultWarmMaxReplenishConcurrency caps the whole worker fleet.
+	// DefaultWarmMaxReplenishPerRoute caps dials toward one route; 0 means
+	// uncapped, preserving the pre-knob behavior — the fleet cap alone is the
+	// ceiling until an operator splits a multi-provider pool's handshake
+	// tolerance per route.
+	DefaultWarmMaxReplenishConcurrency = 2
+	DefaultWarmMaxReplenishPerRoute    = 0
+	DefaultWarmIdleTTL                 = 45 * time.Second
 )
 
 // EgressKind is the public IP family supplied by an upstream proxy provider.
@@ -69,15 +74,10 @@ const (
 )
 
 // RouteSpec is one validated static SOCKS route from the runtime config.
-// Weight is the route's selection weight in [DefaultRouteWeight, MaxRouteWeight]:
-// a route is picked proportionally to its weight against its eligible peers.
-// It is deliberately not part of the route identity — a reload that only
-// retunes weights keeps the route's health state.
 type RouteSpec struct {
 	URL    *url.URL
 	Kind   EgressKind
 	Origin RouteOrigin
-	Weight int
 }
 
 // ManualRouteSpec is one validated API-rotated SOCKS route. Besides the SOCKS
@@ -87,20 +87,6 @@ type ManualRouteSpec struct {
 	RouteSpec
 	RotateInterval time.Duration
 	API            RotateAPI
-}
-
-// KindBalance sets how the mixed listener splits picks between the two egress
-// families: the values are relative shares, so V4=7, V6=3 sends about 70% of
-// mixed traffic through v4 routes no matter how many routes each family has.
-// Route weight still distributes picks inside one family. A family with no
-// share only serves as standby when the shared family has no live route; a
-// family with no live route always defers to the other, so availability beats
-// the ratio. The dedicated v4/v6 listeners are unaffected: their kind filter
-// leaves a single family. The zero value disables the split, keeping the flat
-// weighted pool where each family's share follows its routes' own weights.
-type KindBalance struct {
-	V4 int
-	V6 int
 }
 
 // RotateAPI describes the provider HTTP request that rotates a manual route's
@@ -152,6 +138,25 @@ func (r RotationSettings) ResolveMaxConcurrent(n int) int {
 	return limit
 }
 
+// WarmPoolSettings bounds the background pool of half-established upstream
+// connections: TCP dialed, SOCKS5 greeting and auth negotiated, CONNECT not
+// sent — a parked connection is reusable for any target. Requests never wait
+// on the pool; it only ever swaps a cold dial for a ready half connection.
+type WarmPoolSettings struct {
+	Enabled                 bool
+	MinIdlePerProxy         int
+	MaxIdlePerProxy         int
+	MaxTotalIdle            int
+	MaxReplenishConcurrency int
+	// MaxReplenishPerRoute caps replenish dials in flight toward one route
+	// (0 = uncapped). The fleet cap bounds the process; this one protects a
+	// provider that tolerates fewer concurrent handshakes than the fleet —
+	// a pool mixing providers divides each provider's tolerance across its
+	// routes and caps each route accordingly.
+	MaxReplenishPerRoute int
+	IdleTTL              time.Duration
+}
+
 // AllRoutes returns every serving route, auto first. The pool and the rotation
 // engine both key state by canonical URL+kind, so ordering only affects
 // duplicate reporting and new-entry construction.
@@ -189,7 +194,7 @@ type RuntimeConfig struct {
 	Routes       []RouteSpec
 	ManualRoutes []ManualRouteSpec
 	Rotation     RotationSettings
-	Balance      KindBalance
+	WarmPool     WarmPoolSettings
 }
 
 type fileConfig struct {
@@ -199,14 +204,7 @@ type fileConfig struct {
 	DialTimeout string             `mapstructure:"dial-timeout"`
 	Rotation    rotationFileConfig `mapstructure:"rotation"`
 	Proxies     proxiesFileConfig  `mapstructure:"proxies"`
-	Balance     balanceFileConfig  `mapstructure:"balance"`
-}
-
-// balanceFileConfig keeps the shares as `any` so viper's weak typing cannot
-// silently truncate a mistyped share the way it would turn 2.5 into 2.
-type balanceFileConfig struct {
-	V4 any `mapstructure:"v4"`
-	V6 any `mapstructure:"v6"`
+	WarmPool    warmPoolFileConfig `mapstructure:"warm-pool"`
 }
 
 type cooldownFileConfig struct {
@@ -224,21 +222,32 @@ type rotationFileConfig struct {
 	RetryBackoffMax string `mapstructure:"retry-backoff-max"`
 }
 
+// warmPoolFileConfig keeps the counts as `any` so viper's weak typing cannot
+// silently truncate a mistyped bound (2.5 → 2), the same anti-coercion rule
+// as max-retries.
+type warmPoolFileConfig struct {
+	Enabled                 *bool  `mapstructure:"enabled"`
+	MinIdlePerProxy         any    `mapstructure:"min-idle-per-proxy"`
+	MaxIdlePerProxy         any    `mapstructure:"max-idle-per-proxy"`
+	MaxTotalIdle            any    `mapstructure:"max-total-idle"`
+	MaxReplenishConcurrency any    `mapstructure:"max-replenish-concurrency"`
+	MaxReplenishPerRoute    any    `mapstructure:"max-replenish-per-route"`
+	IdleTTL                 string `mapstructure:"idle-ttl"`
+}
+
 type proxiesFileConfig struct {
 	Auto   []autoProxyFileConfig   `mapstructure:"auto"`
 	Manual []manualProxyFileConfig `mapstructure:"manual"`
 }
 
 type autoProxyFileConfig struct {
-	Proxy  string `mapstructure:"proxy"`
-	Kind   string `mapstructure:"kind"`
-	Weight any    `mapstructure:"weight"`
+	Proxy string `mapstructure:"proxy"`
+	Kind  string `mapstructure:"kind"`
 }
 
 type manualProxyFileConfig struct {
 	Proxy          string        `mapstructure:"proxy"`
 	Kind           string        `mapstructure:"kind"`
-	Weight         any           `mapstructure:"weight"`
 	RotateInterval string        `mapstructure:"rotate-interval"`
 	API            apiFileConfig `mapstructure:"api"`
 }
@@ -439,7 +448,7 @@ func runtimeFromFile(raw fileConfig) (*RuntimeConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	balance, err := parseBalance(raw.Balance)
+	warmPool, err := parseWarmPoolSettings(raw.WarmPool)
 	if err != nil {
 		return nil, err
 	}
@@ -451,7 +460,7 @@ func runtimeFromFile(raw fileConfig) (*RuntimeConfig, error) {
 		DialTimeout:  dialTimeout,
 		LogLevel:     raw.LogLevel,
 		Rotation:     rotation,
-		Balance:      balance,
+		WarmPool:     warmPool,
 	}
 	for i, route := range raw.Proxies.Auto {
 		spec, err := parseRouteSpec(route)
@@ -558,6 +567,107 @@ func (r RotationSettings) validate() error {
 	return errors.Join(errs...)
 }
 
+// parseWarmPoolSettings applies defaults, then validates the overrides —
+// including when the pool is disabled, so a bad bound is reported now rather
+// than silently shipping to the day the pool is switched on.
+func parseWarmPoolSettings(raw warmPoolFileConfig) (WarmPoolSettings, error) {
+	settings := WarmPoolSettings{
+		MinIdlePerProxy:         DefaultWarmMinIdlePerProxy,
+		MaxIdlePerProxy:         DefaultWarmMaxIdlePerProxy,
+		MaxTotalIdle:            DefaultWarmMaxTotalIdle,
+		MaxReplenishConcurrency: DefaultWarmMaxReplenishConcurrency,
+		MaxReplenishPerRoute:    DefaultWarmMaxReplenishPerRoute,
+		IdleTTL:                 DefaultWarmIdleTTL,
+	}
+	if raw.Enabled != nil {
+		settings.Enabled = *raw.Enabled
+	}
+	var errs []error
+	if n, ok, err := parseWarmCount("warm-pool.min-idle-per-proxy", raw.MinIdlePerProxy); err != nil {
+		errs = append(errs, err)
+	} else if ok {
+		settings.MinIdlePerProxy = n
+	}
+	if n, ok, err := parseWarmCount("warm-pool.max-idle-per-proxy", raw.MaxIdlePerProxy); err != nil {
+		errs = append(errs, err)
+	} else if ok {
+		settings.MaxIdlePerProxy = n
+	}
+	if n, ok, err := parseWarmCount("warm-pool.max-total-idle", raw.MaxTotalIdle); err != nil {
+		errs = append(errs, err)
+	} else if ok {
+		settings.MaxTotalIdle = n
+	}
+	if n, ok, err := parseWarmCount("warm-pool.max-replenish-concurrency", raw.MaxReplenishConcurrency); err != nil {
+		errs = append(errs, err)
+	} else if ok {
+		settings.MaxReplenishConcurrency = n
+	}
+	if n, ok, err := parseWarmCount("warm-pool.max-replenish-per-route", raw.MaxReplenishPerRoute); err != nil {
+		errs = append(errs, err)
+	} else if ok {
+		settings.MaxReplenishPerRoute = n
+	}
+	if raw.IdleTTL != "" {
+		d, err := parseRuntimeDuration("warm-pool.idle-ttl", raw.IdleTTL)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			settings.IdleTTL = d
+		}
+	}
+	if err := settings.validate(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := errors.Join(errs...); err != nil {
+		return WarmPoolSettings{}, err
+	}
+	return settings, nil
+}
+
+func (w WarmPoolSettings) validate() error {
+	var errs []error
+	if w.MinIdlePerProxy < 0 {
+		errs = append(errs, fmt.Errorf("warm-pool.min-idle-per-proxy must be >= 0, got %d", w.MinIdlePerProxy))
+	}
+	if w.MaxIdlePerProxy < 1 {
+		errs = append(errs, fmt.Errorf("warm-pool.max-idle-per-proxy must be >= 1, got %d", w.MaxIdlePerProxy))
+	}
+	if w.MaxTotalIdle < 1 {
+		errs = append(errs, fmt.Errorf("warm-pool.max-total-idle must be >= 1, got %d", w.MaxTotalIdle))
+	}
+	if w.MaxReplenishConcurrency < 1 {
+		errs = append(errs, fmt.Errorf("warm-pool.max-replenish-concurrency must be >= 1, got %d", w.MaxReplenishConcurrency))
+	}
+	if w.MaxReplenishPerRoute < 0 {
+		errs = append(errs, fmt.Errorf("warm-pool.max-replenish-per-route must be >= 0 (0 = uncapped), got %d", w.MaxReplenishPerRoute))
+	}
+	if w.IdleTTL <= 0 {
+		errs = append(errs, fmt.Errorf("warm-pool.idle-ttl must be positive, got %s", w.IdleTTL))
+	}
+	if w.MinIdlePerProxy > w.MaxIdlePerProxy {
+		errs = append(errs, fmt.Errorf("warm-pool.min-idle-per-proxy %d must not exceed warm-pool.max-idle-per-proxy %d", w.MinIdlePerProxy, w.MaxIdlePerProxy))
+	}
+	if w.MaxTotalIdle < w.MaxIdlePerProxy {
+		errs = append(errs, fmt.Errorf("warm-pool.max-total-idle %d must be at least warm-pool.max-idle-per-proxy %d", w.MaxTotalIdle, w.MaxIdlePerProxy))
+	}
+	return errors.Join(errs...)
+}
+
+// parseWarmCount accepts an absent value (ok false, the default applies) or a
+// whole YAML integer, refusing the fractional forms viper's weak typing would
+// truncate.
+func parseWarmCount(name string, raw any) (n int, ok bool, err error) {
+	if raw == nil {
+		return 0, false, nil
+	}
+	n, ok = raw.(int)
+	if !ok {
+		return 0, false, fmt.Errorf("%s must be a whole number", name)
+	}
+	return n, true, nil
+}
+
 // parseMaxConcurrent accepts a fixed count (1) or a percent of the manual pool
 // ("25%"). Exactly one representation is returned.
 func parseMaxConcurrent(raw any) (*int, *int, error) {
@@ -587,8 +697,8 @@ func parseMaxConcurrent(raw any) (*int, *int, error) {
 
 // parseMaxRetries requires a whole YAML integer: viper's weak typing would
 // otherwise truncate 2.5 to 2 and quietly change the retry budget, the same
-// anti-coercion rule as parseRouteWeight. An absent value falls through to the
-// range check, which reports it.
+// anti-coercion rule as the warm-pool counts. An absent value falls through to
+// the range check, which reports it.
 func parseMaxRetries(raw any) (int, error) {
 	if raw == nil {
 		return 0, nil
@@ -614,57 +724,7 @@ func parseRouteSpec(raw autoProxyFileConfig) (RouteSpec, error) {
 		return RouteSpec{}, err
 	}
 	spec.Origin = RouteOriginAuto
-	if spec.Weight, err = parseRouteWeight(raw.Weight); err != nil {
-		return RouteSpec{}, err
-	}
 	return spec, nil
-}
-
-// parseRouteWeight applies the default weight, then validates the override.
-// Only whole YAML integers are accepted: viper's weak typing would otherwise
-// silently truncate 2.5 to 2 and turn a config typo into a quiet share change.
-func parseRouteWeight(raw any) (int, error) {
-	if raw == nil {
-		return DefaultRouteWeight, nil
-	}
-	n, ok := raw.(int)
-	if !ok {
-		return 0, fmt.Errorf("weight must be a whole number between %d and %d", DefaultRouteWeight, MaxRouteWeight)
-	}
-	if n < DefaultRouteWeight || n > MaxRouteWeight {
-		return 0, fmt.Errorf("weight must be between %d and %d, got %d", DefaultRouteWeight, MaxRouteWeight, n)
-	}
-	return n, nil
-}
-
-// parseBalance validates the balance block shares. An absent or empty block
-// disables the family split, so only present keys are checked: each must be a
-// whole YAML integer in [1, MaxBalanceShare] — same anti-weak-typing rule as
-// route weight. Shares are relative; any positive pair is a valid ratio.
-func parseBalance(raw balanceFileConfig) (KindBalance, error) {
-	balance := KindBalance{}
-	var err error
-	if balance.V4, err = parseBalanceShare("balance.v4", raw.V4); err != nil {
-		return balance, err
-	}
-	if balance.V6, err = parseBalanceShare("balance.v6", raw.V6); err != nil {
-		return balance, err
-	}
-	return balance, nil
-}
-
-func parseBalanceShare(name string, raw any) (int, error) {
-	if raw == nil {
-		return 0, nil
-	}
-	n, ok := raw.(int)
-	if !ok {
-		return 0, fmt.Errorf("%s must be a whole number between 1 and %d", name, MaxBalanceShare)
-	}
-	if n < 1 || n > MaxBalanceShare {
-		return 0, fmt.Errorf("%s must be between 1 and %d, got %d", name, MaxBalanceShare, n)
-	}
-	return n, nil
 }
 
 // parseManualRouteSpec validates one manual entry: the same SOCKS endpoint
@@ -676,9 +736,6 @@ func parseManualRouteSpec(raw manualProxyFileConfig) (ManualRouteSpec, error) {
 	}
 	manual := ManualRouteSpec{RouteSpec: spec}
 	manual.Origin = RouteOriginManual
-	if manual.Weight, err = parseRouteWeight(raw.Weight); err != nil {
-		return ManualRouteSpec{}, err
-	}
 	if raw.RotateInterval == "" {
 		return ManualRouteSpec{}, errors.New("rotate-interval is required (Go duration, e.g. 90s)")
 	}
@@ -813,7 +870,7 @@ func parseKindedProxy(proxy, kind string) (RouteSpec, error) {
 
 func validateProxyURL(u *url.URL) error {
 	switch {
-	case !validSchemes[u.Scheme]:
+	case u.Scheme != "socks5":
 		return fmt.Errorf("unsupported scheme %q (want socks5)", u.Scheme)
 	case u.Hostname() == "":
 		return errors.New("missing host")

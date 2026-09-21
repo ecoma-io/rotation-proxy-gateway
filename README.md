@@ -89,15 +89,11 @@ cooldown:
   base: 15s
   max: 10m
 dial-timeout: 10s
-balance:
-  v4: 7
-  v6: 3
 proxies:
   auto:
-    - proxy: socks5://username:password@provider.example:1080
+    - proxy: username:password@provider.example:1080
       kind: v4
-      weight: 3
-    - proxy: socks5://username:password@[2001:db8::1]:1080
+    - proxy: username:password@[2001:db8::1]:1080
       kind: v6
   manual: []
 ```
@@ -105,7 +101,9 @@ proxies:
 There is no `global:` block: the removed HTTP era's `target-tls-insecure` and
 `max-body-buffer` settings no longer exist, and a config containing them fails
 validation — the last-known-good config keeps serving (on first boot the process
-refuses to start).
+refuses to start). The removed weighted-selection keys are rejected the same
+way: a route `weight` key and a `balance` block no longer exist, and a config
+containing either fails validation identically.
 
 `proxies.auto` is the source of static routes; `proxies.manual` routes
 additionally carry a rotate schedule and provider API (see
@@ -113,39 +111,19 @@ additionally carry a rotate schedule and provider API (see
 forms are:
 
 ```text
-socks5://host:port
-socks5://user:pass@host:port
-host:port:user:pass
+host:port
 user:pass@host:port
+host:port:user:pass
 ```
 
-Every route requires an explicit port. Bracket IPv6 literals. HTTP/HTTPS routes,
+Every route requires an explicit port. Bracket IPv6 literals. The route line
+carries no scheme: the endpoint protocol is not configurable — every route is
+a SOCKS5 endpoint — and a line containing `socks5://`, `socks5h://`, or any
+other scheme is rejected. HTTP/HTTPS routes,
 URL paths, queries, fragments, unknown active YAML fields, duplicate route
 identities, and non-lowercase/missing `kind` are rejected. A duplicate remains
 a duplicate even if it claims another kind. Credentials never appear in errors,
 logs, or `/status`.
-
-Every route accepts an optional selection `weight` (whole number, default 1, at
-most 1000): picks distribute across eligible routes proportionally to their
-weights, so `weight: 3` serves about three times the traffic of a `weight: 1`
-peer. Equal weights — or no `weight` key at all — give true round-robin. The
-key exists on both `proxies.auto` and `proxies.manual` routes and is not part
-of route identity: a reload that only retunes weights keeps the route's health
-state.
-
-The optional `balance` block splits mixed-listener picks between the two egress
-families by relative share — `balance: {v4: 7, v6: 3}` sends about 70% of mixed
-traffic through `kind: v4` routes no matter how many routes each family has,
-while route `weight` still distributes picks inside one family. Each share is a
-whole number 1–1000; a family with no share only serves as standby when the
-shared family has no live route, and a family whose routes are all cooling or
-auth-blocked always defers to the other — availability beats the ratio. The
-dedicated v4/v6 listeners ignore the block entirely: their picks consult no
-family ratio and never advance the family clocks, so a dedicated listener's
-traffic cannot skew the mixed split's phase. Without it, each family's share
-follows its routes' own weights, exactly as if the pool were flat. A reload
-that changes the ratio applies to the retained routes and carries the split's
-phase over.
 
 `proxies.auto` routes and `proxies.manual` routes share one pool and one
 identity space; a duplicate across the two lists is rejected like any other.
@@ -164,7 +142,7 @@ rotations.
 ```yaml
 proxies:
   manual:
-    - proxy: socks5://username:password@provider.example:1080
+    - proxy: username:password@provider.example:1080
       kind: v6
       rotate-interval: 90s
       api:
@@ -180,9 +158,6 @@ proxies:
   rotation attempts of this route. After a verified rotation the next attempt is
   scheduled one interval out; after an unchanged-IP outcome it is scheduled by
   the retry backoff instead.
-- `weight` (optional, whole number 1–1000, default 1): selection weight,
-  identical to the `proxies.auto` route key. Higher-weight manual routes absorb
-  proportionally more traffic between rotations.
 - `api` (required): the provider call that requests a new egress IP.
   `url` is required (http or https). `method` defaults to `POST`. `timeout`
   defaults to `10s` and bounds one call. `headers` and `body` are sent verbatim.
@@ -253,7 +228,7 @@ immediately in the `stale` state, and the gateway retries forever — the next
 attempt waits one `rotate-interval`, doubling per consecutive unchanged result
 (`interval`, `2×`, `4×`, …) with ±10% jitter, capped at `retry-backoff-max`, and
 floored by any `Retry-After`. Stale routes are pushed to the back of the
-weighted recency order so fresher routes absorb traffic first, but they keep
+recency order so fresher routes absorb traffic first, but they keep
 serving normally.
 
 A route whose provider hands out non-sticky addresses cannot be rotated
@@ -356,13 +331,74 @@ The following settings apply to new client operations without restart:
 - `proxies.auto` and `proxies.manual`
 - every `rotation.*` setting (the scheduler reads them per cycle; a procedure
   already running keeps its own `drain-timeout` and probe settings)
+- every `warm-pool.*` setting (disabling the pool closes its parked
+  connections; changed bounds apply to future replenishment)
 
 Unchanged URL+kind routes preserve their recency pass, cooldown,
 pair-scoped target cooldowns, authentication-block, rotation state (last
-verified IP, stale history), and counters. A changed `weight` applies to the
-retained route without resetting any of it. Changing userinfo, kind, or
+verified IP, stale history), and counters. Changing userinfo, kind, or
 moving a route between `proxies.auto` and `proxies.manual` creates a fresh
 route state.
+
+## Warm upstream pool
+
+The optional `warm-pool` block (off by default) keeps a bounded set of
+half-established upstream connections ready in the background: TCP connected,
+SOCKS greeting and authentication done, **no `CONNECT` sent**. A parked
+connection knows nothing about any target — the gateway never pre-connects to
+a destination — so borrowing one removes the upstream TCP-connect and
+greeting round trips from a request's setup. Route selection, cooldown,
+auth-block, and rotation state are untouched by the pool.
+
+A request that has selected a route first tries to borrow a parked connection
+and falls back to the ordinary cold dial when none exists. Borrowing never
+waits: the pool is a non-blocking pop, so a burst simply drains it and serves
+cold — load above the bounds gets the no-pool behavior, not a queue. Failure
+classification is identical on both paths. A borrowed connection whose
+endpoint refuses the `CONNECT` is an ordinary `connect_target` with its
+pair-scoped cooldown; one whose transport died is discarded together with its
+parked siblings without touching route health, and the cold dial — with its
+usual reporting — decides. The pool itself never writes route health: routes
+that are rotating, auth-blocked, or cooling get their replenishment paused,
+not recorded.
+
+Rotation remains a hard lifecycle boundary. Each parked connection is stamped
+with the route's rotation epoch before its dial; a rotation invalidates the
+old generation, and a connection that straddles the boundary is closed rather
+than served into the new egress IP. Reloads behave like any runtime setting:
+disabling the block or removing a route closes that route's parked
+connections within one poll cycle, and shutdown closes every parked
+connection before the listener drain starts.
+
+Everything is bounded: `min-idle-per-proxy` and `max-idle-per-proxy` per
+route, a process-wide `max-total-idle`, at most `max-replenish-concurrency`
+background dials in total, and — when `max-replenish-per-route` is set
+(default `0`, uncapped) — at most that many replenish dials in flight toward
+any single route. The fleet cap bounds the process; the per-route cap
+protects a provider: a pool that mixes providers can hand each one only the
+concurrent handshakes it tolerates (a provider with R routes in the pool
+sees at most R × `max-replenish-per-route` concurrent warm dials). The
+remaining bounds are exponential backoff on replenish dial failures and an
+`idle-ttl` that expires connections nobody borrowed. Replenishment follows
+consumption — a borrow schedules the refill — so the pool keeps up with
+steady traffic instead of refilling on a fixed tick alone.
+
+Whether the pool pays is measured, not assumed: the paired `WarmAB`/`WarmHA`
+benchmarks ([`e2e/BENCH.md`](e2e/BENCH.md)) run identical scenarios with the
+pool disabled and enabled side by side. The first recorded measurement
+showed remote upstreams (10–30 ms RTT) gaining ~50 % setup latency with a
+borrow ratio near 1.0, near-loopback upstreams gaining only ~20 %, and
+concurrent route failures costing a few extra failed operations per window —
+the discard-and-redial leg of a dying route's borrowed connection. Enable it
+where upstream round trips are real.
+
+`/status` always carries a `warmPool` section: `enabled` (false while the
+block is absent or says so), the active bounds and worker count, total idle,
+cumulative `created`/`borrowed`/`discardedStale`/`discardedOverflow`/
+`generationInvalidated`/`connectFailed`/`replenishAttempts` counters, and
+per-route `idle`/`pending`/`flying` (the last is that route's in-flight
+replenish dials) — upstream identities are `host:port` only, as
+everywhere else.
 
 ## Failure and route-health contract
 
@@ -401,19 +437,14 @@ route state.
 | Client cancellation/disconnect                                                                                                | No health mutation and no retry                                               | Close connection                                                                 |
 | Established tunnel breaks                                                                                                     | No health mutation                                                            | Close tunnel                                                                     |
 
-The pool serves the eligible route with the smallest weighted recency pass:
-every pick, completed request, and stale return advances the route's pass by
-one step inversely proportional to its `weight`, so picks distribute
-proportionally to the configured weights and equal weights give true
-round-robin. On the mixed listener, a configured `balance` block composes a
-family clock above this order: the family whose clock is furthest behind
-serves first — zero-share families only as standby — and the weighted order
-then picks the route inside that family; only mixed picks move those clocks,
-so dedicated-listener traffic never shifts the split's phase. A request never
+The pool serves the eligible route with the smallest recency pass: every pick,
+completed request, and stale return advances the route's pass by one step, and
+first-seen order breaks ties, giving true round-robin across the eligible set.
+A request never
 tries the same route
 twice. Cooling routes are skipped when a usable eligible route exists; when
 all eligible non-auth-blocked routes cool down, the one recovering soonest is
-tried — weight- and family-blind, because soonest recovery is the only
+tried — blind to selection order, because soonest recovery is the only
 criterion that matters there. Authentication blocks remain until the route
 identity changes on reload.
 
@@ -470,9 +501,19 @@ answered with `05 07` (command not supported) and the connection is closed.
 ### Target addresses
 
 IPv4 (`0x01`), domain name (`0x03`), and IPv6 (`0x04`) target address types
-are all supported. Domain targets are forwarded as names: DNS resolution
-happens at the outbound SOCKS route (socks5h semantics) and the gateway never
-resolves target names itself.
+are all supported, and the gateway preserves the inbound request's address
+type to the egress CONNECT: an IPv4 target leaves as an IPv4 target, an IPv6
+target as IPv6, and a domain as the untouched hostname. The gateway never
+re-classifies a target by inspecting its string and never resolves target
+names itself — DNS resolution happens at the outbound SOCKS route.
+
+This is what makes the gateway transparent for both client conventions that
+the `socks5://` and `socks5h://` URL schemes name. They are not two protocols:
+both send plain RFC 1928 SOCKS5, and the only wire difference is the CONNECT
+frame's address type. A `socks5` client resolves the target itself and sends
+ATYP `0x01`/`0x04`; a `socks5h` client sends the name as ATYP `0x03` and lets
+the far end resolve. Either way, whatever address type arrives on ingress is
+exactly what the selected outbound route receives.
 
 ### Replies
 
@@ -514,8 +555,8 @@ ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 redacted `pool` state. It additionally reports safe per-listener counters —
 `requests` and `failovers` (in-band route fallbacks, distinct from rotations) —
 each route's `kind` and `origin`, each manual route's rotation view (see
-"Manual rotation routes"), and the active `balance` family split when one is
-configured. A listener's `requests` counter advances only on a valid `CONNECT`
+"Manual rotation routes"), and a `warmPool` section (see
+["Warm upstream pool"](#warm-upstream-pool)). A listener's `requests` counter advances only on a valid `CONNECT`
 command that reaches route selection; a greeted client that is rejected during
 protocol negotiation (no `0x00` method, unsupported command, malformed frame)
 never advances it. Route identities are always `host:port`, never
