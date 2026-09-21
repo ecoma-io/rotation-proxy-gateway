@@ -9,13 +9,15 @@ License 2.0, and that you have the right to grant that license.
 
 ## The behavior contract
 
-[`README.md`](README.md) is the authoritative behavior contract: failure
+The [`docs/`](docs/) pages are the authoritative behavior contract: failure
 classification, reload semantics, shutdown ordering, rotation states, and
-what may never reach a log line or `/status`. [`AGENTS.md`](AGENTS.md)
-carries the working guidance built on top of it.
+what may never reach a log line or `/status`. [`README.md`](README.md) is the
+entry point, and [`AGENTS.md`](AGENTS.md) carries the working guidance built
+on top of the contract.
 
-A change that moves documented behavior updates both documents in the same
-pull request. A document that lags the code is a defect, not a follow-up.
+A change that moves documented behavior updates the affected docs page and
+AGENTS in the same pull request. A document that lags the code is a defect,
+not a follow-up.
 
 ## Setting up
 

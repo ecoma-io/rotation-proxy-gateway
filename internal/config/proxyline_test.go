@@ -5,8 +5,9 @@ import (
 	"testing"
 )
 
-// The README documents exactly three accepted proxy forms; route lines carry
-// no scheme because the endpoint protocol is always SOCKS5. These tests pin
+// The configuration docs (docs/configuration.md) define exactly three
+// accepted proxy forms; route lines carry no scheme because the endpoint
+// protocol is always SOCKS5. These tests pin
 // that surface directly against parseRouteSpec, the single entry the runtime
 // loader uses for every proxies.auto item.
 func TestParseRouteSpecAcceptsDocumentedForms(t *testing.T) {

@@ -6,10 +6,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        [`README.md`](../../blob/main/README.md) is the behavior contract. A
-        proposal that moves documented behavior must say which sections
-        change, and the pull request that lands it updates those sections in
-        the same pass.
+        The [`docs/`](../../tree/main/docs) pages are the behavior contract.
+        A proposal that moves documented behavior must say which page and
+        sections change, and the pull request that lands it updates those
+        sections in the same pass.
 
         Already-decided out of scope (a proposal here should argue the
         decision, not restate the wish):
@@ -19,8 +19,9 @@ body:
           is SOCKS5 (RFC 1928) by design; the removed `global` block keys
           (`target-tls-insecure`, `max-body-buffer`) are not coming back.
         - Manual reload triggers (SIGHUP, filesystem events) — the 1s
-          content-hash poller is a design, not a gap; see README
-          "Reload behavior" for the blind spot no watcher fixes.
+          content-hash poller is a design, not a gap; see
+          [Reload behavior](../../blob/main/docs/configuration.md#reload-behavior)
+          for the blind spot no watcher fixes.
   - type: checkboxes
     id: before-filing
     attributes:

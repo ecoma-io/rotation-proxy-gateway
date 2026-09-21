@@ -10,7 +10,8 @@ SOCKS5 proxy listener views over one shared route-health pool:
 
 The always-on admin listener defaults to `0.0.0.0:30120`; operators control
 network exposure through Docker port publishing, network policy, and firewalls.
-The authoritative behavior contract is [`README.md`](README.md).
+The authoritative behavior contract lives under [`docs/`](docs/);
+[`README.md`](README.md) is the entry point.
 
 ## Build and test
 
@@ -68,8 +69,8 @@ replacements both reload under any mount style. A failed parse/validation
 leaves the last-known-good pool and runtime settings serving. Do not add a
 manual reload fallback (for example SIGHUP), and do not reintroduce
 event-based watching: neither can fix the one blind spot, a rename-over a
-single-file bind mount (the mount pins the old inode) — see README
-"Reload behavior".
+single-file bind mount (the mount pins the old inode) — see
+[`docs/configuration.md`](docs/configuration.md) "Reload behavior".
 The removed HTTP era's `global:` block is rejected: a config containing
 `target-tls-insecure` or `max-body-buffer` fails validation — the
 last-known-good config keeps serving, and on first boot the process refuses
@@ -85,7 +86,8 @@ address families. Do not infer kind by resolving a hostname.
 
 ## Behavior notes
 
-Read [`README.md`](README.md) before changing failure classification.
+Read [`docs/failure-and-health.md`](docs/failure-and-health.md) before
+changing failure classification.
 
 - The pool selects the usable **eligible** route with the smallest recency
   pass, first-seen order breaking ties — true round-robin over the eligible
@@ -201,8 +203,8 @@ curl http://127.0.0.1:30120/status
 listeners (admin is HTTP; the proxy listeners are SOCKS5) on all host
 interfaces. It bind-mounts `config.yaml` read-only; hot
 reload polls content, so in-place host edits apply without restart, while an
-atomic replace across the single-file mount stays invisible (see README
-"Reload behavior"). Compose defaults to bounded `json-file` logs and uses the
+atomic replace across the single-file mount stays invisible (see
+[`docs/configuration.md`](docs/configuration.md) "Reload behavior"). Compose defaults to bounded `json-file` logs and uses the
 binary `healthcheck` subcommand (no shell in the scratch image).
 
 ## Layout
@@ -214,6 +216,7 @@ binary `healthcheck` subcommand (no shell in the scratch image).
 - `internal/warmpool` — background pool of half-established upstream connections, bounded per route and process-wide, epoch-invalidated by rotation, borrowed on the serving path
 - `internal/rotation` — manual-route rotation engine: scheduling under the concurrency cap, drain, probes, rotate calls, verification, backoff
 - `cmd/rotation-proxy-gateway` — lifecycle, signals, watcher, admin endpoints
+- `docs` — the behavior-contract pages (configuration, rotation, warm pool, failure and route health, inbound SOCKS5, observability, deployment)
 - `e2e` — black-box tests and benchmarks driving the real binary as a
   subprocess with SOCKS5/HTTP/trace/rotate-API simulators; `go test ./e2e/`
   (skip with `-short`), baselines in `e2e/BENCH.md`

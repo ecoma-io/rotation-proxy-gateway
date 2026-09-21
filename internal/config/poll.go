@@ -23,7 +23,7 @@ const DefaultPollInterval = time.Second
 // atomic replacements, and directory or single-file bind mounts all behave
 // identically. The one invisible case is a rename-over a single-file bind
 // mount: the mount pins the old inode, so no in-process reader can observe
-// the replacement (see README "Reload behavior").
+// the replacement (see docs/configuration.md, "Reload behavior").
 type Poller struct {
 	path     string
 	interval time.Duration
