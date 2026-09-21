@@ -52,7 +52,8 @@ exactly what the selected outbound route receives.
 
 - Success: `05 00` with a zero BND.ADDR/BND.PORT. Clients must ignore the
   bound address; the gateway does not bind a local relay endpoint.
-- No eligible route remains (`no_route`) and local setup errors: `05 01`
+- No eligible route remains (`no_route`), the retry budget spent while
+  eligible routes remained (`retry_exhausted`), and local setup errors: `05 01`
   (general failure), followed by a close.
 - Unsupported command: `05 07`, followed by a close.
 - Malformed or truncated frames — bad version, bad reserved byte, unknown

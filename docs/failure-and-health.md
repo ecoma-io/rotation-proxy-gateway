@@ -27,6 +27,10 @@ classified, how routes are selected, and what each outcome does to health.
   target) and every error after the tunnel is established, including target
   reads, writes, cancellation, and established-tunnel failures.
 - **`no_route`**: no eligible untried route remains.
+- **`retry_exhausted`**: the `max-retries` budget was spent while eligible
+  untried routes still remained — the pool ran out of retries, not routes.
+  The client still receives `05 01`; the distinct kind only tells the
+  operator which condition ended the chain.
 
 | Outcome                                                                                                                       | Pool handling                                                                 | Request handling                                                                 |
 | ----------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
@@ -41,7 +45,10 @@ classified, how routes are selected, and what each outcome does to health.
 
 A request tries at most `max-retries` distinct eligible routes in total (see
 [configuration](configuration.md#runtime-yaml)); a request never tries the same
-route twice.
+route twice. When the chain stops, the terminal record distinguishes which
+condition did it: if a pick found no eligible untried route the kind is
+`no_route`, and if the retry budget expired first while eligible routes
+remained the kind is `retry_exhausted`.
 
 ## Selection
 

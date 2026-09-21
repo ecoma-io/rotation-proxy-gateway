@@ -29,7 +29,10 @@ func TestE2E_ExhaustedPoolNoRouteWithCooldownDoubling(t *testing.T) {
 		{Proxy: deadRouteValue(t), Kind: "v4"},
 		{Proxy: deadRouteValue(t), Kind: "v4"},
 	})
-	cfg.MaxRetries = 2 // both routes tried per request, then terminal no_route
+	// With pool size == max-retries, the cap ends the chain after both routes
+	// were tried; the budget, not route exhaustion, stops it, so the terminal
+	// record is retry_exhausted, not no_route.
+	cfg.MaxRetries = 2
 	g := NewGateway(t, cfg)
 
 	// Request n leaves each route at n consecutive failures and a cooldown of
@@ -73,7 +76,57 @@ func TestE2E_ExhaustedPoolNoRouteWithCooldownDoubling(t *testing.T) {
 		}
 	}
 
-	waitForLogRecord(t, g, map[string]string{"msg": "tunnel failed", "error_kind": "no_route", "attempts": "2"}, 5*time.Second)
+	waitForLogRecord(t, g, map[string]string{"msg": "tunnel failed", "error_kind": "retry_exhausted", "attempts": "2"}, 5*time.Second)
+}
+
+// The terminal record must reflect which condition ended the chain: a true
+// pool exhaustion logs no_route — the issue #39 case of pool==max-retries
+// covers that — while stopping at the retry cap with eligible routes still
+// untried logs retry_exhausted. The client still gets 05 01 in both cases.
+func TestE2E_RetryCapExhaustionLogsDistinctKind(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	target := NewEchoTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{
+		{Proxy: deadRouteValue(t), Kind: "v4"},
+		{Proxy: deadRouteValue(t), Kind: "v4"},
+		{Proxy: deadRouteValue(t), Kind: "v4"},
+	})
+	cfg.MaxRetries = 2 // three routes, the cap stops the chain with one untried
+	g := NewGateway(t, cfg)
+
+	failedSocksTunnel(t, g.MixedAddr, target.Host)
+
+	// The cap ends the chain after two attempts: eligible routes remained.
+	waitForLogRecord(t, g, map[string]string{
+		"msg": "tunnel failed", "error_kind": "retry_exhausted", "attempts": "2",
+	}, 5*time.Second)
+	for _, rec := range decodeLogRecords(g.Logs()) {
+		if recordHas(rec, map[string]string{"msg": "tunnel failed", "error_kind": "no_route"}) {
+			t.Fatalf("retry-cap stop wrongly logged no_route:\n%s", g.Logs())
+		}
+	}
+	st, err := g.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Pool) != 3 {
+		t.Fatalf("pool size = %d, want 3", len(st.Pool))
+	}
+	// Two attempts dialed two distinct routes once each; the third route never
+	// was tried — proof that eligible routes remained when the cap stopped the
+	// chain. The two dialed routes report their 5s base cooldown still in the
+	// window.
+	dialed := 0
+	for _, e := range st.Pool {
+		if e.Failures == 1 {
+			dialed++
+		}
+	}
+	if dialed != 2 {
+		t.Fatalf("dialed routes = %d, want 2 of 3 tried before the cap stopped the chain: %+v", dialed, st.Pool)
+	}
 }
 
 // A tunnel established before a reload must keep relaying on its original
