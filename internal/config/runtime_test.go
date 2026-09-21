@@ -352,6 +352,9 @@ func TestLoadRuntimeRejectsInvalidManualRoutes(t *testing.T) {
 		{"invalid header name", "          Content-Type: application/json\n", "          Content Type: application/json\n", "api.headers contains an invalid header name"},
 		{"unknown manual field", "      rotate-interval: 90s\n", "      rotate-interval: 90s\n      interval: 90\n", "invalid keys"},
 		{"missing kind", "      kind: v6\n      rotate-interval: 90s\n", "      rotate-interval: 90s\n", "kind must be exactly v4 or v6"},
+		// Manual routes share the schemeless endpoint rules: a scheme'd line
+		// is rejected just like an auto route's.
+		{"schemed proxy line", "    - proxy: carol:manual-secret@manual.example:1080\n", "    - proxy: socks5://carol:manual-secret@manual.example:1080\n", "carry no scheme"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			content := strings.Replace(validRuntimeConfig, tc.old, tc.replacement, 1)

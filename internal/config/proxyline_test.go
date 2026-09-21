@@ -88,9 +88,18 @@ func TestParseRouteSpecRejectsUndocumentedForms(t *testing.T) {
 		{"empty host", ":1080", "invalid proxy format"},
 		{"at-form missing port", "route-user:route-pass@provider.example", "port is required"},
 		{"at-form empty host", "route-user:route-pass@:1080", "host is required"},
+		{"at-form username without password", "route-user@provider.example:1080", "credentials must be user:pass@host:port"},
+		{"at-form empty password", "route-user:@provider.example:1080", "credentials must be user:pass@host:port"},
+		{"at-form empty username and password", ":@provider.example:1080", "credentials must be user:pass@host:port"},
 		{"bare form missing password", "provider.example:1080:route-user", "invalid proxy format"},
 		{"bare form password with colon", "provider.example:1080:route-user:pa:ss", "invalid proxy format"},
 		{"unterminated ipv6 bracket", "[2001:db8::1:1080:route-user:route-pass", "invalid proxy format"},
+		{"host with a space", "exa mple.com:1080", "invalid proxy format"},
+		{"host with a space and credentials", "exa mple.com:1080:route-user:route-pass", "invalid proxy format"},
+		{"host with a fragment separator", "exa#mple.com:1080", "invalid proxy format"},
+		{"host with a query separator", "exa?mple.com:1080", "invalid proxy format"},
+		{"host with a path separator", "exa/mple.com:1080", "invalid proxy format"},
+		{"host with a percent sign", "exa%mple.com:1080", "invalid proxy format"},
 		{"port zero", "provider.example:0", "invalid proxy port"},
 		{"port above range", "provider.example:70000", "invalid proxy port"},
 		{"port not numeric", "provider.example:socks", "invalid proxy port"},
@@ -110,9 +119,17 @@ func TestParseRouteSpecErrorNeverContainsCredentials(t *testing.T) {
 	for _, raw := range []string{
 		"provider.example:0:route-user:route-pass",
 		"provider.example:1080:route-user:route-pass:extra",
+		// A mistyped bare line whose port position holds the password
+		// ("host:password"): the port rejection must name only the port rule.
+		"provider.example:route-pass",
 		"route-user:route-pass@provider.example:0",
 		"route-user:route-pass@provider.example:70000",
 		"route-user:route-pass@provider.example:1080/path",
+		// Credential shapes outside the documented user:pass pair.
+		"route-user@provider.example:1080",
+		"route-user:@provider.example:1080",
+		":@provider.example:1080",
+		"exa mple.com:1080:route-user:route-pass",
 		"socks5://route-user:route-pass@provider.example:1080",
 	} {
 		_, err := parseRouteSpec(autoProxyFileConfig{Proxy: raw, Kind: "v4"})

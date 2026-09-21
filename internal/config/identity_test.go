@@ -42,10 +42,11 @@ func TestCanonicalRouteIDDistinguishesCredentials(t *testing.T) {
 // Equivalent spellings must still collapse: scheme and host case normalize
 // (IPv6 included) while credential case is preserved as a real difference.
 func TestCanonicalRouteIDNormalization(t *testing.T) {
+	// Config now only ever produces socks5 URLs, so scheme case can no longer
+	// vary from the outside; host and port normalization are the live surface.
 	same := [][2]string{
 		{"socks5://user:pass@Provider.example:1080", "socks5://user:pass@provider.EXAMPLE:1080"},
 		{"socks5://user:pass@[2001:DB8::1]:1080", "socks5://user:pass@[2001:db8::1]:1080"},
-		{"SOCKS5://user:pass@provider.example:1080", "socks5://user:pass@provider.example:1080"},
 		{"socks5://user:pass@provider.example:1080", "socks5://user:pass@provider.example:01080"},
 	}
 	for _, pair := range same {
