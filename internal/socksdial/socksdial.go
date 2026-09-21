@@ -2,7 +2,11 @@
 // shared by the proxy server and the rotation engine so both speak identical
 // SOCKS semantics and error classification. Every dial carries its target's
 // address type explicitly: the CONNECT request encodes exactly the type the
-// caller hands over and never re-infers it from the host string.
+// caller hands over and never re-infers it from the host string. Dialing is
+// staged: DialHalf establishes the endpoint connection through method/auth
+// negotiation, and CompleteConnect sends the CONNECT for one target — so a
+// caller may park the half connection between the stages. Dial is the two
+// stages back to back.
 package socksdial
 
 import (
@@ -184,12 +188,16 @@ func TargetFromAddr(addr string) (Target, error) {
 
 // Dial establishes a TCP connection to t through a SOCKS5 upstream, encoding
 // t.Type as the CONNECT address type. The returned connection is ready for
-// arbitrary byte transport.
+// arbitrary byte transport. It is the staged dial with no pause between
+// stages, and it keeps the single-budget behavior the undivided dial had:
+// CompleteConnect receives the remainder of the one deadline window DialHalf
+// armed.
 func Dial(ctx context.Context, pu *url.URL, t Target, timeout time.Duration) (net.Conn, error) {
-	if pu.Scheme != "socks5" {
-		return nil, &SocksProtocolError{Op: "validate scheme", Err: fmt.Errorf("unsupported upstream scheme %q", pu.Scheme)}
+	hc, err := DialHalf(ctx, pu, timeout)
+	if err != nil {
+		return nil, err
 	}
-	return dialSocks5(ctx, pu, t, timeout)
+	return hc.CompleteConnect(t, time.Until(hc.deadline))
 }
 
 // DialTCP dials addr directly; endpoint failures wrap ProxyDialError.
@@ -218,132 +226,9 @@ func dialTCP(ctx context.Context, addr string, timeout time.Duration) (net.Conn,
 	return conn, nil
 }
 
-// failSetup and failHandshake close the endpoint connection and wrap the
-// cause in the error class the proxy server's failure classification reads.
-// Plain functions rather than closures over conn: the failure paths then
-// allocate no extra escape-to-heap bookkeeping per call.
-func failSetup(conn net.Conn, op string, err error) (net.Conn, error) {
-	_ = conn.Close()
-	return nil, &SocksProtocolError{Op: op, Err: err}
-}
-
-func failHandshake(conn net.Conn, op string, err error) (net.Conn, error) {
-	_ = conn.Close()
-	return nil, &SocksHandshakeError{Op: op, Err: err}
-}
-
-// dialSocks5 tunnels to t through a SOCKS5 proxy per RFC 1928 with optional
-// username/password authentication per RFC 1929. The CONNECT request carries
-// t.Type exactly as given; a domain target reaches the endpoint as a name for
-// it to resolve.
-func dialSocks5(ctx context.Context, pu *url.URL, t Target, timeout time.Duration) (net.Conn, error) {
-	conn, err := dialTCP(ctx, upstreamHostPort(pu), timeout)
-	if err != nil {
-		return nil, err
-	}
-	user, pass := "", ""
-	if pu.User != nil {
-		user = pu.User.Username()
-		pass, _ = pu.User.Password()
-	}
-	wantAuth := user != "" || pass != ""
-
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return failHandshake(conn, "set handshake deadline", err)
-	}
-	br := handshakeBufPool.Get().(*bufio.Reader)
-	br.Reset(conn)
-	defer func() {
-		br.Reset(nil)
-		handshakeBufPool.Put(br)
-	}()
-
-	// VER NMETHODS METHODS...: no auth, plus username/password when the route
-	// carries credentials (RFC 1929). One exact-cap buffer, one write.
-	greet := make([]byte, 0, 4)
-	greet = append(greet, 0x05, 0x01, 0x00)
-	if wantAuth {
-		greet[1] = 0x02
-		greet = append(greet, 0x02)
-	}
-	if _, err := conn.Write(greet); err != nil {
-		return failHandshake(conn, "send greeting", err)
-	}
-	var hdr [4]byte
-	choice := hdr[:2]
-	if _, err := io.ReadFull(br, choice); err != nil {
-		return failHandshake(conn, "read greeting", err)
-	}
-	if choice[0] != 0x05 {
-		return failHandshake(conn, "read greeting", fmt.Errorf("unexpected SOCKS version 0x%02x", choice[0]))
-	}
-	switch choice[1] {
-	case 0x00: // no auth needed
-	case 0x02:
-		if !wantAuth {
-			_ = conn.Close()
-			return nil, &ProxyAuthError{Reason: "endpoint requires credentials but none are configured"}
-		}
-		if len(user) > 255 || len(pass) > 255 {
-			return failSetup(conn, "encode credentials", fmt.Errorf("username or password exceeds SOCKS5 length limit"))
-		}
-		// ULEN UNAME PLEN PASSWD, one exact-cap buffer: credentials are
-		// bounded by the 255-byte length checks above.
-		b := make([]byte, 0, 3+len(user)+len(pass))
-		b = append(b, 0x01, byte(len(user)))
-		b = append(b, user...)
-		b = append(b, byte(len(pass)))
-		b = append(b, pass...)
-		if _, err := conn.Write(b); err != nil {
-			return failHandshake(conn, "send authentication", err)
-		}
-		reply := hdr[:2]
-		if _, err := io.ReadFull(br, reply); err != nil {
-			return failHandshake(conn, "read authentication", err)
-		}
-		if reply[0] != 0x01 {
-			return failHandshake(conn, "read authentication", fmt.Errorf("unexpected auth version 0x%02x", reply[0]))
-		}
-		if reply[1] != 0x00 {
-			_ = conn.Close()
-			return nil, &ProxyAuthError{Reason: "endpoint rejected credentials"}
-		}
-	case 0xff:
-		_ = conn.Close()
-		return nil, &ProxyAuthError{Reason: "endpoint accepted no offered authentication method"}
-	default:
-		return failHandshake(conn, "negotiate authentication", fmt.Errorf("unsupported method 0x%02x", choice[1]))
-	}
-
-	req, err := socksConnectRequest(t)
-	if err != nil {
-		return failSetup(conn, "encode target", err)
-	}
-	if _, err := conn.Write(req); err != nil {
-		return failHandshake(conn, "send connect", err)
-	}
-	head := hdr[:4]
-	if _, err := io.ReadFull(br, head); err != nil {
-		return failHandshake(conn, "read connect", err)
-	}
-	if head[0] != 0x05 || head[2] != 0x00 {
-		return failHandshake(conn, "read connect", fmt.Errorf("invalid SOCKS response"))
-	}
-	if head[1] != 0x00 {
-		// The endpoint spoke a complete reply refusing this target: the route
-		// works, the (route, target) pair does not. SocksReplyError inside the
-		// handshake error is what splits pair-scoped from route-scoped health.
-		return failHandshake(conn, "connect target", &SocksReplyError{Reply: head[1]})
-	}
-	if err := discardSocksBoundAddress(br, head[3]); err != nil {
-		return failHandshake(conn, "read bound address", err)
-	}
-	if err := conn.SetDeadline(time.Time{}); err != nil {
-		_ = conn.Close()
-		return nil, &SocksHandshakeError{Op: "clear handshake deadline", Err: err}
-	}
-	return withBufferedPrefix(conn, br), nil
-}
+// dialSocks5's two stages live in halfconn.go: DialHalf performs everything
+// up to and including method/auth negotiation, and (*HalfConn).CompleteConnect
+// frames and finishes the CONNECT for one target.
 
 // socksConnectRequest encodes the CONNECT request — VER CMD RSV ATYP
 // DST.ADDR DST.PORT — carrying exactly t.Type. IPv4 goes out as four address
