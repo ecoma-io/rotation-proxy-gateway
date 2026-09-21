@@ -1,7 +1,12 @@
-# Deployment credentials are bind-mounted at runtime and must not enter builds.
+# Deployment credentials are bind-mounted at runtime and must not enter
+# builds. The pattern is the literal ".env" — a name-exact match that leaves
+# ".env.example" (documentation) in the context; both directions are pinned
+# by the guard tests in cmd/rotation-proxy-gateway/dockerignore_test.go.
 config.yaml
+.env
 
 # Local development artifacts do not belong in the build context.
 .git
 .claude
 bin
+node_modules
