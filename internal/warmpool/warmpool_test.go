@@ -2,6 +2,8 @@ package warmpool
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"io"
 	"net"
 	"net/url"
@@ -13,6 +15,7 @@ import (
 
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
+	"rotation-proxy-gateway/internal/socksdial"
 )
 
 // The tests drive the pool's state machine synchronously — sweep() plus a
@@ -252,6 +255,76 @@ func TestGlobalCapLimitsRefill(t *testing.T) {
 	if got := wp.Snapshot().IdleTotal; got > w.MaxTotalIdle {
 		t.Fatalf("total idle after refill = %d exceeds cap %d", got, w.MaxTotalIdle)
 	}
+}
+
+// TestPerRouteReplenishCapHolds pins the multi-provider protection: the fleet
+// gate alone lets one hot route take every in-flight dial toward one provider;
+// max-replenish-per-route holds each route to its own share while the rest of
+// the fleet stays available to other routes.
+func TestPerRouteReplenishCapHolds(t *testing.T) {
+	srvA := newHalfServer(t, "ok")
+	srvB := newHalfServer(t, "ok")
+	w := defaultWarm()
+	w.MinIdlePerProxy = 2
+	w.MaxTotalIdle = 8
+	w.MaxReplenishConcurrency = 4 // fleet has room beyond two routes × cap 1
+	w.MaxReplenishPerRoute = 1
+	store, _ := warmStore(w, mustURL(t, "socks5://"+srvA.addr), mustURL(t, "socks5://"+srvB.addr))
+
+	release := make(chan struct{})
+	var calls atomic.Int64
+	wp := New(store, zerolog.Nop(), func(ctx context.Context, pu *url.URL, timeout time.Duration) (*socksdial.HalfConn, error) {
+		if calls.Add(1) <= 2 {
+			<-release // hold the first two dials in the air
+			return nil, errors.New("blocked dial failed")
+		}
+		return socksdial.DialHalf(ctx, pu, timeout)
+	})
+	defer wp.Stop()
+
+	wp.sweep()
+	t1, ok := wp.claimTask()
+	if !ok {
+		t.Fatal("first claim failed")
+	}
+	t2, ok := wp.claimTask()
+	if !ok {
+		t.Fatal("second claim failed")
+	}
+	if t1.p == t2.p {
+		t.Fatal("both claims went to one route; the per-route cap should spread claims across routes")
+	}
+	if _, ok := wp.claimTask(); ok {
+		t.Fatal("third claim succeeded with both routes at cap 1 while the fleet had room")
+	}
+	st := wp.Snapshot()
+	if st.MaxReplenishPerRoute != 1 {
+		t.Fatalf("status maxReplenishPerRoute = %d, want 1", st.MaxReplenishPerRoute)
+	}
+	for _, r := range st.Routes {
+		if r.Flying != 1 {
+			t.Fatalf("route %s flying = %d, want 1 while its dial is in the air", r.Upstream, r.Flying)
+		}
+	}
+
+	// Releasing the dials runs them to the error path, which must return the
+	// reservations — otherwise the routes stay capped forever after failures.
+	close(release)
+	wp.runDial(t1)
+	wp.runDial(t2)
+	for _, r := range wp.Snapshot().Routes {
+		if r.Flying != 0 {
+			t.Fatalf("after failed dials route %s flying = %d, want 0 (reservation returned)", r.Upstream, r.Flying)
+		}
+	}
+
+	// Reservations returned, the routes re-arm: once the failure backoff
+	// lifts, real dials refill both routes to min-idle.
+	waitFor(t, "warm refill after backoff", 3*time.Second, func() bool {
+		wp.sweep()
+		drain(wp)
+		return wp.Snapshot().IdleTotal == w.MinIdlePerProxy*2
+	})
 }
 
 func TestBorrowPopsOldestAndMissesWhenEmpty(t *testing.T) {

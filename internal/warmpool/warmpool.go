@@ -58,9 +58,10 @@ const (
 )
 
 // Per-route backoff for replenish dials that keep failing: doubling from 1s
-// capped at 8s, with ±10% jitter. The worker count is the hard ceiling on
-// concurrent dials toward any endpoint; the backoff keeps a dead one from
-// pinning them cycle after cycle.
+// capped at 8s, with ±10% jitter. The fleet size caps concurrent dials
+// process-wide and max-replenish-per-route (when set) caps them toward one
+// endpoint; the backoff keeps a dead route from pinning its share cycle
+// after cycle.
 const (
 	warmBackoffBase = time.Second
 	warmBackoffMax  = 8 * time.Second
@@ -125,6 +126,13 @@ type routeBucket struct {
 	// pending counts deficits the sweeper scheduled that no worker has
 	// claimed yet, so bursts of wakeups do not become thundering-herd dials.
 	pending int
+
+	// flying counts claimed dials still in the air for this route. pending
+	// and flying hand off at claim time — claim decrements one and
+	// increments the other — so pending+flying is the dials this route is
+	// owed. The per-route replenish cap gates on flying alone: those dials
+	// exist whether or not the sweeper schedules more.
+	flying int
 
 	// failStreak/backoffUntil slow replenishment after dial failures.
 	failStreak   int
@@ -284,7 +292,10 @@ func (wp *Pool) sweep() {
 		if !wp.replenishEligibleLocked(p, b, now) {
 			continue
 		}
-		for deficit := cfg.MinIdlePerProxy - (len(b.ready) + b.pending); deficit > 0; deficit-- {
+		// Flying counts as owned: a dial in the air satisfies the deficit as
+		// surely as a scheduled one, and skipping it would double-schedule on
+		// every pass that lands between claim and completion.
+		for deficit := cfg.MinIdlePerProxy - (len(b.ready) + b.pending + b.flying); deficit > 0; deficit-- {
 			if total >= cfg.MaxTotalIdle {
 				break
 			}
@@ -439,10 +450,15 @@ func (wp *Pool) claimTask() (dialTask, bool) {
 	}
 	now := time.Now()
 	for p, b := range wp.buckets {
-		if b.pending == 0 || !wp.replenishEligibleLocked(p, b, now) {
+		// The per-route cap checks flying, not pending: reservations do not
+		// reach the provider, in-air handshakes do. A bucket at its cap is
+		// skipped, not failed — other buckets still get the worker.
+		if b.pending == 0 || (cfg.MaxReplenishPerRoute > 0 && b.flying >= cfg.MaxReplenishPerRoute) ||
+			!wp.replenishEligibleLocked(p, b, now) {
 			continue
 		}
 		b.pending--
+		b.flying++
 		return dialTask{p: p, b: b, epoch: p.RotationEpoch()}, true
 	}
 	return dialTask{}, false
@@ -453,6 +469,8 @@ func (wp *Pool) claimTask() (dialTask, bool) {
 // a rotation begun under it, a config that disabled the pool, a bound that
 // shrank, or a stopped pool each turn the fresh connection into a close
 // instead of an enqueue — an orphaned socket must never outlive its bucket.
+// Every exit path returns the task's flying reservation under mu, so a
+// deleted bucket just takes a harmless decrement on an orphaned object.
 func (wp *Pool) runDial(t dialTask) {
 	wp.replenishAttempts.Add(1)
 	wp.dialing.Add(1)
@@ -462,6 +480,7 @@ func (wp *Pool) runDial(t dialTask) {
 
 	if err != nil {
 		wp.mu.Lock()
+		t.b.flying--
 		wp.connectFailed.Add(1)
 		var authErr *socksdial.ProxyAuthError
 		if errors.As(err, &authErr) {
@@ -479,6 +498,7 @@ func (wp *Pool) runDial(t dialTask) {
 	cfg := gen.Config.WarmPool
 	wp.mu.Lock()
 	if t.p.RotationEpoch() != t.epoch {
+		t.b.flying--
 		wp.generationInvalidated.Add(1)
 		wp.mu.Unlock()
 		_ = hc.Close()
@@ -486,11 +506,13 @@ func (wp *Pool) runDial(t dialTask) {
 	}
 	if wp.stopped || wp.buckets[t.p] != t.b || !cfg.Enabled ||
 		len(t.b.ready) >= cfg.MaxIdlePerProxy || wp.totalIdleLocked() >= cfg.MaxTotalIdle {
+		t.b.flying--
 		wp.discardedOverflow.Add(1)
 		wp.mu.Unlock()
 		_ = hc.Close()
 		return
 	}
+	t.b.flying--
 	t.b.failStreak = 0
 	t.b.backoffUntil = time.Time{}
 	t.b.ready = append(t.b.ready, &warmConn{hc: hc, epoch: t.epoch, created: time.Now()})
@@ -583,28 +605,32 @@ type RouteStatus struct {
 	Upstream string `json:"upstream"`
 	Idle     int    `json:"idle"`
 	Pending  int    `json:"pending"`
+	Flying   int    `json:"flying"`
 }
 
 // Status is the /status view of the warm pool: configured bounds, gauges
 // derived from bucket state, and the monotonic lifecycle counters.
 type Status struct {
-	Enabled                 bool          `json:"enabled"`
-	Stopped                 bool          `json:"stopped"`
-	Workers                 int           `json:"workers"`
-	IdleTotal               int           `json:"idleTotal"`
-	MinIdlePerProxy         int           `json:"minIdlePerProxy"`
-	MaxIdlePerProxy         int           `json:"maxIdlePerProxy"`
-	MaxTotalIdle            int           `json:"maxTotalIdle"`
-	MaxReplenishConcurrency int           `json:"maxReplenishConcurrency"`
-	IdleTTL                 string        `json:"idleTtl"`
-	Created                 uint64        `json:"created"`
-	Borrowed                uint64        `json:"borrowed"`
-	DiscardedStale          uint64        `json:"discardedStale"`
-	DiscardedOverflow       uint64        `json:"discardedOverflow"`
-	GenerationInvalidated   uint64        `json:"generationInvalidated"`
-	ConnectFailed           uint64        `json:"connectFailed"`
-	ReplenishAttempts       uint64        `json:"replenishAttempts"`
-	Routes                  []RouteStatus `json:"routes"`
+	Enabled                 bool `json:"enabled"`
+	Stopped                 bool `json:"stopped"`
+	Workers                 int  `json:"workers"`
+	IdleTotal               int  `json:"idleTotal"`
+	MinIdlePerProxy         int  `json:"minIdlePerProxy"`
+	MaxIdlePerProxy         int  `json:"maxIdlePerProxy"`
+	MaxTotalIdle            int  `json:"maxTotalIdle"`
+	MaxReplenishConcurrency int  `json:"maxReplenishConcurrency"`
+	// MaxReplenishPerRoute is the per-route in-flight dial cap; 0 means
+	// uncapped (the whole-fleet cap is the only ceiling).
+	MaxReplenishPerRoute  int           `json:"maxReplenishPerRoute"`
+	IdleTTL               string        `json:"idleTtl"`
+	Created               uint64        `json:"created"`
+	Borrowed              uint64        `json:"borrowed"`
+	DiscardedStale        uint64        `json:"discardedStale"`
+	DiscardedOverflow     uint64        `json:"discardedOverflow"`
+	GenerationInvalidated uint64        `json:"generationInvalidated"`
+	ConnectFailed         uint64        `json:"connectFailed"`
+	ReplenishAttempts     uint64        `json:"replenishAttempts"`
+	Routes                []RouteStatus `json:"routes"`
 }
 
 // Snapshot renders the pool's status. Routes are sorted by endpoint for a
@@ -622,6 +648,7 @@ func (wp *Pool) Snapshot() Status {
 		MaxIdlePerProxy:         cfg.MaxIdlePerProxy,
 		MaxTotalIdle:            cfg.MaxTotalIdle,
 		MaxReplenishConcurrency: cfg.MaxReplenishConcurrency,
+		MaxReplenishPerRoute:    cfg.MaxReplenishPerRoute,
 		IdleTTL:                 cfg.IdleTTL.String(),
 		Created:                 wp.created.Load(),
 		Borrowed:                wp.borrowed.Load(),
@@ -634,7 +661,7 @@ func (wp *Pool) Snapshot() Status {
 	}
 	for p, b := range wp.buckets {
 		st.IdleTotal += len(b.ready)
-		st.Routes = append(st.Routes, RouteStatus{Upstream: p.URL.Host, Idle: len(b.ready), Pending: b.pending})
+		st.Routes = append(st.Routes, RouteStatus{Upstream: p.URL.Host, Idle: len(b.ready), Pending: b.pending, Flying: b.flying})
 	}
 	sort.Slice(st.Routes, func(i, j int) bool { return st.Routes[i].Upstream < st.Routes[j].Upstream })
 	return st

@@ -12,6 +12,7 @@ const warmPoolBlock = `warm-pool:
   max-idle-per-proxy: 4
   max-total-idle: 16
   max-replenish-concurrency: 3
+  max-replenish-per-route: 1
   idle-ttl: 30s
 `
 
@@ -26,8 +27,12 @@ func TestLoadRuntimeWarmPoolDefaultsWhenAbsent(t *testing.T) {
 	}
 	if w.MinIdlePerProxy != DefaultWarmMinIdlePerProxy || w.MaxIdlePerProxy != DefaultWarmMaxIdlePerProxy ||
 		w.MaxTotalIdle != DefaultWarmMaxTotalIdle || w.MaxReplenishConcurrency != DefaultWarmMaxReplenishConcurrency ||
+		w.MaxReplenishPerRoute != DefaultWarmMaxReplenishPerRoute ||
 		w.IdleTTL != DefaultWarmIdleTTL {
 		t.Fatalf("warm-pool defaults = %+v", w)
+	}
+	if w.MaxReplenishPerRoute != 0 {
+		t.Fatalf("default max-replenish-per-route = %d, want 0 (uncapped)", w.MaxReplenishPerRoute)
 	}
 }
 
@@ -38,7 +43,8 @@ func TestLoadRuntimeWarmPoolFullBlock(t *testing.T) {
 	}
 	w := cfg.WarmPool
 	if !w.Enabled || w.MinIdlePerProxy != 2 || w.MaxIdlePerProxy != 4 ||
-		w.MaxTotalIdle != 16 || w.MaxReplenishConcurrency != 3 || w.IdleTTL != 30*time.Second {
+		w.MaxTotalIdle != 16 || w.MaxReplenishConcurrency != 3 ||
+		w.MaxReplenishPerRoute != 1 || w.IdleTTL != 30*time.Second {
 		t.Fatalf("warm-pool = %+v", w)
 	}
 }
@@ -67,6 +73,14 @@ warm-pool:
 		{"fractional count", `
 warm-pool:
   max-replenish-concurrency: 2.5
+`, "must be a whole number"},
+		{"negative per-route cap", `
+warm-pool:
+  max-replenish-per-route: -1
+`, "max-replenish-per-route must be >= 0"},
+		{"fractional per-route cap", `
+warm-pool:
+  max-replenish-per-route: 1.5
 `, "must be a whole number"},
 		{"bad duration", `
 warm-pool:

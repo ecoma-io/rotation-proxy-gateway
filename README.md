@@ -400,7 +400,13 @@ connection before the listener drain starts.
 
 Everything is bounded: `min-idle-per-proxy` and `max-idle-per-proxy` per
 route, a process-wide `max-total-idle`, at most `max-replenish-concurrency`
-background dials, exponential backoff on replenish dial failures, and an
+background dials in total, and — when `max-replenish-per-route` is set
+(default `0`, uncapped) — at most that many replenish dials in flight toward
+any single route. The fleet cap bounds the process; the per-route cap
+protects a provider: a pool that mixes providers can hand each one only the
+concurrent handshakes it tolerates (a provider with R routes in the pool
+sees at most R × `max-replenish-per-route` concurrent warm dials). The
+remaining bounds are exponential backoff on replenish dial failures and an
 `idle-ttl` that expires connections nobody borrowed. Replenishment follows
 consumption — a borrow schedules the refill — so the pool keeps up with
 steady traffic instead of refilling on a fixed tick alone.
@@ -418,7 +424,8 @@ where upstream round trips are real.
 block is absent or says so), the active bounds and worker count, total idle,
 cumulative `created`/`borrowed`/`discardedStale`/`discardedOverflow`/
 `generationInvalidated`/`connectFailed`/`replenishAttempts` counters, and
-per-route `idle`/`pending` — upstream identities are `host:port` only, as
+per-route `idle`/`pending`/`flying` (the last is that route's in-flight
+replenish dials) — upstream identities are `host:port` only, as
 everywhere else.
 
 ## Failure and route-health contract

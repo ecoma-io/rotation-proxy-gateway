@@ -51,10 +51,16 @@ const (
 	// connections (TCP + greeting + auth, no CONNECT) ready in the
 	// background; every bound is deliberately conservative, and the feature
 	// is off unless warm-pool.enabled says otherwise.
-	DefaultWarmMinIdlePerProxy         = 1
-	DefaultWarmMaxIdlePerProxy         = 2
-	DefaultWarmMaxTotalIdle            = 64
+	DefaultWarmMinIdlePerProxy = 1
+	DefaultWarmMaxIdlePerProxy = 2
+	DefaultWarmMaxTotalIdle    = 64
+	// DefaultWarmMaxReplenishConcurrency caps the whole worker fleet.
+	// DefaultWarmMaxReplenishPerRoute caps dials toward one route; 0 means
+	// uncapped, preserving the pre-knob behavior — the fleet cap alone is the
+	// ceiling until an operator splits a multi-provider pool's handshake
+	// tolerance per route.
 	DefaultWarmMaxReplenishConcurrency = 2
+	DefaultWarmMaxReplenishPerRoute    = 0
 	DefaultWarmIdleTTL                 = 45 * time.Second
 )
 
@@ -172,7 +178,13 @@ type WarmPoolSettings struct {
 	MaxIdlePerProxy         int
 	MaxTotalIdle            int
 	MaxReplenishConcurrency int
-	IdleTTL                 time.Duration
+	// MaxReplenishPerRoute caps replenish dials in flight toward one route
+	// (0 = uncapped). The fleet cap bounds the process; this one protects a
+	// provider that tolerates fewer concurrent handshakes than the fleet —
+	// a pool mixing providers divides each provider's tolerance across its
+	// routes and caps each route accordingly.
+	MaxReplenishPerRoute int
+	IdleTTL              time.Duration
 }
 
 // AllRoutes returns every serving route, auto first. The pool and the rotation
@@ -258,6 +270,7 @@ type warmPoolFileConfig struct {
 	MaxIdlePerProxy         any    `mapstructure:"max-idle-per-proxy"`
 	MaxTotalIdle            any    `mapstructure:"max-total-idle"`
 	MaxReplenishConcurrency any    `mapstructure:"max-replenish-concurrency"`
+	MaxReplenishPerRoute    any    `mapstructure:"max-replenish-per-route"`
 	IdleTTL                 string `mapstructure:"idle-ttl"`
 }
 
@@ -609,6 +622,7 @@ func parseWarmPoolSettings(raw warmPoolFileConfig) (WarmPoolSettings, error) {
 		MaxIdlePerProxy:         DefaultWarmMaxIdlePerProxy,
 		MaxTotalIdle:            DefaultWarmMaxTotalIdle,
 		MaxReplenishConcurrency: DefaultWarmMaxReplenishConcurrency,
+		MaxReplenishPerRoute:    DefaultWarmMaxReplenishPerRoute,
 		IdleTTL:                 DefaultWarmIdleTTL,
 	}
 	if raw.Enabled != nil {
@@ -634,6 +648,11 @@ func parseWarmPoolSettings(raw warmPoolFileConfig) (WarmPoolSettings, error) {
 		errs = append(errs, err)
 	} else if ok {
 		settings.MaxReplenishConcurrency = n
+	}
+	if n, ok, err := parseWarmCount("warm-pool.max-replenish-per-route", raw.MaxReplenishPerRoute); err != nil {
+		errs = append(errs, err)
+	} else if ok {
+		settings.MaxReplenishPerRoute = n
 	}
 	if raw.IdleTTL != "" {
 		d, err := parseRuntimeDuration("warm-pool.idle-ttl", raw.IdleTTL)
@@ -665,6 +684,9 @@ func (w WarmPoolSettings) validate() error {
 	}
 	if w.MaxReplenishConcurrency < 1 {
 		errs = append(errs, fmt.Errorf("warm-pool.max-replenish-concurrency must be >= 1, got %d", w.MaxReplenishConcurrency))
+	}
+	if w.MaxReplenishPerRoute < 0 {
+		errs = append(errs, fmt.Errorf("warm-pool.max-replenish-per-route must be >= 0 (0 = uncapped), got %d", w.MaxReplenishPerRoute))
 	}
 	if w.IdleTTL <= 0 {
 		errs = append(errs, fmt.Errorf("warm-pool.idle-ttl must be positive, got %s", w.IdleTTL))

@@ -58,8 +58,13 @@ warm-pool:
   max-idle-per-proxy: 2
   # Process-wide ceiling on idle parked connections across all routes.
   max-total-idle: 64
-  # Concurrent background dials replenishing the pool.
+  # Concurrent background dials replenishing the pool, process-wide.
   max-replenish-concurrency: 2
+  # Cap on replenish dials in flight toward ONE route (0 = uncapped). Set it
+  # when the pool mixes providers and one tolerates fewer concurrent
+  # handshakes than the fleet cap: a provider with R routes sees at most
+  # R × this many concurrent warm dials.
+  # max-replenish-per-route: 1
   # A parked connection nobody borrowed is closed after this long.
   idle-ttl: 45s
 

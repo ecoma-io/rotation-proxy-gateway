@@ -100,6 +100,7 @@ type WarmPoolConfig struct {
 	MaxIdlePerProxy         int
 	MaxTotalIdle            int
 	MaxReplenishConcurrency int
+	MaxReplenishPerRoute    int
 	IdleTTL                 string
 }
 
@@ -167,6 +168,7 @@ type Status struct {
 type WarmView struct {
 	Enabled               bool            `json:"enabled"`
 	IdleTotal             int             `json:"idleTotal"`
+	MaxReplenishPerRoute  int             `json:"maxReplenishPerRoute"`
 	Created               uint64          `json:"created"`
 	Borrowed              uint64          `json:"borrowed"`
 	DiscardedStale        uint64          `json:"discardedStale"`
@@ -182,6 +184,7 @@ type WarmRouteView struct {
 	Upstream string `json:"upstream"`
 	Idle     int    `json:"idle"`
 	Pending  int    `json:"pending"`
+	Flying   int    `json:"flying"`
 }
 
 // Gateway is one real gateway subprocess with its own config file and ports.
@@ -276,6 +279,9 @@ func renderConfig(cfg GatewayConfig) string {
 		}
 		if w.MaxReplenishConcurrency > 0 {
 			fmt.Fprintf(&sb, "  max-replenish-concurrency: %d\n", w.MaxReplenishConcurrency)
+		}
+		if w.MaxReplenishPerRoute > 0 {
+			fmt.Fprintf(&sb, "  max-replenish-per-route: %d\n", w.MaxReplenishPerRoute)
 		}
 		if w.IdleTTL != "" {
 			fmt.Fprintf(&sb, "  idle-ttl: %s\n", w.IdleTTL)

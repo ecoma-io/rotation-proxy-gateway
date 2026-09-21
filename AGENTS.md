@@ -116,7 +116,9 @@ Read [`README.md`](README.md) before changing failure classification.
   failure classes identical: a refused `CONNECT` through a borrow stays
   `connect_target` (pair-scoped); a dead borrowed transport discards its
   siblings with no health report. Everything is bounded (per-route min/max
-  idle, global idle cap, replenish concurrency, backoff, idle TTL), and
+  idle, global idle cap, fleet replenish concurrency plus an optional
+  per-route in-flight cap `max-replenish-per-route` that keeps one provider's
+  routes from taking the whole fleet, backoff, idle TTL), and
   reload-disable, route removal, and shutdown close parked connections.
   Enable it where upstream RTT is real — see the warm A/B benchmarks in
   `e2e/BENCH.md`.
