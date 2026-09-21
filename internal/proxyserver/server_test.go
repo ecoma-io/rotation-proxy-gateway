@@ -22,6 +22,7 @@ import (
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/logging"
 	"rotation-proxy-gateway/internal/pool"
+	"rotation-proxy-gateway/internal/socksdial"
 
 	"github.com/rs/zerolog"
 )
@@ -446,10 +447,16 @@ func startAbortTarget(t *testing.T) string {
 // --- protocol surface ------------------------------------------------------
 
 func TestReadSocksRequestAcceptsConnectTargets(t *testing.T) {
-	for _, tc := range []struct{ name, target string }{
-		{"ipv4", "127.0.0.1:8080"},
-		{"domain", "example.test:443"},
-		{"ipv6", "[2001:db8::1]:443"},
+	// The parsed request must carry the frame's own address type — the type
+	// the outbound CONNECT will reproduce, never re-inferred from the host.
+	for _, tc := range []struct {
+		name     string
+		target   string
+		wantType socksdial.AddrType
+	}{
+		{"ipv4", "127.0.0.1:8080", socksdial.AddrIPv4},
+		{"domain", "example.test:443", socksdial.AddrDomain},
+		{"ipv6", "[2001:db8::1]:443", socksdial.AddrIPv6},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			serverSide, clientSide := net.Pipe()
@@ -485,8 +492,11 @@ func TestReadSocksRequestAcceptsConnectTargets(t *testing.T) {
 				if got.err != nil {
 					t.Fatalf("readSocksRequest: %v", got.err)
 				}
-				if got.req.target != tc.target || got.req.cmd != socksCmdConnect {
+				if got.req.target.Addr() != tc.target || got.req.cmd != socksCmdConnect {
 					t.Fatalf("request = %+v, want target %q cmd CONNECT", got.req, tc.target)
+				}
+				if got.req.target.Type != tc.wantType {
+					t.Fatalf("target type = %d, want %d", got.req.target.Type, tc.wantType)
 				}
 			case <-time.After(time.Second):
 				t.Fatal("readSocksRequest did not finish")
@@ -623,14 +633,40 @@ func TestInboundFramingReadBudget(t *testing.T) {
 	}
 }
 
-func TestJoinSocksTarget(t *testing.T) {
-	got, err := joinSocksTarget("example.test", []byte{0x01, 0xbb})
-	if err != nil || got != "example.test:443" {
-		t.Fatalf("joinSocksTarget = %q, %v; want example.test:443", got, err)
-	}
-	if _, err := joinSocksTarget("example.test", []byte{0x00, 0x00}); err == nil || !strings.Contains(err.Error(), "zero target port") {
-		t.Fatalf("zero port error = %v, want a zero-target-port failure", err)
-	}
+func TestSocksTargetBuild(t *testing.T) {
+	t.Run("domain keeps the hostname", func(t *testing.T) {
+		got, err := socksTarget(socksdial.AddrDomain, []byte("example.test"), []byte{0x01, 0xbb})
+		if err != nil {
+			t.Fatalf("socksTarget: %v", err)
+		}
+		if got.Addr() != "example.test:443" || got.Host != "example.test" || got.Type != socksdial.AddrDomain {
+			t.Fatalf("socksTarget = %+v, want the example.test:443 domain target", got)
+		}
+	})
+	t.Run("ipv4 renders the frame bytes", func(t *testing.T) {
+		got, err := socksTarget(socksdial.AddrIPv4, []byte{127, 0, 0, 1}, []byte{0x1f, 0x90})
+		if err != nil {
+			t.Fatalf("socksTarget: %v", err)
+		}
+		if got.Addr() != "127.0.0.1:8080" || got.Type != socksdial.AddrIPv4 {
+			t.Fatalf("socksTarget = %+v, want the 127.0.0.1:8080 IPv4 target", got)
+		}
+	})
+	t.Run("ipv6 renders the frame bytes", func(t *testing.T) {
+		addr := append([]byte{0x20, 0x01, 0x0d, 0xb8}, append(make([]byte, 11), 0x01)...) // 2001:db8::1
+		got, err := socksTarget(socksdial.AddrIPv6, addr, []byte{0x00, 0x35})
+		if err != nil {
+			t.Fatalf("socksTarget: %v", err)
+		}
+		if got.Addr() != "[2001:db8::1]:53" || got.Type != socksdial.AddrIPv6 {
+			t.Fatalf("socksTarget = %+v, want the [2001:db8::1]:53 IPv6 target", got)
+		}
+	})
+	t.Run("zero port", func(t *testing.T) {
+		if _, err := socksTarget(socksdial.AddrDomain, []byte("example.test"), []byte{0x00, 0x00}); err == nil || !strings.Contains(err.Error(), "zero target port") {
+			t.Fatalf("zero port error = %v, want a zero-target-port failure", err)
+		}
+	})
 }
 
 func TestWriteSocksReplyShape(t *testing.T) {
@@ -880,7 +916,7 @@ func TestDialFailureCooldownsRouteExcludedAndFallsBack(t *testing.T) {
 	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), 30*time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
 	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs))
-	s.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+	s.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
 		if pu.Host == dead.Host {
 			return nil, &ProxyDialError{Err: errors.New("connect refused")}
 		}
@@ -1089,7 +1125,7 @@ func TestSetupErrorRepliesFailureWithoutPoolMutation(t *testing.T) {
 	var logs safeLogBuffer
 	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs))
 	dials := 0
-	s.dial = func(context.Context, *url.URL, string, time.Duration) (net.Conn, error) {
+	s.dial = func(context.Context, *url.URL, socksdial.Target, time.Duration) (net.Conn, error) {
 		dials++
 		return nil, &SocksProtocolError{Op: "encode target", Err: errors.New("TEST oversized configured credentials")}
 	}

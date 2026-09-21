@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,6 +21,7 @@ import (
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/sanitize"
+	"rotation-proxy-gateway/internal/socksdial"
 
 	"github.com/rs/zerolog"
 )
@@ -54,7 +54,7 @@ type Server struct {
 	version  string
 	listener string
 	allow    func(*pool.Proxy) bool
-	dial     func(context.Context, *url.URL, string, time.Duration) (net.Conn, error)
+	dial     func(context.Context, *url.URL, socksdial.Target, time.Duration) (net.Conn, error)
 
 	cmu   sync.Mutex
 	conns map[net.Conn]struct{}
@@ -304,11 +304,15 @@ func (s *Server) serveConn(conn net.Conn) {
 // It loads one generation for the whole session so route picks and health
 // reports stay consistent across reloads. handshakeDeadline is the inbound
 // framing window serveConn armed; the retry chain must fit inside it.
-func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadline time.Time, log zerolog.Logger) {
+func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, handshakeDeadline time.Time, log zerolog.Logger) {
 	gen := s.generation()
 	settings := generationSettings(gen)
 	start := time.Now()
-	logTarget := socksTargetLogValue(target)
+	// host:port is the pool-state and log identity; target.Type is the wire
+	// address type the outbound CONNECT carries. Both descend from the
+	// inbound frame, retries included.
+	targetAddr := target.Addr()
+	logTarget := socksTargetLogValue(targetAddr)
 	log.Debug().Str("target", logTarget).Msg("tunnel start")
 
 	exclude := map[*pool.Proxy]bool{}
@@ -327,7 +331,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 				Msg("inbound handshake deadline expired before the next attempt")
 			return
 		}
-		p := s.pick(gen, exclude, target)
+		p := s.pick(gen, exclude, targetAddr)
 		if p == nil {
 			break
 		}
@@ -340,7 +344,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 				Int("attempt", attempts).Int("excluded", len(exclude))
 			// A pick from the all-cooling fallback arrives with cooldown left;
 			// the size of that bet is the whole point of the line.
-			if cd := gen.Pool.CoolingFor(p, target); cd > 0 {
+			if cd := gen.Pool.CoolingFor(p, targetAddr); cd > 0 {
 				ev = ev.Str("cooldown_remaining", logDuration(cd))
 			}
 			ev.Msg("route selected")
@@ -360,7 +364,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 				// only the (route, target) pair is refused, so the cooldown
 				// lands on the pair and the route stays eligible for every
 				// other target. Same retry treatment as socks_connect.
-				cooldown := gen.Pool.ReportTargetFailure(p, target, err)
+				cooldown := gen.Pool.ReportTargetFailure(p, targetAddr, err)
 				exclude[p] = true
 				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
 					Int("attempt", attempts).Str("error_kind", errorKindConnectTarget).
@@ -395,7 +399,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 			}
 			continue
 		}
-		gen.Pool.ReportSuccess(p, target)
+		gen.Pool.ReportSuccess(p, targetAddr)
 		upstream, chosen = up, p
 		break
 	}
@@ -449,10 +453,11 @@ func (s *Server) serveTunnel(clientConn net.Conn, target string, handshakeDeadli
 	recordTunnelClose(log, logTarget, chosen, start, first, second)
 }
 
-// socksRequest is one parsed inbound CONNECT-able request: the host:port
-// target and the requested command.
+// socksRequest is one parsed inbound CONNECT-able request: the target, whose
+// address type is the inbound frame's own ATYP (the wire truth the outbound
+// CONNECT must reproduce), and the requested command.
 type socksRequest struct {
-	target string
+	target socksdial.Target
 	cmd    byte
 }
 
@@ -512,7 +517,7 @@ func readSocksRequest(br *bufio.Reader, w io.Writer) (socksRequest, error) {
 		if _, err := io.ReadFull(br, addr); err != nil {
 			return socksRequest{}, fmt.Errorf("read IPv4 target: %w", err)
 		}
-		target, err := joinSocksTarget(net.IP(addr[:4]).String(), addr[4:])
+		target, err := socksTarget(socksdial.AddrIPv4, addr[:4], addr[4:])
 		if err != nil {
 			return socksRequest{}, err
 		}
@@ -533,7 +538,7 @@ func readSocksRequest(br *bufio.Reader, w io.Writer) (socksRequest, error) {
 		if _, err := io.ReadFull(br, portBytes); err != nil {
 			return socksRequest{}, fmt.Errorf("read domain port: %w", err)
 		}
-		target, err := joinSocksTarget(string(name), portBytes)
+		target, err := socksTarget(socksdial.AddrDomain, name, portBytes)
 		if err != nil {
 			return socksRequest{}, err
 		}
@@ -543,7 +548,7 @@ func readSocksRequest(br *bufio.Reader, w io.Writer) (socksRequest, error) {
 		if _, err := io.ReadFull(br, addr); err != nil {
 			return socksRequest{}, fmt.Errorf("read IPv6 target: %w", err)
 		}
-		target, err := joinSocksTarget(net.IP(addr[:16]).String(), addr[16:])
+		target, err := socksTarget(socksdial.AddrIPv6, addr[:16], addr[16:])
 		if err != nil {
 			return socksRequest{}, err
 		}
@@ -553,14 +558,27 @@ func readSocksRequest(br *bufio.Reader, w io.Writer) (socksRequest, error) {
 	}
 }
 
-// joinSocksTarget validates the port and renders host:port. A zero port is a
-// parse failure: there is no meaningful CONNECT target without one.
-func joinSocksTarget(host string, portBytes []byte) (string, error) {
+// socksTarget builds the request target from one inbound frame's address
+// bytes: the port is validated, the host is rendered as the host:port
+// identity pool state and logs key on, and the address type is the frame's
+// own ATYP — carried through to the outbound CONNECT, never re-inferred from
+// the host string. A zero port is a parse failure: there is no meaningful
+// CONNECT target without one.
+func socksTarget(atyp socksdial.AddrType, host, portBytes []byte) (socksdial.Target, error) {
 	port := binary.BigEndian.Uint16(portBytes)
 	if port == 0 {
-		return "", errors.New("zero target port")
+		return socksdial.Target{}, errors.New("zero target port")
 	}
-	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
+	var hostStr string
+	switch atyp {
+	case socksdial.AddrDomain:
+		hostStr = string(host)
+	case socksdial.AddrIPv4, socksdial.AddrIPv6:
+		// The canonical text of the frame's own address bytes; encoding at the
+		// outbound route round-trips these bytes exactly.
+		hostStr = net.IP(host).String()
+	}
+	return socksdial.Target{Host: hostStr, Port: port, Type: atyp}, nil
 }
 
 // writeSocksReply writes a full SOCKS reply with a zero IPv4 BND.ADDR/PORT.

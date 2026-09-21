@@ -31,10 +31,11 @@ func isSocksHandshakeError(err error) bool { return socksdial.IsHandshakeError(e
 // so the route works and only this (route, target) pair is refused.
 func isConnectTargetError(err error) bool { return socksdial.IsConnectTargetError(err) }
 
-// dialVia establishes a TCP connection to targetAddr through a SOCKS5 upstream.
-// The returned connection is ready for arbitrary byte transport.
-func dialVia(ctx context.Context, pu *url.URL, targetAddr string, timeout time.Duration) (net.Conn, error) {
-	return socksdial.Dial(ctx, pu, targetAddr, timeout)
+// dialVia establishes a TCP connection to target through a SOCKS5 upstream,
+// encoding target.Type as the CONNECT address type. The returned connection
+// is ready for arbitrary byte transport.
+func dialVia(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
+	return socksdial.Dial(ctx, pu, target, timeout)
 }
 
 // dialTCP dials addr directly, wrapping endpoint failures as ProxyDialError.

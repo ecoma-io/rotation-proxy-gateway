@@ -51,7 +51,7 @@ type Engine struct {
 
 	// dial and probeTLS are seams for tests. Production dials through the
 	// route's SOCKS endpoint and always verifies the ip-check certificate.
-	dial     func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error)
+	dial     func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error)
 	probeTLS func(host string) *tls.Config
 
 	wake chan struct{} // capacity 1: a procedure finished, re-evaluate now

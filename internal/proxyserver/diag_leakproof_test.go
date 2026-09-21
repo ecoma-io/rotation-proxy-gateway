@@ -16,6 +16,7 @@ import (
 
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
+	"rotation-proxy-gateway/internal/socksdial"
 )
 
 // Test-first: AdminMux /status currently can expose raw arbitrary errors.
@@ -118,7 +119,7 @@ func TestStatusAndLogsStayCleanAfterServingFailures(t *testing.T) {
 	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), time.Second, time.Minute, config.KindBalance{})
 	var logs safeLogBuffer
 	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs))
-	s.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+	s.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
 		if pu.Host == dead.Host {
 			return nil, &ProxyDialError{Err: errors.New("dial socks5://route-user:route-password@dead.test:1080: connect refused")}
 		}
