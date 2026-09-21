@@ -3,7 +3,7 @@
   "private": true,
   "description": "Node-side repository toolchain (commitlint, lefthook, prettier) for a Go project — nothing here ships.",
   "license": "Apache-2.0",
-  "packageManager": "pnpm@12.3.4",
+  "packageManager": "pnpm@12.5.0",
   "engines": {
     "node": ">=24",
     "pnpm": ">=11"
