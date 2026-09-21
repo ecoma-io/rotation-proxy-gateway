@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -99,32 +100,32 @@ func TestIngressAddressTypePreservedToEgress(t *testing.T) {
 	}
 }
 
-// socks5h:// names the same SOCKS5 upstream transport as socks5:// — both
-// spellings must route traffic through the one shared dial implementation.
-func TestSocks5hRouteSchemeServesTraffic(t *testing.T) {
+// Route lines carry no scheme: every route is a SOCKS5 endpoint. All three
+// documented bare forms must serve traffic through the same dial path.
+func TestBareRouteFormsServeTraffic(t *testing.T) {
 	target := NewEchoTarget(t)
 	for _, tc := range []struct {
-		name     string
-		proxy    string
-		wantAuth bool
+		name  string
+		route func(addr string) string
+		auth  bool
 	}{
-		{"socks5", "socks5://", false},
-		{"socks5h", "socks5h://", false},
-		{"SOCKS5H with credentials", "SOCKS5H://route-user:route-pass@", true},
+		{"host:port", func(addr string) string { return addr }, false},
+		{"host:port:user:pass", func(addr string) string { return addr + ":route-user:route-pass" }, true},
+		{"user:pass@host:port", func(addr string) string { return "route-user:route-pass@" + addr }, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var sim *SocksSim
-			if tc.wantAuth {
+			if tc.auth {
 				sim = NewSocksSim(t, SocksAuthRequired, "route-user", "route-pass")
 			} else {
 				sim = NewSocksSim(t, SocksOK, "", "")
 			}
 			gw := NewGateway(t, defaultGatewayConfig([]RouteConfig{
-				{Proxy: tc.proxy + sim.Addr, Kind: "v4"},
+				{Proxy: tc.route(sim.Addr), Kind: "v4"},
 			}))
 			code, body := GetVia(t, ProxyClient(gw.MixedAddr), target.URL+"/atyp", "e2e-echo:/atyp")
 			if code != 200 {
-				t.Fatalf("GET via %q route: status %d body %q", tc.proxy, code, body)
+				t.Fatalf("GET via %q route: status %d body %q", tc.name, code, body)
 			}
 			if sim.Hits.Load() == 0 {
 				t.Fatal("the route simulator saw no connection")
@@ -133,34 +134,37 @@ func TestSocks5hRouteSchemeServesTraffic(t *testing.T) {
 	}
 }
 
-// socks5:// and socks5h:// spellings of one endpoint are one canonical route:
-// swapping the spelling across a reload must keep the route's live state —
-// its success counter — rather than creating a second, cold route. The second
-// route exists to prove the reloaded generation actually published: a config
-// the gateway rejects (as socks5h:// once was) would keep the old one-route
-// pool serving and look deceptively identical here.
-func TestSocks5hSchemeAliasPreservesRouteIdentityAcrossReload(t *testing.T) {
+// A scheme'd route line is rejected outright — the endpoint protocol is not
+// configurable — and a rejected config must leave the last-known-good pool
+// serving untouched. The second route exists to make the surviving pool
+// distinguishable from a hypothetical cold start.
+func TestSchemedRouteLineRejectedKeepsServing(t *testing.T) {
 	target := NewEchoTarget(t)
 	sim := NewSocksSim(t, SocksOK, "", "")
 	other := NewSocksSim(t, SocksOK, "", "")
 	gw := NewGateway(t, defaultGatewayConfig([]RouteConfig{
-		{Proxy: "socks5://" + sim.Addr, Kind: "v4"},
+		{Proxy: sim.Addr, Kind: "v4"},
+		{Proxy: other.Addr, Kind: "v4"},
 	}))
 
 	GetVia(t, ProxyClient(gw.MixedAddr), target.URL+"/before", "e2e-echo:/before")
 
-	gw.ReloadConfig(defaultGatewayConfig([]RouteConfig{
-		{Proxy: "socks5h://" + sim.Addr, Kind: "v4"},
-		{Proxy: "socks5://" + other.Addr, Kind: "v4"},
-	}), []string{sim.Addr, other.Addr})
-
+	cfg := defaultGatewayConfig([]RouteConfig{
+		{Proxy: "socks5://" + sim.Addr, Kind: "v4"},
+		{Proxy: other.Addr, Kind: "v4"},
+	})
+	gw.ReloadConfigRaw(renderConfig(cfg))
+	gw.WaitForCondition(reloadSettle, "a scheme rejection warning in the logs",
+		func(*Status) bool { return strings.Contains(gw.Logs(), "carry no scheme") })
 	st, err := gw.Status()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := st.Pool[0].Successes; got != 1 {
-		t.Fatalf("successes after the reload = %d, want the pre-reload state preserved (1)", got)
+	if len(st.Pool) != 2 {
+		t.Fatalf("pool after the rejected reload has %d routes, want the last-known-good 2", len(st.Pool))
 	}
-
+	if got := st.Pool[0].Successes; got != 1 {
+		t.Fatalf("successes after the rejected reload = %d, want the serving state preserved (1)", got)
+	}
 	GetVia(t, ProxyClient(gw.MixedAddr), target.URL+"/after", "e2e-echo:/after")
 }

@@ -37,12 +37,12 @@ dial-timeout: 7s
 ` + rotationBlock + `
 proxies:
   auto:
-    - proxy: socks5://alice:secret@v4.example:1080
+    - proxy: alice:secret@v4.example:1080
       kind: v4
     - proxy: "[2001:db8::1]:1080:bob:other-secret"
       kind: v6
   manual:
-    - proxy: socks5://carol:manual-secret@manual.example:1080
+    - proxy: carol:manual-secret@manual.example:1080
       kind: v6
       rotate-interval: 90s
       api:
@@ -277,7 +277,7 @@ func TestLoadRuntimeRejectsInvalidRuntimeValues(t *testing.T) {
 func TestLoadRuntimeRejectsDuplicateRegardlessOfKind(t *testing.T) {
 	content := strings.Replace(validRuntimeConfig,
 		"    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6",
-		"    - proxy: socks5://alice:secret@V4.example:1080\n      kind: v6", 1)
+		"    - proxy: alice:secret@V4.example:1080\n      kind: v6", 1)
 	_, err := LoadRuntime(writeRuntimeConfig(t, content))
 	if err == nil || !strings.Contains(err.Error(), "duplicate route") {
 		t.Fatalf("error = %v, want duplicate route", err)
@@ -298,7 +298,7 @@ func TestLoadRuntimeAcceptsSingleFamilyRoutes(t *testing.T) {
 		},
 		{
 			name:   "v6 only",
-			remove: "    - proxy: socks5://alice:secret@v4.example:1080\n      kind: v4\n",
+			remove: "    - proxy: alice:secret@v4.example:1080\n      kind: v4\n",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -316,7 +316,7 @@ func TestLoadRuntimeAcceptsSingleFamilyRoutes(t *testing.T) {
 
 func TestLoadRuntimeManualOnlyPoolIsValid(t *testing.T) {
 	content := strings.Replace(validRuntimeConfig,
-		"    - proxy: socks5://alice:secret@v4.example:1080\n      kind: v4\n    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6\n", "", 1)
+		"    - proxy: alice:secret@v4.example:1080\n      kind: v4\n    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6\n", "", 1)
 	cfg, err := LoadRuntime(writeRuntimeConfig(t, content))
 	if err != nil {
 		t.Fatalf("LoadRuntime() error = %v", err)
@@ -331,7 +331,7 @@ func TestLoadRuntimeManualOnlyPoolIsValid(t *testing.T) {
 
 func TestLoadRuntimeRejectsEmptyPools(t *testing.T) {
 	content := strings.Replace(validRuntimeConfig,
-		"    - proxy: socks5://alice:secret@v4.example:1080\n      kind: v4\n    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6\n  manual:\n    - proxy: socks5://carol:manual-secret@manual.example:1080\n      kind: v6\n      rotate-interval: 90s\n      api:\n        url: https://provider.example/rotate\n        method: POST\n        headers:\n          Content-Type: application/json\n          X-Api-Token: rot-token\n        body: |\n          {\"proxy_id\": 7}\n        timeout: 4s\n", "", 1)
+		"    - proxy: alice:secret@v4.example:1080\n      kind: v4\n    - proxy: \"[2001:db8::1]:1080:bob:other-secret\"\n      kind: v6\n  manual:\n    - proxy: carol:manual-secret@manual.example:1080\n      kind: v6\n      rotate-interval: 90s\n      api:\n        url: https://provider.example/rotate\n        method: POST\n        headers:\n          Content-Type: application/json\n          X-Api-Token: rot-token\n        body: |\n          {\"proxy_id\": 7}\n        timeout: 4s\n", "", 1)
 	_, err := LoadRuntime(writeRuntimeConfig(t, content))
 	if err == nil || !strings.Contains(err.Error(), "proxies must contain at least one route") {
 		t.Fatalf("error = %v", err)
@@ -368,8 +368,8 @@ func TestLoadRuntimeRejectsDuplicateAcrossPools(t *testing.T) {
 	// Same endpoint identity as the first auto route; a different claimed kind
 	// must not rescue it.
 	content := strings.Replace(validRuntimeConfig,
-		"    - proxy: socks5://carol:manual-secret@manual.example:1080\n      kind: v6\n",
-		"    - proxy: socks5://alice:secret@V4.example:1080\n      kind: v4\n", 1)
+		"    - proxy: carol:manual-secret@manual.example:1080\n      kind: v6\n",
+		"    - proxy: alice:secret@V4.example:1080\n      kind: v4\n", 1)
 	_, err := LoadRuntime(writeRuntimeConfig(t, content))
 	if err == nil || !strings.Contains(err.Error(), "duplicate route") {
 		t.Fatalf("error = %v, want duplicate route", err)

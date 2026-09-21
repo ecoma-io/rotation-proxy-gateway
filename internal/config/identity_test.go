@@ -47,8 +47,6 @@ func TestCanonicalRouteIDNormalization(t *testing.T) {
 		{"socks5://user:pass@[2001:DB8::1]:1080", "socks5://user:pass@[2001:db8::1]:1080"},
 		{"SOCKS5://user:pass@provider.example:1080", "socks5://user:pass@provider.example:1080"},
 		{"socks5://user:pass@provider.example:1080", "socks5://user:pass@provider.example:01080"},
-		{"socks5h://user:pass@provider.example:1080", "socks5://user:pass@provider.example:1080"},
-		{"SOCKS5H://user:pass@provider.example:1080", "socks5://user:pass@provider.example:1080"},
 	}
 	for _, pair := range same {
 		a := CanonicalRouteID(mustParseURL(t, pair[0]))

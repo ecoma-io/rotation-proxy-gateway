@@ -94,10 +94,10 @@ balance:
   v6: 3
 proxies:
   auto:
-    - proxy: socks5://username:password@provider.example:1080
+    - proxy: username:password@provider.example:1080
       kind: v4
       weight: 3
-    - proxy: socks5://username:password@[2001:db8::1]:1080
+    - proxy: username:password@[2001:db8::1]:1080
       kind: v6
   manual: []
 ```
@@ -113,13 +113,15 @@ additionally carry a rotate schedule and provider API (see
 forms are:
 
 ```text
-socks5://host:port
-socks5://user:pass@host:port
-host:port:user:pass
+host:port
 user:pass@host:port
+host:port:user:pass
 ```
 
-Every route requires an explicit port. Bracket IPv6 literals. HTTP/HTTPS routes,
+Every route requires an explicit port. Bracket IPv6 literals. The route line
+carries no scheme: the endpoint protocol is not configurable — every route is
+a SOCKS5 endpoint — and a line containing `socks5://`, `socks5h://`, or any
+other scheme is rejected. HTTP/HTTPS routes,
 URL paths, queries, fragments, unknown active YAML fields, duplicate route
 identities, and non-lowercase/missing `kind` are rejected. A duplicate remains
 a duplicate even if it claims another kind. Credentials never appear in errors,
@@ -164,7 +166,7 @@ rotations.
 ```yaml
 proxies:
   manual:
-    - proxy: socks5://username:password@provider.example:1080
+    - proxy: username:password@provider.example:1080
       kind: v6
       rotate-interval: 90s
       api:
@@ -470,9 +472,19 @@ answered with `05 07` (command not supported) and the connection is closed.
 ### Target addresses
 
 IPv4 (`0x01`), domain name (`0x03`), and IPv6 (`0x04`) target address types
-are all supported. Domain targets are forwarded as names: DNS resolution
-happens at the outbound SOCKS route (socks5h semantics) and the gateway never
-resolves target names itself.
+are all supported, and the gateway preserves the inbound request's address
+type to the egress CONNECT: an IPv4 target leaves as an IPv4 target, an IPv6
+target as IPv6, and a domain as the untouched hostname. The gateway never
+re-classifies a target by inspecting its string and never resolves target
+names itself — DNS resolution happens at the outbound SOCKS route.
+
+This is what makes the gateway transparent for both client conventions that
+the `socks5://` and `socks5h://` URL schemes name. They are not two protocols:
+both send plain RFC 1928 SOCKS5, and the only wire difference is the CONNECT
+frame's address type. A `socks5` client resolves the target itself and sends
+ATYP `0x01`/`0x04`; a `socks5h` client sends the name as ATYP `0x03` and lets
+the far end resolve. Either way, whatever address type arrives on ingress is
+exactly what the selected outbound route receives.
 
 ### Replies
 

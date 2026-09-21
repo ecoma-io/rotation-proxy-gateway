@@ -71,17 +71,19 @@ rotation:
   retry-backoff-max: 15m
 
 proxies:
-  # Static SOCKS5 routes selected by the local health-aware pool. Accepted proxy
-  # forms are socks5://host:port, socks5://user:pass@host:port,
-  # host:port:user:pass, and user:pass@host:port. Bracket IPv6 literals.
+  # Static SOCKS5 routes selected by the local health-aware pool. The route
+  # line carries no scheme — the endpoint protocol is always SOCKS5 — so the
+  # accepted forms are host:port, user:pass@host:port, and
+  # host:port:user:pass. A line containing socks5:// or any other scheme is
+  # rejected. Bracket IPv6 literals.
   auto:
-    - proxy: socks5://username:password@v4-provider.example:1080
+    - proxy: username:password@v4-provider.example:1080
       kind: v4
       # Optional selection weight (whole number, 1-1000, default 1): picks
       # distribute proportionally, so weight 3 serves about three times the
       # traffic of a weight-1 peer. Equal or absent weights give round-robin.
       weight: 3
-    - proxy: socks5://username:password@[2001:db8::1]:1080
+    - proxy: username:password@[2001:db8::1]:1080
       kind: v6
 
   # API-rotated routes. The provider swaps the route's public egress IP when
@@ -89,7 +91,7 @@ proxies:
   # rotate-interval, drains the route first, and verifies the IP actually
   # changed afterwards.
   manual:
-    - proxy: socks5://username:password@v6-provider.example:1080
+    - proxy: username:password@v6-provider.example:1080
       kind: v6
       # Selection weight, same meaning as on auto routes.
       weight: 1

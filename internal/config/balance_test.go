@@ -17,9 +17,9 @@ cooldown:
 dial-timeout: 7s
 proxies:
   auto:
-    - proxy: socks5://v4.example:1080
+    - proxy: v4.example:1080
       kind: v4
-    - proxy: socks5://v6.example:1080
+    - proxy: v6.example:1080
       kind: v6
 `
 

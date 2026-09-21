@@ -99,12 +99,14 @@ func NewSocksSim(t testing.TB, mode SocksMode, user, pass string) *SocksSim {
 	return s
 }
 
-// RouteValue renders the config proxy line for this simulator.
+// RouteValue renders the config proxy line for this simulator: a bare
+// host:port when the simulator accepts no credentials, the bare
+// user:pass@host:port form when it demands them.
 func (s *SocksSim) RouteValue() string {
 	if s.User != "" {
-		return fmt.Sprintf("socks5://%s:%s@%s", s.User, s.Pass, s.Addr)
+		return fmt.Sprintf("%s:%s@%s", s.User, s.Pass, s.Addr)
 	}
-	return "socks5://" + s.Addr
+	return s.Addr
 }
 
 func (s *SocksSim) handle(conn net.Conn) {

@@ -172,9 +172,9 @@ func TestE2E_ReloadChangedCredsResetState(t *testing.T) {
 	}
 	socks := NewSocksSim(t, SocksAuthRequired, "e2e-user", "e2e-right-pass")
 	target := NewEchoTarget(t)
-	right := fmt.Sprintf("socks5://e2e-user:e2e-right-pass@%s", socks.Addr)
+	right := fmt.Sprintf("e2e-user:e2e-right-pass@%s", socks.Addr)
 	cfg := defaultGatewayConfig([]RouteConfig{
-		{Proxy: fmt.Sprintf("socks5://e2e-user:e2e-wrong-pass@%s", socks.Addr), Kind: "v4"},
+		{Proxy: fmt.Sprintf("e2e-user:e2e-wrong-pass@%s", socks.Addr), Kind: "v4"},
 		{Proxy: deadRouteValue(t), Kind: "v4"},
 	})
 	g := NewGateway(t, cfg)

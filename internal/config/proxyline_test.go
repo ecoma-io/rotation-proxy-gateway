@@ -5,9 +5,10 @@ import (
 	"testing"
 )
 
-// The README documents exactly four accepted proxy forms plus bracketed IPv6
-// literals; these tests pin that surface directly against parseRouteSpec, the
-// single entry the runtime loader uses for every proxies.auto item.
+// The README documents exactly three accepted proxy forms; route lines carry
+// no scheme because the endpoint protocol is always SOCKS5. These tests pin
+// that surface directly against parseRouteSpec, the single entry the runtime
+// loader uses for every proxies.auto item.
 func TestParseRouteSpecAcceptsDocumentedForms(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -16,13 +17,12 @@ func TestParseRouteSpecAcceptsDocumentedForms(t *testing.T) {
 		wantPass string
 		wantHost string
 	}{
-		{"socks5 url without credentials", "socks5://provider.example:1080", "", "", "provider.example:1080"},
-		{"socks5 url with credentials", "socks5://route-user:route-pass@provider.example:1080", "route-user", "route-pass", "provider.example:1080"},
+		{"bare host:port without credentials", "provider.example:1080", "", "", "provider.example:1080"},
 		{"bare host:port:user:pass", "provider.example:1080:route-user:route-pass", "route-user", "route-pass", "provider.example:1080"},
 		{"bare user:pass@host:port", "route-user:route-pass@provider.example:1080", "route-user", "route-pass", "provider.example:1080"},
+		{"bracketed ipv6 without credentials", "[2001:db8::1]:1080", "", "", "[2001:db8::1]:1080"},
 		{"bracketed ipv6 bare form", "[2001:db8::1]:1080:route-user:route-pass", "route-user", "route-pass", "[2001:db8::1]:1080"},
-		{"bracketed ipv6 url form", "socks5://route-user:route-pass@[2001:db8::1]:1080", "route-user", "route-pass", "[2001:db8::1]:1080"},
-		{"uppercase scheme normalized", "SOCKS5://provider.example:1080", "", "", "provider.example:1080"},
+		{"bracketed ipv6 at-credentials form", "route-user:route-pass@[2001:db8::1]:1080", "route-user", "route-pass", "[2001:db8::1]:1080"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			spec, err := parseRouteSpec(autoProxyFileConfig{Proxy: tc.raw, Kind: "v4"})
@@ -32,8 +32,14 @@ func TestParseRouteSpecAcceptsDocumentedForms(t *testing.T) {
 			if spec.Kind != EgressV4 {
 				t.Fatalf("kind = %q, want v4", spec.Kind)
 			}
+			if spec.URL.Scheme != "socks5" {
+				t.Fatalf("implicit scheme = %q, want socks5", spec.URL.Scheme)
+			}
 			if spec.URL.Host != tc.wantHost {
 				t.Fatalf("host = %q, want %q", spec.URL.Host, tc.wantHost)
+			}
+			if tc.wantUser == "" && spec.URL.User != nil {
+				t.Fatalf("credentials = %q, want none", spec.URL.User.String())
 			}
 			gotUser, gotPass := "", ""
 			if spec.URL.User != nil {
@@ -47,25 +53,47 @@ func TestParseRouteSpecAcceptsDocumentedForms(t *testing.T) {
 	}
 }
 
+// The endpoint protocol is not configurable, so no scheme spelling is
+// accepted — not even socks5:// or its socks5h client-convention alias. The
+// socks5/socks5h distinction belongs to inbound clients (it is the CONNECT
+// frame's address type), never to the route line.
+func TestParseRouteSpecRejectsEveryScheme(t *testing.T) {
+	for _, tc := range []struct{ name, raw string }{
+		{"socks5 scheme", "socks5://provider.example:1080"},
+		{"socks5 scheme with credentials", "socks5://route-user:route-pass@provider.example:1080"},
+		{"socks5h scheme", "socks5h://provider.example:1080"},
+		{"uppercase SOCKS5 scheme", "SOCKS5://provider.example:1080"},
+		{"uppercase SOCKS5H scheme", "SOCKS5H://provider.example:1080"},
+		{"http scheme", "http://provider.example:1080"},
+		{"https scheme", "https://provider.example:1080"},
+		{"socks4 scheme", "socks4://provider.example:1080"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseRouteSpec(autoProxyFileConfig{Proxy: tc.raw, Kind: "v4"})
+			if err == nil || !strings.Contains(err.Error(), "carry no scheme") {
+				t.Fatalf("parseRouteSpec(%q) error = %v, want the carries-no-scheme rejection", tc.raw, err)
+			}
+			for _, secret := range []string{"route-user", "route-pass"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("error for %q leaked %q: %v", tc.raw, secret, err)
+				}
+			}
+		})
+	}
+}
+
 func TestParseRouteSpecRejectsUndocumentedForms(t *testing.T) {
 	for _, tc := range []struct{ name, raw, want string }{
-		{"http scheme", "http://provider.example:1080", "unsupported scheme"},
-		{"https scheme", "https://provider.example:1080", "unsupported scheme"},
-		{"socks4 scheme", "socks4://provider.example:1080", "unsupported scheme"},
-		{"bare socks scheme", "socks://provider.example:1080", "unsupported scheme"},
-		{"missing port", "socks5://provider.example", "missing port"},
-		{"empty host", "socks5://:1080", "missing host"},
-		{"url path", "socks5://provider.example:1080/path", "path, query, and fragment"},
-		{"url query", "socks5://provider.example:1080?x=1", "path, query, and fragment"},
-		{"url fragment", "socks5://provider.example:1080#frag", "path, query, and fragment"},
-		{"bare host:port without credentials", "provider.example:1080", "invalid proxy format"},
+		{"missing port", "provider.example", "invalid proxy format"},
+		{"empty host", ":1080", "invalid proxy format"},
+		{"at-form missing port", "route-user:route-pass@provider.example", "port is required"},
+		{"at-form empty host", "route-user:route-pass@:1080", "host is required"},
 		{"bare form missing password", "provider.example:1080:route-user", "invalid proxy format"},
 		{"bare form password with colon", "provider.example:1080:route-user:pa:ss", "invalid proxy format"},
-		{"bare credentials missing port", "route-user:route-pass@provider.example", "port is required"},
 		{"unterminated ipv6 bracket", "[2001:db8::1:1080:route-user:route-pass", "invalid proxy format"},
-		{"port zero", "socks5://provider.example:0", "invalid proxy port"},
-		{"port above range", "socks5://provider.example:70000", "invalid proxy port"},
-		{"port not numeric", "socks5://provider.example:socks", "invalid proxy URL"},
+		{"port zero", "provider.example:0", "invalid proxy port"},
+		{"port above range", "provider.example:70000", "invalid proxy port"},
+		{"port not numeric", "provider.example:socks", "invalid proxy port"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := parseRouteSpec(autoProxyFileConfig{Proxy: tc.raw, Kind: "v4"})
@@ -76,63 +104,16 @@ func TestParseRouteSpecRejectsUndocumentedForms(t *testing.T) {
 	}
 }
 
-// socks5h:// is accepted as an alias of socks5://. It names the same SOCKS5
-// upstream transport; the client-convention difference (which side resolves a
-// domain target) lives in the inbound CONNECT frame's address type, never in
-// the route scheme. Parsing canonicalizes the scheme to socks5 so duplicate
-// detection, route identity, and reload state all see one route.
-func TestParseRouteSpecAcceptsSocks5hAlias(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		raw      string
-		wantUser string
-		wantPass string
-	}{
-		{"socks5h without credentials", "socks5h://provider.example:1080", "", ""},
-		{"socks5h with credentials", "socks5h://route-user:route-pass@provider.example:1080", "route-user", "route-pass"},
-		{"uppercase SOCKS5H", "SOCKS5H://provider.example:1080", "", ""},
-		{"bracketed ipv6", "socks5h://route-user:route-pass@[2001:db8::1]:1080", "route-user", "route-pass"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			spec, err := parseRouteSpec(autoProxyFileConfig{Proxy: tc.raw, Kind: "v4"})
-			if err != nil {
-				t.Fatalf("parseRouteSpec(%q) error = %v", tc.raw, err)
-			}
-			if spec.URL.Scheme != "socks5" {
-				t.Fatalf("canonical scheme = %q, want socks5", spec.URL.Scheme)
-			}
-			gotUser, gotPass := "", ""
-			if spec.URL.User != nil {
-				gotUser = spec.URL.User.Username()
-				gotPass, _ = spec.URL.User.Password()
-			}
-			if gotUser != tc.wantUser || gotPass != tc.wantPass {
-				t.Fatalf("userinfo = %q:%q, want %q:%q", gotUser, gotPass, tc.wantUser, tc.wantPass)
-			}
-		})
-	}
-	a, err := parseRouteSpec(autoProxyFileConfig{Proxy: "socks5://route-user:route-pass@provider.example:1080", Kind: "v4"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := parseRouteSpec(autoProxyFileConfig{Proxy: "socks5h://route-user:route-pass@provider.example:1080", Kind: "v4"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a.URL.String() != b.URL.String() {
-		t.Fatalf("both spellings must parse to one URL: %q vs %q", a.URL.Redacted(), b.URL.Redacted())
-	}
-}
-
 // Parse rejections quote only structural facts (ports, shapes); the offending
 // route line, which normally carries credentials, must never surface.
 func TestParseRouteSpecErrorNeverContainsCredentials(t *testing.T) {
 	for _, raw := range []string{
-		"socks5://route-user:route-pass@provider.example:0",
-		"socks5://route-user:route-pass@provider.example:70000",
-		"route-user:route-pass@provider.example",
+		"provider.example:0:route-user:route-pass",
 		"provider.example:1080:route-user:route-pass:extra",
-		"socks5://route-user:route-pass@provider.example:1080/path",
+		"route-user:route-pass@provider.example:0",
+		"route-user:route-pass@provider.example:70000",
+		"route-user:route-pass@provider.example:1080/path",
+		"socks5://route-user:route-pass@provider.example:1080",
 	} {
 		_, err := parseRouteSpec(autoProxyFileConfig{Proxy: raw, Kind: "v4"})
 		if err == nil {
