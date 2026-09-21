@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.0](https://github.com/ecoma-io/rotation-proxy-gateway/compare/v0.1.0...v0.2.0) (2026-09-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* a config containing a route weight key or a balance block fails validation (UnmarshalExact rejects the now-unknown keys) — the last-known-good config keeps serving and first boot refuses to start, mirroring the removed global block. /status pool entries lose weight and the top-level balance key is gone.
+* socks5:// and socks5h:// route proxy lines are no longer accepted; use the bare forms.
+
+### Features
+
+* drop weighted selection and the balance family split ([#28](https://github.com/ecoma-io/rotation-proxy-gateway/issues/28)) ([e95c65d](https://github.com/ecoma-io/rotation-proxy-gateway/commit/e95c65d7dba91f2be2a127abbf2ba741119edf41))
+* preserve the inbound CONNECT address type and drop route-line schemes ([#19](https://github.com/ecoma-io/rotation-proxy-gateway/issues/19)) ([fbab6dd](https://github.com/ecoma-io/rotation-proxy-gateway/commit/fbab6dd496d56dafa022c1600b35e0e2aa567fad))
+* warm upstream connection pool (background + borrow-or-cold serving path) ([#26](https://github.com/ecoma-io/rotation-proxy-gateway/issues/26)) ([a535f08](https://github.com/ecoma-io/rotation-proxy-gateway/commit/a535f08a182db0d3979518a0e052058ac36b1bf6)), closes [#23](https://github.com/ecoma-io/rotation-proxy-gateway/issues/23)
+
+
+### Bug Fixes
+
+* **config:** make the poller-baseline test replace content atomically ([#21](https://github.com/ecoma-io/rotation-proxy-gateway/issues/21)) ([3ea0e80](https://github.com/ecoma-io/rotation-proxy-gateway/commit/3ea0e807521ac001a123b49d3e01d5f29f8866c8))
+
 ## 0.1.0 (2026-09-21)
 
 
