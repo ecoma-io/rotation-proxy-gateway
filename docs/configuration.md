@@ -158,9 +158,11 @@ and pool. Validated configuration and its reconfigured pool snapshot publish as
 one atomic generation: every request and CONNECT operation loads that generation
 once, while in-flight operations finish on their original snapshot.
 
-There is deliberately no signal-based fallback: SIGHUP re-reads the same pinned
-inode and cannot fix the bind-mount blind spot, so it would only add a second,
-more surprising reload path.
+There is deliberately no signal-based fallback. SIGHUP is not handled at all:
+it keeps its default disposition and terminates the process immediately — no
+drain, no reload — so treat it as a kill, not a kick. A SIGHUP-based reload
+would also re-read the same pinned inode and cannot fix the bind-mount blind
+spot, so it would only add a second, more surprising reload path.
 
 ### Measured mount behavior (Docker bind mounts)
 
