@@ -89,14 +89,10 @@ cooldown:
   base: 15s
   max: 10m
 dial-timeout: 10s
-balance:
-  v4: 7
-  v6: 3
 proxies:
   auto:
     - proxy: username:password@provider.example:1080
       kind: v4
-      weight: 3
     - proxy: username:password@[2001:db8::1]:1080
       kind: v6
   manual: []
@@ -105,7 +101,9 @@ proxies:
 There is no `global:` block: the removed HTTP era's `target-tls-insecure` and
 `max-body-buffer` settings no longer exist, and a config containing them fails
 validation — the last-known-good config keeps serving (on first boot the process
-refuses to start).
+refuses to start). The removed weighted-selection keys are rejected the same
+way: a route `weight` key and a `balance` block no longer exist, and a config
+containing either fails validation identically.
 
 `proxies.auto` is the source of static routes; `proxies.manual` routes
 additionally carry a rotate schedule and provider API (see
@@ -126,28 +124,6 @@ URL paths, queries, fragments, unknown active YAML fields, duplicate route
 identities, and non-lowercase/missing `kind` are rejected. A duplicate remains
 a duplicate even if it claims another kind. Credentials never appear in errors,
 logs, or `/status`.
-
-Every route accepts an optional selection `weight` (whole number, default 1, at
-most 1000): picks distribute across eligible routes proportionally to their
-weights, so `weight: 3` serves about three times the traffic of a `weight: 1`
-peer. Equal weights — or no `weight` key at all — give true round-robin. The
-key exists on both `proxies.auto` and `proxies.manual` routes and is not part
-of route identity: a reload that only retunes weights keeps the route's health
-state.
-
-The optional `balance` block splits mixed-listener picks between the two egress
-families by relative share — `balance: {v4: 7, v6: 3}` sends about 70% of mixed
-traffic through `kind: v4` routes no matter how many routes each family has,
-while route `weight` still distributes picks inside one family. Each share is a
-whole number 1–1000; a family with no share only serves as standby when the
-shared family has no live route, and a family whose routes are all cooling or
-auth-blocked always defers to the other — availability beats the ratio. The
-dedicated v4/v6 listeners ignore the block entirely: their picks consult no
-family ratio and never advance the family clocks, so a dedicated listener's
-traffic cannot skew the mixed split's phase. Without it, each family's share
-follows its routes' own weights, exactly as if the pool were flat. A reload
-that changes the ratio applies to the retained routes and carries the split's
-phase over.
 
 `proxies.auto` routes and `proxies.manual` routes share one pool and one
 identity space; a duplicate across the two lists is rejected like any other.
@@ -182,9 +158,6 @@ proxies:
   rotation attempts of this route. After a verified rotation the next attempt is
   scheduled one interval out; after an unchanged-IP outcome it is scheduled by
   the retry backoff instead.
-- `weight` (optional, whole number 1–1000, default 1): selection weight,
-  identical to the `proxies.auto` route key. Higher-weight manual routes absorb
-  proportionally more traffic between rotations.
 - `api` (required): the provider call that requests a new egress IP.
   `url` is required (http or https). `method` defaults to `POST`. `timeout`
   defaults to `10s` and bounds one call. `headers` and `body` are sent verbatim.
@@ -255,7 +228,7 @@ immediately in the `stale` state, and the gateway retries forever — the next
 attempt waits one `rotate-interval`, doubling per consecutive unchanged result
 (`interval`, `2×`, `4×`, …) with ±10% jitter, capped at `retry-backoff-max`, and
 floored by any `Retry-After`. Stale routes are pushed to the back of the
-weighted recency order so fresher routes absorb traffic first, but they keep
+recency order so fresher routes absorb traffic first, but they keep
 serving normally.
 
 A route whose provider hands out non-sticky addresses cannot be rotated
@@ -363,8 +336,7 @@ The following settings apply to new client operations without restart:
 
 Unchanged URL+kind routes preserve their recency pass, cooldown,
 pair-scoped target cooldowns, authentication-block, rotation state (last
-verified IP, stale history), and counters. A changed `weight` applies to the
-retained route without resetting any of it. Changing userinfo, kind, or
+verified IP, stale history), and counters. Changing userinfo, kind, or
 moving a route between `proxies.auto` and `proxies.manual` creates a fresh
 route state.
 
@@ -465,19 +437,14 @@ everywhere else.
 | Client cancellation/disconnect                                                                                                | No health mutation and no retry                                               | Close connection                                                                 |
 | Established tunnel breaks                                                                                                     | No health mutation                                                            | Close tunnel                                                                     |
 
-The pool serves the eligible route with the smallest weighted recency pass:
-every pick, completed request, and stale return advances the route's pass by
-one step inversely proportional to its `weight`, so picks distribute
-proportionally to the configured weights and equal weights give true
-round-robin. On the mixed listener, a configured `balance` block composes a
-family clock above this order: the family whose clock is furthest behind
-serves first — zero-share families only as standby — and the weighted order
-then picks the route inside that family; only mixed picks move those clocks,
-so dedicated-listener traffic never shifts the split's phase. A request never
+The pool serves the eligible route with the smallest recency pass: every pick,
+completed request, and stale return advances the route's pass by one step, and
+first-seen order breaks ties, giving true round-robin across the eligible set.
+A request never
 tries the same route
 twice. Cooling routes are skipped when a usable eligible route exists; when
 all eligible non-auth-blocked routes cool down, the one recovering soonest is
-tried — weight- and family-blind, because soonest recovery is the only
+tried — blind to selection order, because soonest recovery is the only
 criterion that matters there. Authentication blocks remain until the route
 identity changes on reload.
 
@@ -588,8 +555,7 @@ ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 redacted `pool` state. It additionally reports safe per-listener counters —
 `requests` and `failovers` (in-band route fallbacks, distinct from rotations) —
 each route's `kind` and `origin`, each manual route's rotation view (see
-"Manual rotation routes"), the active `balance` family split when one is
-configured, and a `warmPool` section (see
+"Manual rotation routes"), and a `warmPool` section (see
 ["Warm upstream pool"](#warm-upstream-pool)). A listener's `requests` counter advances only on a valid `CONNECT`
 command that reaches route selection; a greeted client that is rejected during
 protocol negotiation (no `0x00` method, unsupported command, malformed frame)

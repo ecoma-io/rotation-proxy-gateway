@@ -63,8 +63,8 @@ func (p *Proxy) EndRotation(ip string, at time.Time) {
 
 // MarkStale returns a route to serving after a rotation that did not change
 // its egress IP. It records the retry wait and the run of same-IP rotations,
-// and jumps the route to the weighted recency back so picks prefer fresher
-// routes until the next rotation attempt. The flag clears under p.mu, as in
+// and jumps the route to the recency back so picks prefer fresher routes
+// until the next rotation attempt. The flag clears under p.mu, as in
 // EndRotation.
 func (pl *Pool) MarkStale(p *Proxy, nextRetryIn time.Duration, consecutiveSameIP int) {
 	p.mu.Lock()

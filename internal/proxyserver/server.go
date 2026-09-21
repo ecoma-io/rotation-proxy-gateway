@@ -225,18 +225,8 @@ func (s *Server) generation() *pool.Generation {
 	return s.store.Load()
 }
 
-// MixedListener is the listener name of the mixed v4/v6 egress view. The name
-// decides the pick path: dedicated views pick through PickForDedicated so
-// their traffic never advances the family-balance clocks the mixed view splits
-// by.
+// MixedListener is the listener name of the mixed v4/v6 egress view.
 const MixedListener = "mixed"
-
-func (s *Server) pick(gen *pool.Generation, exclude map[*pool.Proxy]bool, target string) *pool.Proxy {
-	if s.listener == MixedListener {
-		return gen.Pool.PickFor(exclude, s.allow, target)
-	}
-	return gen.Pool.PickForDedicated(exclude, s.allow, target)
-}
 
 // UseWarmPool arms the warm-connection borrow path. It must be called before
 // Serve; afterwards the field is read-only.
@@ -377,7 +367,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 				Msg("inbound handshake deadline expired before the next attempt")
 			return
 		}
-		p := s.pick(gen, exclude, targetAddr)
+		p := gen.Pool.PickFor(exclude, s.allow, targetAddr)
 		if p == nil {
 			break
 		}
@@ -796,12 +786,6 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 			"failovers": failovers,
 			"listeners": perListener,
 			"pool":      gen.Pool.Snapshot(),
-		}
-		// The active family split is part of the serving contract, so /status
-		// reports exactly what the current generation enforces — omitted when
-		// no balance block is configured.
-		if bal := gen.Config.Balance; bal.V4 > 0 || bal.V6 > 0 {
-			status["balance"] = map[string]int{"v4": bal.V4, "v6": bal.V6}
 		}
 		if rotations != nil {
 			status["rotations"] = rotations()

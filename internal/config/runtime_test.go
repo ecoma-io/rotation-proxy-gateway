@@ -219,6 +219,8 @@ func TestLoadRuntimeStrictAndCredentialSafe(t *testing.T) {
 		{"unknown top level", "unknown: value\n", "invalid keys"},
 		{"per route override", "      target-tls-insecure: false\n", "invalid keys"},
 		{"legacy global block", "global:\n  target-tls-insecure: true\n", "invalid keys"},
+		{"legacy route weight", "      weight: 3\n", "invalid keys"},
+		{"legacy balance block", "balance:\n  v4: 7\n", "invalid keys"},
 		{"invalid kind", "      kind: ipv4\n", "kind must be exactly v4 or v6"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -226,7 +228,7 @@ func TestLoadRuntimeStrictAndCredentialSafe(t *testing.T) {
 			switch tc.name {
 			case "invalid kind":
 				content = strings.Replace(content, "      kind: v4\n", tc.mutate, 1)
-			case "per route override":
+			case "per route override", "legacy route weight":
 				content = strings.Replace(content, "      kind: v4\n", "      kind: v4\n"+tc.mutate, 1)
 			default:
 				content += tc.mutate

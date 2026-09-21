@@ -144,7 +144,7 @@ func warmStore(w config.WarmPoolSettings, routes ...*url.URL) (*pool.Store, []*p
 	for _, u := range routes {
 		cfg.Routes = append(cfg.Routes, config.RouteSpec{URL: u, Kind: config.EgressV4})
 	}
-	store := pool.NewStore(cfg, pool.NewRoutes(cfg.AllRoutes(), cfg.CooldownBase, cfg.CooldownMax, config.KindBalance{}))
+	store := pool.NewStore(cfg, pool.NewRoutes(cfg.AllRoutes(), cfg.CooldownBase, cfg.CooldownMax))
 	return store, store.Load().Pool.RoutePointers()
 }
 

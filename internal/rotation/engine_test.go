@@ -124,7 +124,7 @@ func testPool(t *testing.T, cfg *config.RuntimeConfig) *pool.Pool {
 	for _, m := range cfg.ManualRoutes {
 		specs = append(specs, m.RouteSpec)
 	}
-	return pool.NewRoutes(specs, 30*time.Second, time.Minute, config.KindBalance{})
+	return pool.NewRoutes(specs, 30*time.Second, time.Minute)
 }
 
 // setup builds the config/pool/generation trio and an engine over them. All
@@ -781,7 +781,7 @@ func TestProcedureAbortsForRemovedRoute(t *testing.T) {
 
 	// The generation's pool no longer contains the route (removed by a
 	// reload): the procedure must return without touching anything.
-	emptyGen := pool.NewGeneration(cfg, pool.NewRoutes(nil, 30*time.Second, time.Minute, config.KindBalance{}))
+	emptyGen := pool.NewGeneration(cfg, pool.NewRoutes(nil, 30*time.Second, time.Minute))
 	s.e.runProcedure(context.Background(), emptyGen, spec, nil, routeID(spec.RouteSpec))
 	if api.calls.Load() != 0 {
 		t.Fatalf("removed route still called the API %d times", api.calls.Load())

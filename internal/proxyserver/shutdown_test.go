@@ -54,7 +54,7 @@ func TestShutdownCancelsPendingUpstreamDial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, time.Second, time.Minute)
 	s := newRuntimeServer(pl, defaultRuntime(), testLogger())
 
 	dialStarted := make(chan struct{})
@@ -102,7 +102,7 @@ func TestShutdownCancelsPendingUpstreamDial(t *testing.T) {
 // what lets Serve close late connections instead of counting them into a
 // drain that already swept.
 func TestBeginSessionRefusedAfterShutdown(t *testing.T) {
-	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}), defaultRuntime(), testLogger())
+	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute), defaultRuntime(), testLogger())
 	if err := s.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown on an idle server = %v, want nil", err)
 	}
@@ -119,7 +119,7 @@ func TestBeginSessionRefusedAfterShutdown(t *testing.T) {
 // the race detector watch for that desync as a hang or a counter panic.
 func TestBeginSessionShutdownRace(t *testing.T) {
 	for range 50 {
-		s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute, config.KindBalance{}), defaultRuntime(), testLogger())
+		s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute), defaultRuntime(), testLogger())
 		const sessionCount = 8
 		start := make(chan struct{})
 		parked := make(chan net.Conn, sessionCount)
@@ -174,7 +174,7 @@ func TestLastAttemptFailureIsNotAFailover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, time.Second, time.Minute)
 	runtime := defaultRuntime()
 	runtime.MaxRetries = 1
 	var logs safeLogBuffer
@@ -212,7 +212,7 @@ func TestServeTunnelStopsRetryingAfterHandshakeDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, time.Second, time.Minute)
 	runtime := defaultRuntime()
 	runtime.MaxRetries = 3
 	var logs safeLogBuffer

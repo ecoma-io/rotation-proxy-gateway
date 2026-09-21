@@ -130,7 +130,7 @@ func run() error {
 	// snapshot). Handlers load it once per operation; reload builds the next
 	// pool snapshot and swaps the whole generation atomically. The pool serves
 	// both origins; manual routes additionally carry rotation state.
-	store := pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.AllRoutes(), runtimeCfg.CooldownBase, runtimeCfg.CooldownMax, runtimeCfg.Balance))
+	store := pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.AllRoutes(), runtimeCfg.CooldownBase, runtimeCfg.CooldownMax))
 	engine := rotation.New(store, log)
 	// The warm pool keeps half-established upstream connections ready for the
 	// serving path to borrow (one non-blocking pop per attempt, cold dial on

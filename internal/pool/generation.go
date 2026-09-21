@@ -68,7 +68,7 @@ func (s *Store) Publish(cfg *config.RuntimeConfig) *Generation {
 		panic("pool: Publish requires a non-nil RuntimeConfig")
 	}
 	current := s.value.Load()
-	gen := NewGeneration(cfg, current.Pool.Reconfigure(cfg.AllRoutes(), cfg.CooldownBase, cfg.CooldownMax, cfg.Balance))
+	gen := NewGeneration(cfg, current.Pool.Reconfigure(cfg.AllRoutes(), cfg.CooldownBase, cfg.CooldownMax))
 	s.value.Store(gen)
 	return gen
 }

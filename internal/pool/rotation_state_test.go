@@ -19,7 +19,7 @@ func newManualPool(t *testing.T, c *clock, urls ...string) *Pool {
 	for _, raw := range urls {
 		routes = append(routes, manualSpec(t, raw))
 	}
-	pl := NewRoutes(routes, 30*time.Second, time.Minute, config.KindBalance{})
+	pl := NewRoutes(routes, 30*time.Second, time.Minute)
 	pl.Now = c.NowFunc
 	return pl
 }
@@ -276,11 +276,11 @@ func TestMarkRotatedClearsDialHealthNotAuth(t *testing.T) {
 func TestReconfigureKeepsRotationStateForUnchangedIdentity(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	specs := []config.RouteSpec{manualSpec(t, "socks5://m1:1")}
-	pl := NewRoutes(specs, 30*time.Second, time.Minute, config.KindBalance{})
+	pl := NewRoutes(specs, 30*time.Second, time.Minute)
 	pl.Now = c.NowFunc
 
 	pl.entries[0].EndRotation("203.0.113.9", c.now)
-	next := pl.Reconfigure(specs, 30*time.Second, time.Minute, config.KindBalance{})
+	next := pl.Reconfigure(specs, 30*time.Second, time.Minute)
 	next.Now = c.NowFunc
 	if next.entries[0] != pl.entries[0] {
 		t.Fatalf("unchanged manual route rebuilt a new state")
@@ -292,7 +292,7 @@ func TestReconfigureKeepsRotationStateForUnchangedIdentity(t *testing.T) {
 	// Same URL+kind but origin flipped to auto is a new route role: fresh
 	// state, no rotation view.
 	autoSpecs := []config.RouteSpec{{URL: specs[0].URL, Kind: specs[0].Kind, Origin: config.RouteOriginAuto}}
-	next = pl.Reconfigure(autoSpecs, 30*time.Second, time.Minute, config.KindBalance{})
+	next = pl.Reconfigure(autoSpecs, 30*time.Second, time.Minute)
 	next.Now = c.NowFunc
 	if next.entries[0] == pl.entries[0] {
 		t.Fatalf("origin flip reused the manual route state")

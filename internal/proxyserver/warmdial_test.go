@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/socksdial"
 
@@ -91,7 +90,7 @@ func warmDialServer() *Server {
 
 func warmRoute(t *testing.T) *pool.Proxy {
 	t.Helper()
-	pl := pool.NewRoutes(mixedRoutes(&url.URL{Scheme: "socks5", Host: "unused.test:1080"}), 30*time.Second, time.Minute, config.KindBalance{})
+	pl := pool.NewRoutes(mixedRoutes(&url.URL{Scheme: "socks5", Host: "unused.test:1080"}), 30*time.Second, time.Minute)
 	return pl.RoutePointers()[0]
 }
 

@@ -196,7 +196,7 @@ provider's or a middlebox's, the remedy is the same).
   included in ns/op. Gateway-internal allocation or pick-path work therefore
   needs the in-process micro-benches instead: `internal/socksdial`
   (`BenchmarkDial`, `BenchmarkDialAuthenticated` — full outbound handshake per
-  iteration) and `internal/pool` (`BenchmarkPickFor`, `BenchmarkPickForBalanced`
+  iteration) and `internal/pool` (`BenchmarkPickFor`
   — pick, report, release under full parallelism). Loopback e2e `ns/op` is
   handshake-RTT-dominated and routinely cannot resolve a real few-percent
   gateway win; a pinned unit test (for example the inbound framing read
