@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -434,5 +435,73 @@ func TestE2E_ReloadDoesNotDropInFlight(t *testing.T) {
 
 	if got := failures.Load(); got != 0 {
 		t.Fatalf("reload dropped %d in-flight requests; logs:\n%s", got, g.Logs())
+	}
+}
+
+// hupIgnoredMsg is the exact one-time info message the gateway logs on the
+// first ignored SIGHUP; the e2e assertions match it verbatim.
+const hupIgnoredMsg = "SIGHUP received; ignored — configuration reloads are poller-driven, stop with SIGTERM"
+
+// SIGHUP is caught and deliberately ignored: it must neither terminate the
+// process (its default disposition killed it instantly, no drain, exit 129)
+// nor act as a reload trigger — the content poller is the only reload path.
+// The gateway keeps serving untouched and logs one info line on first receipt.
+func TestE2E_SIGHUPIgnoredKeepsServing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	sim := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{{Proxy: sim.RouteValue(), Kind: "v4"}})
+	g := NewGateway(t, cfg)
+
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+
+	if err := g.cmd.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatalf("SIGHUP: %v", err)
+	}
+	waitForLogRecord(t, g, map[string]string{"msg": hupIgnoredMsg}, reloadSettle)
+
+	alive := func() {
+		t.Helper()
+		if g.cmd.ProcessState != nil && g.cmd.ProcessState.Exited() {
+			t.Fatalf("gateway died on SIGHUP; output:\n%s", g.Logs())
+		}
+	}
+	alive()
+	st, err := g.Status()
+	if err != nil {
+		t.Fatalf("status after SIGHUP: %v\nlogs:\n%s", err, g.Logs())
+	}
+	if got := proxyAddrs(st); len(got) != 1 || got[0] != sim.Addr {
+		t.Fatalf("pool changed after SIGHUP: %v", got)
+	}
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+	if _, ok := findLogRecord(decodeLogRecords(g.Logs()), map[string]string{"msg": "configuration reloaded"}); ok {
+		t.Fatalf("SIGHUP triggered a reload:\n%s", g.Logs())
+	}
+	if _, ok := findLogRecord(decodeLogRecords(g.Logs()), map[string]string{"msg": "shutting down"}); ok {
+		t.Fatalf("SIGHUP started a shutdown:\n%s", g.Logs())
+	}
+
+	// A second SIGHUP stays silent: exactly one info line, ever.
+	if err := g.cmd.Process.Signal(syscall.SIGHUP); err != nil {
+		t.Fatalf("second SIGHUP: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	alive()
+	hupLines := 0
+	for _, rec := range decodeLogRecords(g.Logs()) {
+		if recordHas(rec, map[string]string{"msg": hupIgnoredMsg}) {
+			hupLines++
+		}
+	}
+	if hupLines != 1 {
+		t.Fatalf("SIGHUP log lines = %d, want exactly one on first receipt:\n%s", hupLines, g.Logs())
+	}
+
+	// SIGTERM still stops the process gracefully after SIGHUPs were ignored.
+	if code := g.TerminateAndWait(); code != 0 {
+		t.Fatalf("exit code after SIGTERM = %d, want 0; logs:\n%s", code, g.Logs())
 	}
 }

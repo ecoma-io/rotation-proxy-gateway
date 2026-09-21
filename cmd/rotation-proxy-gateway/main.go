@@ -236,8 +236,11 @@ func run() error {
 	go engine.Run(engineCtx)
 	warm.Start()
 
+	// SIGHUP is registered only so it cannot kill the process with its default
+	// disposition: it is neither a reload trigger (reloads are poller-driven)
+	// nor a stop signal. SIGINT/SIGTERM keep their graceful-stop meaning.
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
 
 	// Reloads from the poller arrive on one channel and are handled by this
@@ -259,12 +262,24 @@ func run() error {
 		log.Info().Str("source", source).Int("upstreams", len(next.AllRoutes())).Msg("configuration reloaded")
 	}
 
+	hupLogged := false
 	for {
 		select {
 		case err := <-errCh:
 			shutdownAll(log, engineCancel, warm.Stop, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return err
 		case sig := <-sigCh:
+			// SIGHUP is deliberately ignored — never a reload, never a drain.
+			// One info line on first receipt tells the operator why nothing
+			// happened; later ones stay silent so a looping sender cannot
+			// flood the log. Any other signal is the graceful-stop path.
+			if sig == syscall.SIGHUP {
+				if !hupLogged {
+					hupLogged = true
+					log.Info().Msg("SIGHUP received; ignored — configuration reloads are poller-driven, stop with SIGTERM")
+				}
+				continue
+			}
 			log.Info().Str("signal", sig.String()).Str("grace", bootstrap.ShutdownGrace.String()).Msg("shutting down")
 			shutdownAll(log, engineCancel, warm.Stop, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return nil
