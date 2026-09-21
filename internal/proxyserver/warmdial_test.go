@@ -66,7 +66,7 @@ func parkThenDie(t *testing.T) *url.URL {
 				return
 			}
 			go func() {
-				defer conn.Close()
+				defer func() { _ = conn.Close() }()
 				br := bufio.NewReader(conn)
 				head := make([]byte, 2)
 				if _, err := io.ReadFull(br, head); err != nil {
@@ -116,7 +116,7 @@ func TestDialWarmFirstUsesBorrowedConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dialWarmFirst: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	banner := make([]byte, len("banner\n"))
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := io.ReadFull(conn, banner); err != nil {
@@ -147,7 +147,7 @@ func TestDialWarmFirstDropsDeadBorrowAndDialsCold(t *testing.T) {
 	s.dial = func(context.Context, *url.URL, socksdial.Target, time.Duration) (net.Conn, error) {
 		coldDialed++
 		c1, c2 := net.Pipe()
-		go io.Copy(io.Discard, c1)
+		go func() { _, _ = io.Copy(io.Discard, c1) }()
 		return c2, nil
 	}
 	s.warm = warm

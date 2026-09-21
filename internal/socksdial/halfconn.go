@@ -56,7 +56,7 @@ func DialHalf(ctx context.Context, pu *url.URL, timeout time.Duration) (*HalfCon
 	hc.br = handshakeBufPool.Get().(*bufio.Reader)
 	hc.br.Reset(conn)
 	if err := hc.negotiate(pu); err != nil {
-		hc.Close()
+		_ = hc.Close()
 		return nil, err
 	}
 	return hc, nil
