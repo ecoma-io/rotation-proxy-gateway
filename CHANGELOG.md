@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.3.1](https://github.com/ecoma-io/rotation-proxy-gateway/compare/v0.3.0...v0.3.1) (2026-09-21)
+
+
+### Bug Fixes
+
+* **ci:** keep .env and node_modules out of the Docker build context ([6efb6a7](https://github.com/ecoma-io/rotation-proxy-gateway/commit/6efb6a7c13e9781d28637487f8491f49e388b0d4)), closes [#41](https://github.com/ecoma-io/rotation-proxy-gateway/issues/41)
+* **ci:** keep .env out of the Docker build context ([#49](https://github.com/ecoma-io/rotation-proxy-gateway/issues/49)) ([6efb6a7](https://github.com/ecoma-io/rotation-proxy-gateway/commit/6efb6a7c13e9781d28637487f8491f49e388b0d4))
+* **ci:** keep merge-queue CodeQL upload tied to its candidate ([#60](https://github.com/ecoma-io/rotation-proxy-gateway/issues/60)) ([fc046e1](https://github.com/ecoma-io/rotation-proxy-gateway/commit/fc046e12795699e01280c3167f55270d9fcad7e6))
+* **cmd:** catch and ignore SIGHUP instead of dying without drain ([2e9b322](https://github.com/ecoma-io/rotation-proxy-gateway/commit/2e9b322c72225c1eed46c23f86ef9cbd9f72323d))
+* **cmd:** ignore SIGHUP instead of terminating without drain ([#57](https://github.com/ecoma-io/rotation-proxy-gateway/issues/57)) ([2e9b322](https://github.com/ecoma-io/rotation-proxy-gateway/commit/2e9b322c72225c1eed46c23f86ef9cbd9f72323d))
+* **config:** reject provider URLs without a host and unknown argv ([#50](https://github.com/ecoma-io/rotation-proxy-gateway/issues/50)) ([9eb0bf6](https://github.com/ecoma-io/rotation-proxy-gateway/commit/9eb0bf6df7eebed822535ce7e32c34f8d069fe48)), closes [#44](https://github.com/ecoma-io/rotation-proxy-gateway/issues/44)
+* **pool:** clear pair cooldowns when a rotation succeeds ([#54](https://github.com/ecoma-io/rotation-proxy-gateway/issues/54)) ([8f0e20a](https://github.com/ecoma-io/rotation-proxy-gateway/commit/8f0e20a6ce4bad98ee4a100364190ef332224345))
+* **proxyserver:** compare RFC 1929 credentials constant-time across the pair ([#48](https://github.com/ecoma-io/rotation-proxy-gateway/issues/48)) ([eaa8743](https://github.com/ecoma-io/rotation-proxy-gateway/commit/eaa87434cdb97a6f9726c29f6aaa0f930935a2f3))
+* **proxyserver:** log retry-cap exhaustion as a distinct error kind ([#58](https://github.com/ecoma-io/rotation-proxy-gateway/issues/58)) ([a6d17a7](https://github.com/ecoma-io/rotation-proxy-gateway/commit/a6d17a75af4db17831c3c3328388ab943590adec))
+* **proxyserver:** reset wrapped client conns and honor client half-close ([#55](https://github.com/ecoma-io/rotation-proxy-gateway/issues/55)) ([ded0388](https://github.com/ecoma-io/rotation-proxy-gateway/commit/ded0388384bb208a0d5b6a5e4aed275a7439b5ce)), closes [#37](https://github.com/ecoma-io/rotation-proxy-gateway/issues/37) [#38](https://github.com/ecoma-io/rotation-proxy-gateway/issues/38)
+* **rotation:** make the new-IP commit race-free and add the post-API removal checkpoint ([#56](https://github.com/ecoma-io/rotation-proxy-gateway/issues/56)) ([051fdcb](https://github.com/ecoma-io/rotation-proxy-gateway/commit/051fdcbee289454ed26f2705c5b50880be33c778))
+
+
+### Documentation
+
+* configuration.md "Reload behavior" now states the caught-and- ([2e9b322](https://github.com/ecoma-io/rotation-proxy-gateway/commit/2e9b322c72225c1eed46c23f86ef9cbd9f72323d)), closes [#42](https://github.com/ecoma-io/rotation-proxy-gateway/issues/42)
+* rotation.md procedure step 4 and failure-and-health.md's pair ([8f0e20a](https://github.com/ecoma-io/rotation-proxy-gateway/commit/8f0e20a6ce4bad98ee4a100364190ef332224345)), closes [#45](https://github.com/ecoma-io/rotation-proxy-gateway/issues/45)
+* split the behavior contract into docs/ pages behind a landing README ([#36](https://github.com/ecoma-io/rotation-proxy-gateway/issues/36)) ([d001bfb](https://github.com/ecoma-io/rotation-proxy-gateway/commit/d001bfbe60190407a4209d0cd4643796df0eb9ec))
+
 ## [0.3.0](https://github.com/ecoma-io/rotation-proxy-gateway/compare/v0.2.0...v0.3.0) (2026-09-21)
 
 
