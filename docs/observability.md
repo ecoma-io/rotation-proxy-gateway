@@ -81,7 +81,8 @@ restart.
 Each request has a process-local `request_id`. Log lines additionally include
 `listener=mixed|v4|v6`, host-only `target` and `upstream`, retry attempt
 counts, the error kind (`proxy_connect`, `auth_route`, `socks_connect`,
-`connect_target`, `setup`, `no_route`), and the applied cooldown for endpoint
+`connect_target`, `setup`, `no_route`, `retry_exhausted`), and the applied
+cooldown for endpoint
 dial, SOCKS handshake, and refused connect-target failures. They never log
 full URLs, headers, bodies, userinfo, the inbound account, or the rotate-API
 configuration.

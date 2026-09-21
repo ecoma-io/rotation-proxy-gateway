@@ -74,8 +74,8 @@ bootstrap variable carries the `RPGW_` prefix;
   isolation.
 - [Failure and route health](docs/failure-and-health.md) — the failure
   classification contract (`proxy_connect`, `auth_route`, `socks_connect`,
-  `connect_target`, `setup`, `no_route`), round-robin selection, and the two
-  cooldown scopes.
+  `connect_target`, `setup`, `no_route`, `retry_exhausted`), round-robin
+  selection, and the two cooldown scopes.
 - [Inbound SOCKS5 behavior](docs/inbound-socks5.md) — RFC 1928/1929
   authentication, commands, target-address transparency, replies, the
   handshake deadline, and keep-alive ownership.

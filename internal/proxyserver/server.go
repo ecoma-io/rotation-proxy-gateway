@@ -446,7 +446,14 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 	var upstream net.Conn
 	var chosen *pool.Proxy
 	var attempts int
-	for attempt := 0; attempt < settings.maxRetries; attempt++ {
+	// exhausted distinguishes why the chain ended with no tunnel. true means
+	// the retry budget ran out while the pool could still supply routes; the
+	// loop breaks on the *next* pick when the cap is already reached, so a
+	// final attempt that succeeded or failed in-band is never misread as an
+	// untried leftover. false means the last pick itself came back nil — no
+	// eligible untried route remained.
+	exhausted := false
+	for attempt := 0; ; attempt++ {
 		// A retry dials again under the inbound handshake window. Once that
 		// window is gone — a slow retry chain, most plausibly a vanished
 		// client — further attempts would spend route health on a client
@@ -457,6 +464,13 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 				Str("error_kind", errorKindSetup).Str("duration", logDuration(time.Since(start))).
 				Msg("inbound handshake deadline expired before the next attempt")
 			return
+		}
+		// The budget ends the chain before picking: a pick would have
+		// succeeded -- eligible routes remain -- so this is retry exhaustion,
+		// not route exhaustion.
+		if attempt >= settings.maxRetries {
+			exhausted = true
+			break
 		}
 		p := gen.Pool.PickFor(exclude, s.allow, targetAddr)
 		if p == nil {
@@ -531,11 +545,15 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 		break
 	}
 	if upstream == nil {
+		kind := errorKindNoRoute
+		if exhausted {
+			kind = errorKindRetryExhausted
+		}
 		writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the connection closes either way
 		log.Warn().Str("target", logTarget).Int("attempts", attempts).
 			Int("pool_size", gen.Pool.Size()).Int("kind_routes", gen.Pool.CountAllowed(s.allow)).
 			Int("excluded", len(exclude)).
-			Str("error_kind", errorKindNoRoute).Str("duration", logDuration(time.Since(start))).
+			Str("error_kind", kind).Str("duration", logDuration(time.Since(start))).
 			Msg("tunnel failed")
 		return
 	}

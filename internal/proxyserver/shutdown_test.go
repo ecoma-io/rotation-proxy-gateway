@@ -199,8 +199,10 @@ func TestLastAttemptFailureIsNotAFailover(t *testing.T) {
 		t.Fatalf("listener status = %+v, want the single failed attempt not counted as a fallback", status)
 	}
 	// The reply can reach the client before the session goroutine flushes its
-	// closing log record, so poll instead of asserting immediately.
-	waitForRecord(t, &logs, map[string]string{"msg": "tunnel failed", "error_kind": "no_route", "attempts": "1",
+	// closing log record, so poll instead of asserting immediately. The single
+	// route was tried once and the budget ended the chain: that is the
+	// retry-cap stop, so the kind is retry_exhausted, not no_route.
+	waitForRecord(t, &logs, map[string]string{"msg": "tunnel failed", "error_kind": "retry_exhausted", "attempts": "1",
 		"pool_size": "1", "kind_routes": "1", "excluded": "1"})
 }
 

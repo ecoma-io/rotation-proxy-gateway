@@ -105,7 +105,9 @@ changing failure classification.
   bounded per-route tracking (1024, expired-then-soonest eviction), summary
   counts only in `/status`—so one refused target cannot cool the route for
   other targets. Local SOCKS request errors and post-tunnel errors are
-  `setup`; exhausting eligible routes is `no_route`.
+  `setup`; picking finds no eligible untried route is `no_route`, while
+  spending the `max-retries` budget with eligible routes still untried is
+  `retry_exhausted`.
 - Errors after the SOCKS tunnel is established—including target reads/writes,
   malformed target content, cancellation, and broken tunnel—and local inbound
   request errors (malformed target encoding, oversized configured

@@ -14,12 +14,13 @@ import (
 const maxLogErrorLength = 512
 
 const (
-	errorKindProxyConnect  = "proxy_connect"
-	errorKindAuthRoute     = "auth_route"
-	errorKindSocksConnect  = "socks_connect"
-	errorKindConnectTarget = "connect_target"
-	errorKindSetup         = "setup"
-	errorKindNoRoute       = "no_route"
+	errorKindProxyConnect   = "proxy_connect"
+	errorKindAuthRoute      = "auth_route"
+	errorKindSocksConnect   = "socks_connect"
+	errorKindConnectTarget  = "connect_target"
+	errorKindSetup          = "setup"
+	errorKindNoRoute        = "no_route"
+	errorKindRetryExhausted = "retry_exhausted"
 )
 
 // upstreamLogValue returns the redacted route identity used in logs. URL.Host

@@ -88,7 +88,11 @@ func TestNoRouteRecordShowsPoolAndKindView(t *testing.T) {
 		{URL: u6, Kind: config.EgressV6},
 	}, time.Second, time.Minute)
 	runtime := defaultRuntime()
-	runtime.MaxRetries = 1
+	// The cap outlives the pickable routes: the v4 route fails and is
+	// excluded, and the v6 route can never serve the v4-only listener, so the
+	// chain ends with a nil pick -- true route exhaustion, logged no_route
+	// with the retry budget still unspent.
+	runtime.MaxRetries = 2
 	var logs safeLogBuffer
 	s := newRuntimeServer(pl, runtime, captureLogger(&logs), config.EgressV4)
 	s.dial = func(context.Context, *url.URL, socksdial.Target, time.Duration) (net.Conn, error) {
@@ -109,6 +113,116 @@ func TestNoRouteRecordShowsPoolAndKindView(t *testing.T) {
 		"pool_size": "2", "kind_routes": "1", "excluded": "1",
 	}); !ok {
 		t.Fatalf("no_route record missing the pool/kind view:\n%s", output)
+	}
+}
+
+// When the retry budget ends the chain while eligible routes remain untried,
+// the terminal record must say retry_exhausted, not no_route: no_route is
+// reserved for the case where no eligible untried route remained. The client
+// still receives the ordinary 05 01 general failure either way.
+func TestRetryCapExhaustionLogsDistinctKind(t *testing.T) {
+	// Three always-failing routes; the pool can supply a fresh one on every
+	// attempt, so only the cap can stop the chain.
+	routes := make([]config.RouteSpec, 0, 3)
+	for range 3 {
+		u, err := url.Parse("socks5://dead.test:1080")
+		if err != nil {
+			t.Fatal(err)
+		}
+		routes = append(routes, config.RouteSpec{URL: u, Kind: config.EgressV4})
+	}
+	pl := pool.NewRoutes(routes, time.Second, time.Minute)
+	runtime := defaultRuntime()
+	runtime.MaxRetries = 2
+	var logs safeLogBuffer
+	s := newRuntimeServer(pl, runtime, captureLogger(&logs), config.EgressV4)
+	dials := 0
+	s.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
+		dials++
+		return nil, &socksdial.ProxyDialError{Err: errors.New("connect refused (TEST)")}
+	}
+	addr := startServer(t, s)
+
+	conn := parkClient(t, addr, "example.test:80")
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if reply[1] != socksReplyGeneral {
+		t.Fatalf("reply = 0x%02x, want general failure 0x01", reply[1])
+	}
+	if dials != runtime.MaxRetries {
+		t.Fatalf("dials = %d, want the retry cap %d", dials, runtime.MaxRetries)
+	}
+
+	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel failed", "error_kind": "retry_exhausted"})
+	if _, ok := findRecord(output, map[string]string{
+		"msg": "tunnel failed", "error_kind": "retry_exhausted", "attempts": "2",
+		"pool_size": "3", "kind_routes": "3", "excluded": "2",
+	}); !ok {
+		t.Fatalf("retry_exhausted record missing the pool/kind view:\n%s", output)
+	}
+	// Two eligible routes went untried: the record must not claim no_route.
+	if _, ok := findRecord(output, map[string]string{"msg": "tunnel failed", "error_kind": "no_route"}); ok {
+		t.Fatalf("retry-cap stop wrongly logged no_route:\n%s", output)
+	}
+
+	// Pool size equal to the cap: every route is tried, the cap ends the
+	// chain — still retry_exhausted, never no_route, because the budget, not
+	// a nil pick, stopped it.
+	plEqual := pool.NewRoutes(routes[:2], time.Second, time.Minute)
+	var logsEqual safeLogBuffer
+	sEqual := newRuntimeServer(plEqual, runtime, captureLogger(&logsEqual), config.EgressV4)
+	sEqual.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
+		return nil, &socksdial.ProxyDialError{Err: errors.New("connect refused (TEST)")}
+	}
+	addrEqual := startServer(t, sEqual)
+	connEqual := parkClient(t, addrEqual, "example.test:80")
+	_ = connEqual.SetDeadline(time.Now().Add(5 * time.Second))
+	replyEqual := make([]byte, 10)
+	if _, err := io.ReadFull(connEqual, replyEqual); err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if replyEqual[1] != socksReplyGeneral {
+		t.Fatalf("replyEqual = 0x%02x, want general failure 0x01", replyEqual[1])
+	}
+	outputEqual := waitForRecord(t, &logsEqual, map[string]string{"msg": "tunnel failed", "error_kind": "retry_exhausted"})
+	if _, ok := findRecord(outputEqual, map[string]string{
+		"msg": "tunnel failed", "error_kind": "retry_exhausted", "attempts": "2",
+		"pool_size": "2", "kind_routes": "2", "excluded": "2",
+	}); !ok {
+		t.Fatalf("pool==cap record missing retry_exhausted view:\n%s", outputEqual)
+	}
+
+	// True route exhaustion -- no eligible untried route remains -- still logs
+	// no_route. One route, tried once and excluded: the second pick has nothing
+	// left and ends the chain, with the cap (2) never reached.
+	pl2 := pool.NewRoutes(routes[:1], time.Second, time.Minute)
+	var logs2 safeLogBuffer
+	s2 := newRuntimeServer(pl2, runtime, captureLogger(&logs2), config.EgressV4)
+	s2.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
+		return nil, &socksdial.ProxyDialError{Err: errors.New("connect refused (TEST)")}
+	}
+	addr2 := startServer(t, s2)
+	conn2 := parkClient(t, addr2, "example.test:80")
+	_ = conn2.SetDeadline(time.Now().Add(5 * time.Second))
+	reply2 := make([]byte, 10)
+	if _, err := io.ReadFull(conn2, reply2); err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	if reply2[1] != socksReplyGeneral {
+		t.Fatalf("reply2 = 0x%02x, want general failure 0x01", reply2[1])
+	}
+	output2 := waitForRecord(t, &logs2, map[string]string{"msg": "tunnel failed", "error_kind": "no_route"})
+	if _, ok := findRecord(output2, map[string]string{
+		"msg": "tunnel failed", "error_kind": "no_route", "attempts": "1",
+		"pool_size": "1", "kind_routes": "1", "excluded": "1",
+	}); !ok {
+		t.Fatalf("true-exhaustion record missing the no_route view:\n%s", output2)
+	}
+	if _, ok := findRecord(output2, map[string]string{"msg": "tunnel failed", "error_kind": "retry_exhausted"}); ok {
+		t.Fatalf("true exhaustion wrongly logged retry_exhausted:\n%s", output2)
 	}
 }
 
