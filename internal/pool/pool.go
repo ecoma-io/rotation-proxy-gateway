@@ -190,6 +190,22 @@ func (p *Proxy) clearTargetCooldown(target string) {
 	p.targetMu.Unlock()
 }
 
+// clearAllTargetCooldowns empties the pair map after a verified rotation:
+// every tracked (route, target) deadline was earned through the previous
+// egress IP, so none of it describes the address the route now serves from.
+// The targetPairs gate mirrors clearTargetCooldown's so routes that never
+// recorded a refusal pay nothing. Taken without any other lock held, keeping
+// targetMu innermost as on every path that takes it.
+func (p *Proxy) clearAllTargetCooldowns() {
+	if p.targetPairs.Load() == 0 {
+		return
+	}
+	p.targetMu.Lock()
+	clear(p.targetCool)
+	p.targetPairs.Store(0)
+	p.targetMu.Unlock()
+}
+
 // coolingTargetPairs counts entries whose deadline is still in the future at
 // nowNano. Called with p.mu held by Snapshot; targetMu stays the innermost
 // lock on every path that takes it.
