@@ -191,12 +191,17 @@ type RotateAPISim struct {
 
 	// Status selects the response code; 0 means 200.
 	Status atomic.Int64
-	// Hang delays the response, modeling a slow provider API.
+	// Hang delays the response, modeling a slow provider API. The delay
+	// yields to teardown: stopNow releases parked hangs so cleanup never
+	// waits out a scripted slow provider.
 	Hang time.Duration
 	// RetryAfter, when non-empty, is sent as a Retry-After header.
 	RetryAfter atomic.Value // string
 	// onCall runs when the request arrives, before the scripted response.
 	onCall func()
+
+	stopOnce sync.Once
+	stop     chan struct{}
 
 	tmu   sync.Mutex
 	times []time.Time
@@ -205,7 +210,7 @@ type RotateAPISim struct {
 // NewRotateAPISim starts the rotate endpoint on 127.0.0.1:0.
 func NewRotateAPISim(t testing.TB) *RotateAPISim {
 	t.Helper()
-	s := &RotateAPISim{}
+	s := &RotateAPISim{stop: make(chan struct{})}
 	s.RetryAfter.Store("")
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.Hits.Add(1)
@@ -227,7 +232,10 @@ func NewRotateAPISim(t testing.TB) *RotateAPISim {
 			s.onCall()
 		}
 		if s.Hang > 0 {
-			time.Sleep(s.Hang)
+			select {
+			case <-time.After(s.Hang):
+			case <-s.stop:
+			}
 		}
 		if ra, _ := s.RetryAfter.Load().(string); ra != "" {
 			w.Header().Set("Retry-After", ra)
@@ -238,7 +246,11 @@ func NewRotateAPISim(t testing.TB) *RotateAPISim {
 		}
 		w.WriteHeader(status)
 	}))
-	t.Cleanup(s.srv.Close)
+	// stop runs first so a handler parked in Hang cannot pin srv.Close.
+	t.Cleanup(func() {
+		s.stopNow()
+		s.srv.Close()
+	})
 	s.URL = s.srv.URL
 	return s
 }
@@ -249,9 +261,16 @@ func (s *RotateAPISim) MaxConcurrent() int64 { return s.maxFast.Load() }
 // OnCall registers a hook run at the arrival of each call.
 func (s *RotateAPISim) OnCall(fn func()) { s.onCall = fn }
 
-// ForceClose drops every live client connection so cleanup does not wait out
-// a parked (hung) rotate call.
-func (s *RotateAPISim) ForceClose() { s.srv.CloseClientConnections() }
+// stopNow releases every parked hang exactly once; later calls with Hang set
+// answer immediately, which only happens after the test is over anyway.
+func (s *RotateAPISim) stopNow() { s.stopOnce.Do(func() { close(s.stop) }) }
+
+// ForceClose wakes parked hangs and drops every live client connection so
+// cleanup does not wait out a parked (hung) rotate call.
+func (s *RotateAPISim) ForceClose() {
+	s.stopNow()
+	s.srv.CloseClientConnections()
+}
 
 // Times reports when each call arrived, for retry-cadence assertions.
 func (s *RotateAPISim) Times() []time.Time {

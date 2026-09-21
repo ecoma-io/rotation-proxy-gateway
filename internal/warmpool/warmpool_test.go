@@ -696,6 +696,153 @@ func TestBorrowWakesSweeper(t *testing.T) {
 	}
 }
 
+// TestReloadShrinksReplenishBoundsMidDial pins the reload edge the at-rest
+// bound tests do not: with replenish dials already in the air, shrinking
+// max-replenish-concurrency or max-replenish-per-route must not kill or leak
+// the in-flight dials (they drain to completion and return their
+// reservations), no new dial may start past the shrunken bound while they
+// fly, and the new bound governs every dial afterwards. The gate releases
+// exactly one parked dial per token, so each phase's in-flight count is
+// observed, not assumed.
+func TestReloadShrinksReplenishBoundsMidDial(t *testing.T) {
+	shrunkStore := func(store *pool.Store, mutate func(*config.WarmPoolSettings)) {
+		t.Helper()
+		next := *store.Load().Config
+		mutate(&next.WarmPool)
+		store.Publish(&next)
+	}
+	gatedPool := func(store *pool.Store) (*Pool, chan struct{}) {
+		gate := make(chan struct{})
+		wp := New(store, zerolog.Nop(), func(ctx context.Context, pu *url.URL, timeout time.Duration) (*socksdial.HalfConn, error) {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return socksdial.DialHalf(ctx, pu, timeout)
+		})
+		return wp, gate
+	}
+	// launch claims n tasks and runs their dials parked at the gate.
+	launch := func(wp *Pool, n int) {
+		t.Helper()
+		for range n {
+			task, ok := wp.claimTask()
+			if !ok {
+				t.Fatal("claim failed while the deficit was scheduled")
+			}
+			go wp.runDial(task)
+		}
+	}
+	waitDialing := func(wp *Pool, want int64, what string) {
+		t.Helper()
+		waitFor(t, what, 3*time.Second, func() bool { return wp.dialing.Load() == want })
+	}
+
+	t.Run("fleet concurrency", func(t *testing.T) {
+		srv := newHalfServer(t, "ok")
+		w := defaultWarm()
+		w.MinIdlePerProxy = 4
+		w.MaxIdlePerProxy = 4
+		w.MaxTotalIdle = 8
+		w.MaxReplenishConcurrency = 2
+		store, _ := warmStore(w, mustURL(t, "socks5://"+srv.addr))
+		wp, gate := gatedPool(store)
+		defer wp.Stop()
+
+		wp.sweep() // four deficits scheduled, two may fly under the old cap
+		launch(wp, 2)
+		waitDialing(wp, 2, "two dials in flight under the old cap")
+
+		shrunkStore(store, func(s *config.WarmPoolSettings) { s.MaxReplenishConcurrency = 1 })
+		if st := wp.Snapshot(); st.MaxReplenishConcurrency != 1 {
+			t.Fatalf("status cap = %d, want 1 after the shrink", st.MaxReplenishConcurrency)
+		}
+		if _, ok := wp.claimTask(); ok {
+			t.Fatal("claim succeeded past the shrunken fleet cap while two dials were in flight")
+		}
+
+		// The in-flight dials drain and retire: both complete, park, and
+		// return their reservations.
+		gate <- struct{}{}
+		gate <- struct{}{}
+		waitDialing(wp, 0, "in-flight dials drained after the shrink")
+		if st := wp.Snapshot(); st.Created != 2 || st.IdleTotal != 2 || st.Routes[0].Flying != 0 {
+			t.Fatalf("drained dials did not retire: %+v", st)
+		}
+
+		// Afterwards the new bound holds: exactly one replenish dial at a time.
+		launch(wp, 1)
+		waitDialing(wp, 1, "one dial under the shrunken cap")
+		if _, ok := wp.claimTask(); ok {
+			t.Fatal("claim succeeded past the shrunken fleet cap with one dial in flight")
+		}
+		gate <- struct{}{}
+		waitDialing(wp, 0, "third dial retired")
+		launch(wp, 1)
+		gate <- struct{}{}
+		waitFor(t, "pool fills to min-idle under the shrunken cap", 3*time.Second, func() bool {
+			return wp.Snapshot().IdleTotal == w.MinIdlePerProxy
+		})
+		if st := wp.Snapshot(); st.Routes[0].Flying != 0 || st.Routes[0].Pending != 0 {
+			t.Fatalf("reservations leaked after the shrink: %+v", st.Routes[0])
+		}
+	})
+
+	t.Run("per-route cap", func(t *testing.T) {
+		srv := newHalfServer(t, "ok")
+		w := defaultWarm()
+		w.MinIdlePerProxy = 4
+		w.MaxIdlePerProxy = 4
+		w.MaxTotalIdle = 8
+		w.MaxReplenishConcurrency = 4
+		w.MaxReplenishPerRoute = 2
+		store, _ := warmStore(w, mustURL(t, "socks5://"+srv.addr))
+		wp, gate := gatedPool(store)
+		defer wp.Stop()
+
+		wp.sweep() // four deficits scheduled, two may fly toward the route
+		launch(wp, 2)
+		waitDialing(wp, 2, "two dials in flight under the old per-route cap")
+		if st := wp.Snapshot(); st.Routes[0].Flying != 2 {
+			t.Fatalf("setup flying = %d, want 2", st.Routes[0].Flying)
+		}
+
+		shrunkStore(store, func(s *config.WarmPoolSettings) { s.MaxReplenishPerRoute = 1 })
+		if st := wp.Snapshot(); st.MaxReplenishPerRoute != 1 {
+			t.Fatalf("status per-route cap = %d, want 1 after the shrink", st.MaxReplenishPerRoute)
+		}
+		// The fleet itself has room; the route's two in-flight dials alone
+		// must hold the third claim back.
+		if _, ok := wp.claimTask(); ok {
+			t.Fatal("claim succeeded past the shrunken per-route cap while two dials flew to the route")
+		}
+
+		gate <- struct{}{}
+		gate <- struct{}{}
+		waitDialing(wp, 0, "in-flight dials drained after the per-route shrink")
+
+		launch(wp, 1)
+		waitDialing(wp, 1, "one dial under the shrunken per-route cap")
+		if st := wp.Snapshot(); st.Routes[0].Flying != 1 {
+			t.Fatalf("flying = %d, want exactly 1", st.Routes[0].Flying)
+		}
+		if _, ok := wp.claimTask(); ok {
+			t.Fatal("claim succeeded past the shrunken per-route cap with one dial in flight")
+		}
+		gate <- struct{}{}
+		waitDialing(wp, 0, "dial retired under the per-route cap")
+		launch(wp, 1)
+		gate <- struct{}{}
+		waitFor(t, "pool fills to min-idle under the shrunken per-route cap", 3*time.Second, func() bool {
+			return wp.Snapshot().IdleTotal == w.MinIdlePerProxy
+		})
+		if st := wp.Snapshot(); st.Routes[0].Flying != 0 || st.Routes[0].Pending != 0 {
+			t.Fatalf("reservations leaked after the per-route shrink: %+v", st.Routes[0])
+		}
+	})
+}
+
 func TestStartStopLifecycle(t *testing.T) {
 	srv := newHalfServer(t, "ok")
 	store, _ := warmStore(defaultWarm(), mustURL(t, "socks5://"+srv.addr))
