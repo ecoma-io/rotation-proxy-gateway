@@ -132,10 +132,12 @@ func run() error {
 	// both origins; manual routes additionally carry rotation state.
 	store := pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.AllRoutes(), runtimeCfg.CooldownBase, runtimeCfg.CooldownMax, runtimeCfg.Balance))
 	engine := rotation.New(store, log)
-	// The warm pool is strictly background: it keeps half-established upstream
-	// connections ready without touching the serving path (nothing borrows
-	// from it yet) or route health. It follows config generations on its own;
-	// a disabled config parks it at zero idle connections.
+	// The warm pool keeps half-established upstream connections ready for the
+	// serving path to borrow (one non-blocking pop per attempt, cold dial on
+	// any miss) while never writing route health itself: cooldown, auth, and
+	// rotation state change only on the request path. It follows config
+	// generations on its own; a disabled config parks it at zero idle
+	// connections and every dial is cold again.
 	warm := warmpool.New(store, log, nil)
 
 	listeners := make([]runningListener, 0, 3)
@@ -145,6 +147,7 @@ func run() error {
 			return nil
 		}
 		srv := proxyserver.NewRuntime(store, log, version, name, kinds...)
+		srv.UseWarmPool(warm)
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			return fmt.Errorf("%s listener: %w", name, err)
