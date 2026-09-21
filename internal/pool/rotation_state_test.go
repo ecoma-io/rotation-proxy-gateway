@@ -2,6 +2,7 @@ package pool
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -317,6 +318,69 @@ func TestLastIPsExcludesRouteAndAutoOrigin(t *testing.T) {
 	ips = pl.LastIPs(nil)
 	if len(ips) != 2 {
 		t.Fatalf("LastIPs(nil) = %v, want both manual IPs (auto excluded)", ips)
+	}
+}
+
+// TestCommitRotationIsAtomicWithCollisionCheck reproduces the rotation
+// engine's exact check→commit interleave: two procedures screen the collision
+// set (both see the shared candidate free), a barrier, then both commit it.
+// The scan and the record must behave as one decision made exactly once —
+// one commit succeeds, the other is rejected with ErrRotationCollision, and
+// only one route ends up holding the address.
+func TestCommitRotationIsAtomicWithCollisionCheck(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := newManualPool(t, c, "socks5://m1:1", "socks5://m2:2")
+	const shared = "198.51.100.9"
+
+	var screened, done sync.WaitGroup
+	screened.Add(2)
+	done.Add(2)
+	errs := make([]error, 2)
+	for i := range 2 {
+		go func(i int) {
+			defer done.Done()
+			p := pl.entries[i]
+			if pl.LastIPs(p)[shared] {
+				errs[i] = errors.New("the screen saw a collision before any commit")
+				return
+			}
+			screened.Done()
+			screened.Wait() // both screens passed; now both commit
+			errs[i] = pl.CommitRotation(p, shared, c.now)
+		}(i)
+	}
+	done.Wait()
+
+	winner, loser := 0, 1
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			winner = i
+		case errors.Is(err, ErrRotationCollision):
+			loser = i
+		default:
+			t.Fatalf("procedure %d commit err = %v, want a success or a collision rejection", i, err)
+		}
+	}
+	if errs[winner] != nil || errs[loser] == nil {
+		t.Fatalf("commits = %v, want exactly one success and one collision rejection", errs)
+	}
+	if got := pl.entries[winner].LastIP(); got != shared {
+		t.Fatalf("winner lastIP = %q, want the shared candidate", got)
+	}
+	if got := pl.entries[loser].LastIP(); got != "" {
+		t.Fatalf("loser lastIP = %q, want nothing recorded for the rejected candidate", got)
+	}
+	if ips := pl.LastIPs(nil); len(ips) != 1 || !ips[shared] {
+		t.Fatalf("collision set = %v, want the shared candidate held once", ips)
+	}
+
+	// The rejected address stays refused on retry, and a distinct one commits.
+	if err := pl.CommitRotation(pl.entries[loser], shared, c.now); !errors.Is(err, ErrRotationCollision) {
+		t.Fatalf("re-commit of a held address = %v, want a collision rejection", err)
+	}
+	if err := pl.CommitRotation(pl.entries[loser], "198.51.100.10", c.now); err != nil {
+		t.Fatalf("commit of a distinct address = %v, want nil", err)
 	}
 }
 

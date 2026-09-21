@@ -299,10 +299,31 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 	retryAfter, apiErr := e.callRotateAPI(ctx, spec.API)
 
 	// 4. Verify: the egress IP must actually have changed. Carriers can hand
-	// back the same address, which does not count as a rotation.
+	// back the same address, which does not count as a rotation. A candidate
+	// that survives every check is committed through commit, which re-checks
+	// the collision set atomically with the record.
 	p.SetRotationPhase(pool.RotationVerifying)
 	enterPhase("verifying")
-	newIP, changed := e.verify(ctx, gen, spec, p, baseline, verified, settings, apiErr != nil, log)
+	commit := func(ip string) commitOutcome {
+		if gone() {
+			return commitAborted
+		}
+		// The live pool decides: a second procedure may have committed this
+		// same candidate between verify's screen above and here, and only the
+		// pool's atomic check-and-record can catch that.
+		if err := e.store.Load().Pool.CommitRotation(p, ip, e.Now()); err != nil {
+			return commitLateCollision
+		}
+		// 5. Success: the new IP became the baseline, dial health earned by
+		// the old IP is discarded, and the route serves fresh.
+		p.MarkRotated()
+		e.clearConsecutive(id)
+		e.rotations.Add(1)
+		e.setDue(id, e.Now().Add(spec.RotateInterval))
+		log.Info().Str("egress_ip", ip).Str("next_in", dlog(spec.RotateInterval)).Msg("rotation complete")
+		return commitDone
+	}
+	changed := e.verify(ctx, gen, spec, p, baseline, verified, settings, apiErr != nil, log, commit)
 
 	if gone() {
 		return true
@@ -329,34 +350,43 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 			warnEv = warnEv.Str("retry_after_hint", dlog(retryAfter))
 		}
 		warnEv.Msg("rotation did not change the egress IP; retrying")
-		return false
 	}
-
-	// 5. Success: the new IP becomes the baseline, dial health earned by the
-	// old IP is discarded, and the route serves fresh.
-	e.clearConsecutive(id)
-	p.MarkRotated()
-	p.EndRotation(newIP, e.Now())
-	e.rotations.Add(1)
-	e.setDue(id, e.Now().Add(spec.RotateInterval))
-	log.Info().Str("egress_ip", newIP).Str("next_in", dlog(spec.RotateInterval)).Msg("rotation complete")
 	return false
 }
+
+// commitOutcome is the commit seam's decision for one verified candidate.
+type commitOutcome uint8
+
+const (
+	// commitDone: the candidate was free of collisions at commit time and the
+	// rotation is recorded.
+	commitDone commitOutcome = iota
+	// commitAborted: the route was removed, replaced, or the engine is
+	// shutting down before the commit; nothing is recorded and the procedure
+	// unwinds.
+	commitAborted
+	// commitLateCollision: another procedure committed the same candidate
+	// between this procedure's screen and its commit; the candidate counts
+	// as rejected and verification continues for a distinct address.
+	commitLateCollision
+)
 
 // verify polls the route's egress IP until it differs from the baseline and
 // no other manual route reports it. With an unknown baseline any
 // non-colliding IP counts. apiFailed shortens the window to a single probe:
 // the call failed, but the provider may have rotated anyway. Each rejected
 // candidate is logged at debug — when verification fails, these lines are
-// the only record of why.
-func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.ManualRouteSpec, p *pool.Proxy, baseline string, verified bool, settings config.RotationSettings, apiFailed bool, log zerolog.Logger) (string, bool) {
+// the only record of why. A candidate that survives every check is handed to
+// commit, which re-checks the collision set atomically with the record; it
+// reports whether that commit happened.
+func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.ManualRouteSpec, p *pool.Proxy, baseline string, verified bool, settings config.RotationSettings, apiFailed bool, log zerolog.Logger, commit func(ip string) commitOutcome) bool {
 	deadline := e.Now().Add(settings.IPCheckTimeout)
 	for attempt := 0; ; attempt++ {
 		if ctx.Err() != nil {
-			return "", false
+			return false
 		}
 		if apiFailed && attempt >= 1 {
-			return "", false
+			return false
 		}
 		if attempt > 0 {
 			pause := settings.IPCheckInterval
@@ -364,7 +394,7 @@ func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.M
 				pause = remaining
 			}
 			if !sleepCtx(ctx, pause) || !e.Now().Before(deadline) {
-				return "", false
+				return false
 			}
 		}
 		remaining := settings.IPCheckTimeout
@@ -395,7 +425,18 @@ func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.M
 			log.Debug().Int("attempt", attempt+1).Str("egress_ip", ip).Msg("ip collides with another manual route")
 			continue
 		}
-		return ip, true
+		switch commit(ip) {
+		case commitDone:
+			return true
+		case commitAborted:
+			return false
+		default: // commitLateCollision
+			// A second procedure committed this same candidate after the
+			// screen above passed for this one: the candidate counts as
+			// rejected and the window keeps watching for an address no other
+			// route holds.
+			log.Debug().Int("attempt", attempt+1).Str("egress_ip", ip).Msg("ip collides with another manual route")
+		}
 	}
 }
 

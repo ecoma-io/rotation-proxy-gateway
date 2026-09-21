@@ -68,6 +68,7 @@ type ipServer struct {
 	static  atomic.Value // string
 	unique  atomic.Bool
 	counter atomic.Int32
+	hits    atomic.Int32 // fully served requests in every mode; tests await probe arrivals
 	hang    atomic.Int64 // handler delay, exercising probe timeouts
 }
 
@@ -76,6 +77,7 @@ func newIPServer(t *testing.T, initial string) *ipServer {
 	s := &ipServer{}
 	s.static.Store(initial)
 	s.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		defer s.hits.Add(1)
 		if d := time.Duration(s.hang.Load()); d > 0 {
 			time.Sleep(d)
 		}
@@ -714,6 +716,137 @@ func TestProcedureRejectsCrossRouteCollision(t *testing.T) {
 	st := snapshotHost(t, s.pl, "m2.test")
 	if st.Rotation.State != "stale" {
 		t.Fatalf("collision status = %+v", st.Rotation)
+	}
+}
+
+// TestVerifyContinuesAfterALateCollision drives verify's commit seam
+// directly: a candidate the pool rejects at commit time (a second procedure
+// committed the same address after this one's screen) is treated as
+// rejected, the window keeps watching, and a later distinct candidate
+// commits. A seam that reports the procedure gone stops verify without a
+// commit.
+func TestVerifyContinuesAfterALateCollision(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	api := newAPIServer(t)
+	spec := manualRoute(t, "m1.test", time.Minute, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+	p := s.pl.Lookup(routeID(spec.RouteSpec))
+
+	ips.set("198.51.100.9") // the candidate both procedures would verify
+	var candidates []string
+	commit := func(ip string) commitOutcome {
+		candidates = append(candidates, ip)
+		if ip == "198.51.100.9" {
+			// The competing procedure wins the shared candidate; only after
+			// that loss does a distinct address exist for this route.
+			ips.set("198.51.100.10")
+			return commitLateCollision
+		}
+		return commitDone
+	}
+	if !s.e.verify(context.Background(), s.gen, spec, p, "203.0.113.7", true, fastSettings(), false, discardLogger(), commit) {
+		t.Fatal("verify = false, want the post-collision candidate committed")
+	}
+	if len(candidates) != 2 || candidates[0] != "198.51.100.9" || candidates[1] != "198.51.100.10" {
+		t.Fatalf("commit candidates = %v, want the rejected shared one then the distinct one", candidates)
+	}
+
+	// A seam that reports the procedure aborted stops verify at once.
+	var aborted atomic.Int32
+	if s.e.verify(context.Background(), s.gen, spec, p, "192.0.2.1", true, fastSettings(), false, discardLogger(), func(string) commitOutcome {
+		aborted.Add(1)
+		return commitAborted
+	}) {
+		t.Fatal("verify = true after an aborted commit, want false")
+	}
+	if aborted.Load() != 1 {
+		t.Fatalf("commit calls after an abort = %d, want exactly one", aborted.Load())
+	}
+}
+
+// TestConcurrentProceduresNeverCommitTheSameIP runs two procedures under a
+// concurrency cap of 2 whose provider hands both the same new address: both
+// screens can pass before either commit, so only the pool's atomic
+// check-and-record keeps the routes on distinct public addresses. The losing
+// procedure treats the shared candidate as rejected and commits the next
+// distinct one.
+func TestConcurrentProceduresNeverCommitTheSameIP(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	api := newAPIServer(t)
+	const shared, distinct = "198.51.100.9", "198.51.100.10"
+	settings := fastSettings()
+	settings.MaxConcurrentFixed = ptrInt(2)
+	settings.RotateOnStart = true
+	settings.IPCheckTimeout = 3 * time.Second // room for the loser's next candidate
+	cfg := &config.RuntimeConfig{
+		Rotation: settings,
+		ManualRoutes: []config.ManualRouteSpec{
+			manualRoute(t, "m1.test", time.Hour, apiSpec(api)),
+			manualRoute(t, "m2.test", time.Hour, apiSpec(api)),
+		},
+	}
+	s := newSetup(t, cfg, nil, ips)
+
+	// Both rotate calls park in the provider; both hand the same new address
+	// when released.
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		ips.set(shared)
+		entered <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		s.e.Run(ctx)
+	}()
+
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			cancel()
+			t.Fatal("a procedure never reached its rotate API call")
+		}
+	}
+	baseline := ips.hits.Load() // exactly one baseline probe per procedure
+	if baseline != 2 {
+		t.Fatalf("baseline probe hits = %d, want one per procedure", baseline)
+	}
+
+	// Release both calls: both procedures verify the shared candidate. Once
+	// each has observed it, a distinct address exists for whoever loses the
+	// commit.
+	close(release)
+	waitUntil(t, "both procedures to observe the shared candidate", func() bool {
+		return ips.hits.Load() >= baseline+2
+	})
+	ips.set(distinct)
+
+	waitUntil(t, "both rotations to complete", func() bool { return s.e.Rotations() == 2 })
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("engine Run did not return after cancellation")
+	}
+
+	st1, st2 := snapshotHost(t, s.pl, "m1.test"), snapshotHost(t, s.pl, "m2.test")
+	for _, st := range []pool.Status{st1, st2} {
+		if st.Rotation.State != "idle" || st.Rotation.LastIP == "" {
+			t.Fatalf("route state after rotation = %+v, want idle with a recorded IP", st.Rotation)
+		}
+	}
+	if st1.Rotation.LastIP == st2.Rotation.LastIP {
+		t.Fatalf("routes committed the same egress IP %q", st1.Rotation.LastIP)
+	}
+	if seen := s.pl.LastIPs(nil); len(seen) != 2 {
+		t.Fatalf("collision set = %v, want two distinct committed addresses", seen)
 	}
 }
 
