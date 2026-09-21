@@ -51,6 +51,8 @@ func TestParseRouteSpecRejectsUndocumentedForms(t *testing.T) {
 	for _, tc := range []struct{ name, raw, want string }{
 		{"http scheme", "http://provider.example:1080", "unsupported scheme"},
 		{"https scheme", "https://provider.example:1080", "unsupported scheme"},
+		{"socks4 scheme", "socks4://provider.example:1080", "unsupported scheme"},
+		{"bare socks scheme", "socks://provider.example:1080", "unsupported scheme"},
 		{"missing port", "socks5://provider.example", "missing port"},
 		{"empty host", "socks5://:1080", "missing host"},
 		{"url path", "socks5://provider.example:1080/path", "path, query, and fragment"},
@@ -71,6 +73,54 @@ func TestParseRouteSpecRejectsUndocumentedForms(t *testing.T) {
 				t.Fatalf("parseRouteSpec(%q) error = %v, want %q", tc.raw, err, tc.want)
 			}
 		})
+	}
+}
+
+// socks5h:// is accepted as an alias of socks5://. It names the same SOCKS5
+// upstream transport; the client-convention difference (which side resolves a
+// domain target) lives in the inbound CONNECT frame's address type, never in
+// the route scheme. Parsing canonicalizes the scheme to socks5 so duplicate
+// detection, route identity, and reload state all see one route.
+func TestParseRouteSpecAcceptsSocks5hAlias(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		raw      string
+		wantUser string
+		wantPass string
+	}{
+		{"socks5h without credentials", "socks5h://provider.example:1080", "", ""},
+		{"socks5h with credentials", "socks5h://route-user:route-pass@provider.example:1080", "route-user", "route-pass"},
+		{"uppercase SOCKS5H", "SOCKS5H://provider.example:1080", "", ""},
+		{"bracketed ipv6", "socks5h://route-user:route-pass@[2001:db8::1]:1080", "route-user", "route-pass"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, err := parseRouteSpec(autoProxyFileConfig{Proxy: tc.raw, Kind: "v4"})
+			if err != nil {
+				t.Fatalf("parseRouteSpec(%q) error = %v", tc.raw, err)
+			}
+			if spec.URL.Scheme != "socks5" {
+				t.Fatalf("canonical scheme = %q, want socks5", spec.URL.Scheme)
+			}
+			gotUser, gotPass := "", ""
+			if spec.URL.User != nil {
+				gotUser = spec.URL.User.Username()
+				gotPass, _ = spec.URL.User.Password()
+			}
+			if gotUser != tc.wantUser || gotPass != tc.wantPass {
+				t.Fatalf("userinfo = %q:%q, want %q:%q", gotUser, gotPass, tc.wantUser, tc.wantPass)
+			}
+		})
+	}
+	a, err := parseRouteSpec(autoProxyFileConfig{Proxy: "socks5://route-user:route-pass@provider.example:1080", Kind: "v4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := parseRouteSpec(autoProxyFileConfig{Proxy: "socks5h://route-user:route-pass@provider.example:1080", Kind: "v4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.URL.String() != b.URL.String() {
+		t.Fatalf("both spellings must parse to one URL: %q vs %q", a.URL.Redacted(), b.URL.Redacted())
 	}
 }
 

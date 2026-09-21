@@ -25,9 +25,25 @@ func envAddr(key string, dst *string) {
 	}
 }
 
-var validSchemes = map[string]bool{"socks5": true}
+// validSchemes lists the accepted upstream route schemes. socks5h is a
+// client-convention spelling of the same SOCKS5 transport — the "h" says the
+// client sends names instead of resolving them itself, which for this
+// gateway's inbound listeners is a property of each request's address type,
+// never of the upstream route — so it is canonicalized to socks5 at parse
+// time and never reaches route identity or the dialer as a distinct scheme.
+var validSchemes = map[string]bool{"socks5": true, "socks5h": true}
 
-// parseProxyLine accepts a socks5:// URL or either bare SOCKS5 form:
+// canonicalScheme folds accepted scheme spellings onto the one scheme the
+// dialer speaks.
+func canonicalScheme(scheme string) string {
+	if scheme == "socks5h" {
+		return "socks5"
+	}
+	return scheme
+}
+
+// parseProxyLine accepts a socks5:// URL (socks5h:// is accepted as an alias
+// of the same SOCKS5 upstream) or either bare SOCKS5 form:
 // "host:port:user:pass" or "user:pass@host:port". Bracketed IPv6 hosts are
 // supported in all forms. Callers validate explicit ports and disallow URL
 // paths, queries, and fragments after parsing.
@@ -37,7 +53,7 @@ func parseProxyLine(line string) (*url.URL, error) {
 		if err != nil {
 			return nil, errors.New("invalid proxy URL")
 		}
-		u.Scheme = strings.ToLower(u.Scheme)
+		u.Scheme = canonicalScheme(strings.ToLower(u.Scheme))
 		return u, nil
 	}
 	if strings.Contains(line, "@") {
@@ -123,7 +139,7 @@ func CanonicalRouteID(u *url.URL) string {
 		// plain user + ":" + password concatenation does.
 		creds = u.User.String()
 	}
-	return strings.ToLower(u.Scheme) + "://" + creds + "@" + strings.ToLower(u.Hostname()) + ":" + normalizePort(u.Port())
+	return canonicalScheme(strings.ToLower(u.Scheme)) + "://" + creds + "@" + strings.ToLower(u.Hostname()) + ":" + normalizePort(u.Port())
 }
 
 // normalizePort canonicalizes a port to its decimal form, so "0080" and "80"
