@@ -46,6 +46,22 @@ const (
 	DefaultIPCheckInterval  = 2 * time.Second
 	DefaultRetryBackoffMax  = 15 * time.Minute
 	DefaultRotateAPITimeout = 10 * time.Second
+
+	// Warm-pool defaults. The pool keeps half-established upstream
+	// connections (TCP + greeting + auth, no CONNECT) ready in the
+	// background; every bound is deliberately conservative, and the feature
+	// is off unless warm-pool.enabled says otherwise.
+	DefaultWarmMinIdlePerProxy = 1
+	DefaultWarmMaxIdlePerProxy = 2
+	DefaultWarmMaxTotalIdle    = 64
+	// DefaultWarmMaxReplenishConcurrency caps the whole worker fleet.
+	// DefaultWarmMaxReplenishPerRoute caps dials toward one route; 0 means
+	// uncapped, preserving the pre-knob behavior — the fleet cap alone is the
+	// ceiling until an operator splits a multi-provider pool's handshake
+	// tolerance per route.
+	DefaultWarmMaxReplenishConcurrency = 2
+	DefaultWarmMaxReplenishPerRoute    = 0
+	DefaultWarmIdleTTL                 = 45 * time.Second
 )
 
 // EgressKind is the public IP family supplied by an upstream proxy provider.
@@ -152,6 +168,25 @@ func (r RotationSettings) ResolveMaxConcurrent(n int) int {
 	return limit
 }
 
+// WarmPoolSettings bounds the background pool of half-established upstream
+// connections: TCP dialed, SOCKS5 greeting and auth negotiated, CONNECT not
+// sent — a parked connection is reusable for any target. Requests never wait
+// on the pool; it only ever swaps a cold dial for a ready half connection.
+type WarmPoolSettings struct {
+	Enabled                 bool
+	MinIdlePerProxy         int
+	MaxIdlePerProxy         int
+	MaxTotalIdle            int
+	MaxReplenishConcurrency int
+	// MaxReplenishPerRoute caps replenish dials in flight toward one route
+	// (0 = uncapped). The fleet cap bounds the process; this one protects a
+	// provider that tolerates fewer concurrent handshakes than the fleet —
+	// a pool mixing providers divides each provider's tolerance across its
+	// routes and caps each route accordingly.
+	MaxReplenishPerRoute int
+	IdleTTL              time.Duration
+}
+
 // AllRoutes returns every serving route, auto first. The pool and the rotation
 // engine both key state by canonical URL+kind, so ordering only affects
 // duplicate reporting and new-entry construction.
@@ -190,6 +225,7 @@ type RuntimeConfig struct {
 	ManualRoutes []ManualRouteSpec
 	Rotation     RotationSettings
 	Balance      KindBalance
+	WarmPool     WarmPoolSettings
 }
 
 type fileConfig struct {
@@ -200,6 +236,7 @@ type fileConfig struct {
 	Rotation    rotationFileConfig `mapstructure:"rotation"`
 	Proxies     proxiesFileConfig  `mapstructure:"proxies"`
 	Balance     balanceFileConfig  `mapstructure:"balance"`
+	WarmPool    warmPoolFileConfig `mapstructure:"warm-pool"`
 }
 
 // balanceFileConfig keeps the shares as `any` so viper's weak typing cannot
@@ -222,6 +259,19 @@ type rotationFileConfig struct {
 	IPCheckTimeout  string `mapstructure:"ip-check-timeout"`
 	IPCheckInterval string `mapstructure:"ip-check-interval"`
 	RetryBackoffMax string `mapstructure:"retry-backoff-max"`
+}
+
+// warmPoolFileConfig keeps the counts as `any` so viper's weak typing cannot
+// silently truncate a mistyped bound (2.5 → 2), the same anti-coercion rule
+// as max-retries and route weights.
+type warmPoolFileConfig struct {
+	Enabled                 *bool  `mapstructure:"enabled"`
+	MinIdlePerProxy         any    `mapstructure:"min-idle-per-proxy"`
+	MaxIdlePerProxy         any    `mapstructure:"max-idle-per-proxy"`
+	MaxTotalIdle            any    `mapstructure:"max-total-idle"`
+	MaxReplenishConcurrency any    `mapstructure:"max-replenish-concurrency"`
+	MaxReplenishPerRoute    any    `mapstructure:"max-replenish-per-route"`
+	IdleTTL                 string `mapstructure:"idle-ttl"`
 }
 
 type proxiesFileConfig struct {
@@ -443,6 +493,10 @@ func runtimeFromFile(raw fileConfig) (*RuntimeConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	warmPool, err := parseWarmPoolSettings(raw.WarmPool)
+	if err != nil {
+		return nil, err
+	}
 
 	cfg := &RuntimeConfig{
 		MaxRetries:   maxRetries,
@@ -452,6 +506,7 @@ func runtimeFromFile(raw fileConfig) (*RuntimeConfig, error) {
 		LogLevel:     raw.LogLevel,
 		Rotation:     rotation,
 		Balance:      balance,
+		WarmPool:     warmPool,
 	}
 	for i, route := range raw.Proxies.Auto {
 		spec, err := parseRouteSpec(route)
@@ -556,6 +611,107 @@ func (r RotationSettings) validate() error {
 		errs = append(errs, fmt.Errorf("rotation.retry-backoff-max must be positive, got %s", r.RetryBackoffMax))
 	}
 	return errors.Join(errs...)
+}
+
+// parseWarmPoolSettings applies defaults, then validates the overrides —
+// including when the pool is disabled, so a bad bound is reported now rather
+// than silently shipping to the day the pool is switched on.
+func parseWarmPoolSettings(raw warmPoolFileConfig) (WarmPoolSettings, error) {
+	settings := WarmPoolSettings{
+		MinIdlePerProxy:         DefaultWarmMinIdlePerProxy,
+		MaxIdlePerProxy:         DefaultWarmMaxIdlePerProxy,
+		MaxTotalIdle:            DefaultWarmMaxTotalIdle,
+		MaxReplenishConcurrency: DefaultWarmMaxReplenishConcurrency,
+		MaxReplenishPerRoute:    DefaultWarmMaxReplenishPerRoute,
+		IdleTTL:                 DefaultWarmIdleTTL,
+	}
+	if raw.Enabled != nil {
+		settings.Enabled = *raw.Enabled
+	}
+	var errs []error
+	if n, ok, err := parseWarmCount("warm-pool.min-idle-per-proxy", raw.MinIdlePerProxy); err != nil {
+		errs = append(errs, err)
+	} else if ok {
+		settings.MinIdlePerProxy = n
+	}
+	if n, ok, err := parseWarmCount("warm-pool.max-idle-per-proxy", raw.MaxIdlePerProxy); err != nil {
+		errs = append(errs, err)
+	} else if ok {
+		settings.MaxIdlePerProxy = n
+	}
+	if n, ok, err := parseWarmCount("warm-pool.max-total-idle", raw.MaxTotalIdle); err != nil {
+		errs = append(errs, err)
+	} else if ok {
+		settings.MaxTotalIdle = n
+	}
+	if n, ok, err := parseWarmCount("warm-pool.max-replenish-concurrency", raw.MaxReplenishConcurrency); err != nil {
+		errs = append(errs, err)
+	} else if ok {
+		settings.MaxReplenishConcurrency = n
+	}
+	if n, ok, err := parseWarmCount("warm-pool.max-replenish-per-route", raw.MaxReplenishPerRoute); err != nil {
+		errs = append(errs, err)
+	} else if ok {
+		settings.MaxReplenishPerRoute = n
+	}
+	if raw.IdleTTL != "" {
+		d, err := parseRuntimeDuration("warm-pool.idle-ttl", raw.IdleTTL)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			settings.IdleTTL = d
+		}
+	}
+	if err := settings.validate(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := errors.Join(errs...); err != nil {
+		return WarmPoolSettings{}, err
+	}
+	return settings, nil
+}
+
+func (w WarmPoolSettings) validate() error {
+	var errs []error
+	if w.MinIdlePerProxy < 0 {
+		errs = append(errs, fmt.Errorf("warm-pool.min-idle-per-proxy must be >= 0, got %d", w.MinIdlePerProxy))
+	}
+	if w.MaxIdlePerProxy < 1 {
+		errs = append(errs, fmt.Errorf("warm-pool.max-idle-per-proxy must be >= 1, got %d", w.MaxIdlePerProxy))
+	}
+	if w.MaxTotalIdle < 1 {
+		errs = append(errs, fmt.Errorf("warm-pool.max-total-idle must be >= 1, got %d", w.MaxTotalIdle))
+	}
+	if w.MaxReplenishConcurrency < 1 {
+		errs = append(errs, fmt.Errorf("warm-pool.max-replenish-concurrency must be >= 1, got %d", w.MaxReplenishConcurrency))
+	}
+	if w.MaxReplenishPerRoute < 0 {
+		errs = append(errs, fmt.Errorf("warm-pool.max-replenish-per-route must be >= 0 (0 = uncapped), got %d", w.MaxReplenishPerRoute))
+	}
+	if w.IdleTTL <= 0 {
+		errs = append(errs, fmt.Errorf("warm-pool.idle-ttl must be positive, got %s", w.IdleTTL))
+	}
+	if w.MinIdlePerProxy > w.MaxIdlePerProxy {
+		errs = append(errs, fmt.Errorf("warm-pool.min-idle-per-proxy %d must not exceed warm-pool.max-idle-per-proxy %d", w.MinIdlePerProxy, w.MaxIdlePerProxy))
+	}
+	if w.MaxTotalIdle < w.MaxIdlePerProxy {
+		errs = append(errs, fmt.Errorf("warm-pool.max-total-idle %d must be at least warm-pool.max-idle-per-proxy %d", w.MaxTotalIdle, w.MaxIdlePerProxy))
+	}
+	return errors.Join(errs...)
+}
+
+// parseWarmCount accepts an absent value (ok false, the default applies) or a
+// whole YAML integer, refusing the fractional forms viper's weak typing would
+// truncate.
+func parseWarmCount(name string, raw any) (n int, ok bool, err error) {
+	if raw == nil {
+		return 0, false, nil
+	}
+	n, ok = raw.(int)
+	if !ok {
+		return 0, false, fmt.Errorf("%s must be a whole number", name)
+	}
+	return n, true, nil
 }
 
 // parseMaxConcurrent accepts a fixed count (1) or a percent of the manual pool

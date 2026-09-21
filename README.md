@@ -358,6 +358,8 @@ The following settings apply to new client operations without restart:
 - `proxies.auto` and `proxies.manual`
 - every `rotation.*` setting (the scheduler reads them per cycle; a procedure
   already running keeps its own `drain-timeout` and probe settings)
+- every `warm-pool.*` setting (disabling the pool closes its parked
+  connections; changed bounds apply to future replenishment)
 
 Unchanged URL+kind routes preserve their recency pass, cooldown,
 pair-scoped target cooldowns, authentication-block, rotation state (last
@@ -365,6 +367,66 @@ verified IP, stale history), and counters. A changed `weight` applies to the
 retained route without resetting any of it. Changing userinfo, kind, or
 moving a route between `proxies.auto` and `proxies.manual` creates a fresh
 route state.
+
+## Warm upstream pool
+
+The optional `warm-pool` block (off by default) keeps a bounded set of
+half-established upstream connections ready in the background: TCP connected,
+SOCKS greeting and authentication done, **no `CONNECT` sent**. A parked
+connection knows nothing about any target — the gateway never pre-connects to
+a destination — so borrowing one removes the upstream TCP-connect and
+greeting round trips from a request's setup. Route selection, cooldown,
+auth-block, and rotation state are untouched by the pool.
+
+A request that has selected a route first tries to borrow a parked connection
+and falls back to the ordinary cold dial when none exists. Borrowing never
+waits: the pool is a non-blocking pop, so a burst simply drains it and serves
+cold — load above the bounds gets the no-pool behavior, not a queue. Failure
+classification is identical on both paths. A borrowed connection whose
+endpoint refuses the `CONNECT` is an ordinary `connect_target` with its
+pair-scoped cooldown; one whose transport died is discarded together with its
+parked siblings without touching route health, and the cold dial — with its
+usual reporting — decides. The pool itself never writes route health: routes
+that are rotating, auth-blocked, or cooling get their replenishment paused,
+not recorded.
+
+Rotation remains a hard lifecycle boundary. Each parked connection is stamped
+with the route's rotation epoch before its dial; a rotation invalidates the
+old generation, and a connection that straddles the boundary is closed rather
+than served into the new egress IP. Reloads behave like any runtime setting:
+disabling the block or removing a route closes that route's parked
+connections within one poll cycle, and shutdown closes every parked
+connection before the listener drain starts.
+
+Everything is bounded: `min-idle-per-proxy` and `max-idle-per-proxy` per
+route, a process-wide `max-total-idle`, at most `max-replenish-concurrency`
+background dials in total, and — when `max-replenish-per-route` is set
+(default `0`, uncapped) — at most that many replenish dials in flight toward
+any single route. The fleet cap bounds the process; the per-route cap
+protects a provider: a pool that mixes providers can hand each one only the
+concurrent handshakes it tolerates (a provider with R routes in the pool
+sees at most R × `max-replenish-per-route` concurrent warm dials). The
+remaining bounds are exponential backoff on replenish dial failures and an
+`idle-ttl` that expires connections nobody borrowed. Replenishment follows
+consumption — a borrow schedules the refill — so the pool keeps up with
+steady traffic instead of refilling on a fixed tick alone.
+
+Whether the pool pays is measured, not assumed: the paired `WarmAB`/`WarmHA`
+benchmarks ([`e2e/BENCH.md`](e2e/BENCH.md)) run identical scenarios with the
+pool disabled and enabled side by side. The first recorded measurement
+showed remote upstreams (10–30 ms RTT) gaining ~50 % setup latency with a
+borrow ratio near 1.0, near-loopback upstreams gaining only ~20 %, and
+concurrent route failures costing a few extra failed operations per window —
+the discard-and-redial leg of a dying route's borrowed connection. Enable it
+where upstream round trips are real.
+
+`/status` always carries a `warmPool` section: `enabled` (false while the
+block is absent or says so), the active bounds and worker count, total idle,
+cumulative `created`/`borrowed`/`discardedStale`/`discardedOverflow`/
+`generationInvalidated`/`connectFailed`/`replenishAttempts` counters, and
+per-route `idle`/`pending`/`flying` (the last is that route's in-flight
+replenish dials) — upstream identities are `host:port` only, as
+everywhere else.
 
 ## Failure and route-health contract
 
@@ -526,8 +588,9 @@ ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 redacted `pool` state. It additionally reports safe per-listener counters —
 `requests` and `failovers` (in-band route fallbacks, distinct from rotations) —
 each route's `kind` and `origin`, each manual route's rotation view (see
-"Manual rotation routes"), and the active `balance` family split when one is
-configured. A listener's `requests` counter advances only on a valid `CONNECT`
+"Manual rotation routes"), the active `balance` family split when one is
+configured, and a `warmPool` section (see
+["Warm upstream pool"](#warm-upstream-pool)). A listener's `requests` counter advances only on a valid `CONNECT`
 command that reaches route selection; a greeted client that is rejected during
 protocol negotiation (no `0x00` method, unsupported command, malformed frame)
 never advances it. Route identities are always `host:port`, never

@@ -22,6 +22,7 @@ import (
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/sanitize"
 	"rotation-proxy-gateway/internal/socksdial"
+	"rotation-proxy-gateway/internal/warmpool"
 
 	"github.com/rs/zerolog"
 )
@@ -47,6 +48,15 @@ const (
 	socksReplyCmdUnsupported = 0x07
 )
 
+// WarmBorrower is the serving path's window into the warm pool. Borrow is a
+// non-blocking pop: nil means dial cold, exactly as before the pool existed.
+// DiscardRoute drops the route's parked siblings after a borrowed connection
+// failed at the transport level — they likely died with it.
+type WarmBorrower interface {
+	Borrow(*pool.Proxy) *socksdial.HalfConn
+	DiscardRoute(*pool.Proxy)
+}
+
 // Server is the inbound SOCKS5 listener handler.
 type Server struct {
 	store    *pool.Store
@@ -55,6 +65,10 @@ type Server struct {
 	listener string
 	allow    func(*pool.Proxy) bool
 	dial     func(context.Context, *url.URL, socksdial.Target, time.Duration) (net.Conn, error)
+	// warm lends parked half connections. Nil (and the zero value of every
+	// test Server) keeps the cold dial path. It is set once, before Serve
+	// starts, and read-only afterwards.
+	warm WarmBorrower
 
 	cmu   sync.Mutex
 	conns map[net.Conn]struct{}
@@ -224,6 +238,38 @@ func (s *Server) pick(gen *pool.Generation, exclude map[*pool.Proxy]bool, target
 	return gen.Pool.PickForDedicated(exclude, s.allow, target)
 }
 
+// UseWarmPool arms the warm-connection borrow path. It must be called before
+// Serve; afterwards the field is read-only.
+func (s *Server) UseWarmPool(w WarmBorrower) {
+	s.warm = w
+}
+
+// dialWarmFirst establishes the upstream tunnel for one attempt: a parked
+// half connection when the warm pool has one for this route, the cold dial
+// otherwise. A borrowed connection that the endpoint itself refuses
+// (non-zero CONNECT reply) surfaces as-is so the caller's classification
+// gives it the pair-scoped treatment — identical to the cold path. A
+// borrowed connection that fails at the transport level says nothing about
+// the route today: its siblings are discarded, no route health is reported
+// for the attempt, and the cold dial decides the outcome.
+func (s *Server) dialWarmFirst(ctx context.Context, p *pool.Proxy, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
+	if s.warm != nil {
+		if hc := s.warm.Borrow(p); hc != nil {
+			conn, err := hc.CompleteConnect(target, timeout)
+			if err == nil {
+				s.log.Debug().Str("upstream", upstreamLogValue(p)).Msg("warm connection completed")
+				return conn, nil
+			}
+			if isConnectTargetError(err) {
+				return nil, err
+			}
+			s.log.Debug().Str("upstream", upstreamLogValue(p)).Msg("warm connection died; dialing cold")
+			s.warm.DiscardRoute(p)
+		}
+	}
+	return s.dial(ctx, p.URL, target, timeout)
+}
+
 type sessionSettings struct {
 	maxRetries  int
 	dialTimeout time.Duration
@@ -349,7 +395,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 			}
 			ev.Msg("route selected")
 		}
-		up, err := s.dial(s.baseCtx, p.URL, target, settings.dialTimeout)
+		up, err := s.dialWarmFirst(s.baseCtx, p, target, settings.dialTimeout)
 		if err != nil {
 			switch {
 			case isProxyDialError(err):
@@ -715,7 +761,7 @@ func (s *Server) CloseConns() int {
 
 // AdminMux serves the health and status endpoints for the admin listener.
 func (s *Server) AdminMux() *http.ServeMux {
-	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s}, nil)
+	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s}, nil, nil)
 }
 
 // AdminMux serves aggregate health/status for all proxy listener views sharing
@@ -724,7 +770,9 @@ func (s *Server) AdminMux() *http.ServeMux {
 // commands (protocol rejects never advance it) and failovers counts in-band
 // route fallbacks, distinct from rotations. The pool snapshot comes from the
 // current generation so /status changes atomically with serving behavior.
-func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64) *http.ServeMux {
+// warm, when non-nil, reports the warm-pool view (bounds, gauges, lifecycle
+// counters); it is omitted entirely when no warm pool backs the process.
+func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64, warm func() warmpool.Status) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -757,6 +805,9 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 		}
 		if rotations != nil {
 			status["rotations"] = rotations()
+		}
+		if warm != nil {
+			status["warmPool"] = warm()
 		}
 		_ = json.NewEncoder(w).Encode(status)
 	})

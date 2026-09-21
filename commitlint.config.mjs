@@ -17,6 +17,7 @@ export default {
         "rotation",
         "proxyserver",
         "socksdial",
+        "warmpool",
         "config",
         "cmd",
         "e2e",

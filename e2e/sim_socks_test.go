@@ -54,7 +54,21 @@ type SocksSim struct {
 	// resolved.
 	TunnelTo string
 
+	// Latency, when positive, delays every protocol reply (greeting, auth,
+	// CONNECT) by this duration, modeling a remote endpoint's processing and
+	// network round trips instead of a free loopback hop. Benchmarks shape
+	// the upstream with it; functional tests leave it at zero.
+	Latency atomic.Int64
+
 	Hits atomic.Uint64
+
+	// Connected counts CONNECT requests read to the end: accepts minus
+	// connected is the number of connections that stopped at the greeting,
+	// method, or auth phase — the shape a pre-CONNECT parked warm connection
+	// has while parked. Live is the current accepted-but-not-closed count.
+	Connected atomic.Uint64
+	Live      atomic.Int64
+
 	Addr string
 
 	mu   sync.Mutex
@@ -109,9 +123,21 @@ func (s *SocksSim) RouteValue() string {
 	return s.Addr
 }
 
+// delay holds the reply for the configured Latency, modeling endpoint
+// processing and network RTT on the leg the client is waiting on.
+func (s *SocksSim) delay() {
+	if d := time.Duration(s.Latency.Load()); d > 0 {
+		time.Sleep(d)
+	}
+}
+
 func (s *SocksSim) handle(conn net.Conn) {
-	defer func() { _ = conn.Close() }()
 	s.Hits.Add(1)
+	s.Live.Add(1)
+	defer func() {
+		s.Live.Add(-1)
+		_ = conn.Close()
+	}()
 	if s.Down.Load() {
 		return
 	}
@@ -137,6 +163,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 			_, _ = conn.Write([]byte{0x05, 0xff})
 			return
 		}
+		s.delay()
 		if _, err := conn.Write([]byte{0x05, 0x02}); err != nil {
 			return
 		}
@@ -160,10 +187,12 @@ func (s *SocksSim) handle(conn net.Conn) {
 			_, _ = conn.Write([]byte{0x01, 0x01})
 			return
 		}
+		s.delay()
 		if _, err := conn.Write([]byte{0x01, 0x00}); err != nil {
 			return
 		}
 	} else {
+		s.delay()
 		if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
 			return
 		}
@@ -217,6 +246,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 	if s.TunnelTo != "" {
 		target = s.TunnelTo
 	}
+	s.Connected.Add(1)
 
 	if s.Mode == SocksRejectTarget {
 		refuse := true
@@ -238,6 +268,7 @@ func (s *SocksSim) handle(conn net.Conn) {
 		return
 	}
 	defer func() { _ = up.Close() }()
+	s.delay()
 	if _, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
 		return
 	}

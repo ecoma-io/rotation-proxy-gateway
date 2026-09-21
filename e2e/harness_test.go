@@ -89,6 +89,19 @@ type GatewayConfig struct {
 	Manual       []ManualRouteConfig
 	Rotation     *RotationConfig
 	Balance      *BalanceConfig
+	WarmPool     *WarmPoolConfig
+}
+
+// WarmPoolConfig renders the warm-pool runtime block; zero fields fall back
+// to the documented defaults.
+type WarmPoolConfig struct {
+	Enabled                 bool
+	MinIdlePerProxy         int
+	MaxIdlePerProxy         int
+	MaxTotalIdle            int
+	MaxReplenishConcurrency int
+	MaxReplenishPerRoute    int
+	IdleTTL                 string
 }
 
 func defaultGatewayConfig(routes []RouteConfig) GatewayConfig {
@@ -146,8 +159,32 @@ type Status struct {
 		Requests  uint64 `json:"requests"`
 		Failovers uint64 `json:"failovers"`
 	} `json:"listeners"`
-	Pool    []PoolEntry  `json:"pool"`
-	Balance *BalanceView `json:"balance,omitempty"`
+	Pool     []PoolEntry  `json:"pool"`
+	Balance  *BalanceView `json:"balance,omitempty"`
+	WarmPool *WarmView    `json:"warmPool,omitempty"`
+}
+
+// WarmView is the warm-pool section of /status.
+type WarmView struct {
+	Enabled               bool            `json:"enabled"`
+	IdleTotal             int             `json:"idleTotal"`
+	MaxReplenishPerRoute  int             `json:"maxReplenishPerRoute"`
+	Created               uint64          `json:"created"`
+	Borrowed              uint64          `json:"borrowed"`
+	DiscardedStale        uint64          `json:"discardedStale"`
+	DiscardedOverflow     uint64          `json:"discardedOverflow"`
+	GenerationInvalidated uint64          `json:"generationInvalidated"`
+	ConnectFailed         uint64          `json:"connectFailed"`
+	ReplenishAttempts     uint64          `json:"replenishAttempts"`
+	Routes                []WarmRouteView `json:"routes"`
+}
+
+// WarmRouteView is one route's warm-pool gauge.
+type WarmRouteView struct {
+	Upstream string `json:"upstream"`
+	Idle     int    `json:"idle"`
+	Pending  int    `json:"pending"`
+	Flying   int    `json:"flying"`
 }
 
 // Gateway is one real gateway subprocess with its own config file and ports.
@@ -225,6 +262,29 @@ func renderConfig(cfg GatewayConfig) string {
 		}
 		if cfg.Balance.V6 > 0 {
 			fmt.Fprintf(&sb, "  v6: %d\n", cfg.Balance.V6)
+		}
+	}
+	if cfg.WarmPool != nil {
+		w := cfg.WarmPool
+		sb.WriteString("warm-pool:\n")
+		fmt.Fprintf(&sb, "  enabled: %v\n", w.Enabled)
+		if w.MinIdlePerProxy > 0 {
+			fmt.Fprintf(&sb, "  min-idle-per-proxy: %d\n", w.MinIdlePerProxy)
+		}
+		if w.MaxIdlePerProxy > 0 {
+			fmt.Fprintf(&sb, "  max-idle-per-proxy: %d\n", w.MaxIdlePerProxy)
+		}
+		if w.MaxTotalIdle > 0 {
+			fmt.Fprintf(&sb, "  max-total-idle: %d\n", w.MaxTotalIdle)
+		}
+		if w.MaxReplenishConcurrency > 0 {
+			fmt.Fprintf(&sb, "  max-replenish-concurrency: %d\n", w.MaxReplenishConcurrency)
+		}
+		if w.MaxReplenishPerRoute > 0 {
+			fmt.Fprintf(&sb, "  max-replenish-per-route: %d\n", w.MaxReplenishPerRoute)
+		}
+		if w.IdleTTL != "" {
+			fmt.Fprintf(&sb, "  idle-ttl: %s\n", w.IdleTTL)
 		}
 	}
 	sb.WriteString("proxies:\n  auto:\n")
@@ -311,7 +371,10 @@ func newGateway(t testing.TB, cfg GatewayConfig, extraEnv []string) *Gateway {
 	}
 	g.cmd = cmd
 	t.Cleanup(g.stop)
-	g.waitHealthy(10 * time.Second)
+	// 30s only matters on a machine that stalls: a healthy gateway answers
+	// healthz in milliseconds, but a shared box can freeze for ~10s and a
+	// tight budget turns environmental noise into a harness failure.
+	g.waitHealthy(30 * time.Second)
 	return g
 }
 
