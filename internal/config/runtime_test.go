@@ -383,12 +383,12 @@ func TestLoadRuntimeRejectsDuplicateAcrossPools(t *testing.T) {
 }
 
 func TestLoadBootstrapDefaultsAndConflicts(t *testing.T) {
-	for _, key := range []string{"CONFIG_FILE", "ADMIN_ADDR"} {
+	for _, key := range []string{"RPGW_CONFIG_FILE", "RPGW_ADMIN_ADDR"} {
 		t.Setenv(key, "")
 	}
-	t.Setenv("MIXED_LISTEN_ADDR", DefaultMixedListenAddr)
-	t.Setenv("V4_LISTEN_ADDR", DefaultV4ListenAddr)
-	t.Setenv("V6_LISTEN_ADDR", DefaultV6ListenAddr)
+	t.Setenv("RPGW_MIXED_LISTEN_ADDR", DefaultMixedListenAddr)
+	t.Setenv("RPGW_V4_LISTEN_ADDR", DefaultV4ListenAddr)
+	t.Setenv("RPGW_V6_LISTEN_ADDR", DefaultV6ListenAddr)
 	cfg, err := LoadBootstrap()
 	if err != nil {
 		t.Fatal(err)
@@ -404,25 +404,25 @@ func TestLoadBootstrapDefaultsAndConflicts(t *testing.T) {
 	}{
 		{
 			name: "wildcard overlap",
-			set:  map[string]string{"V4_LISTEN_ADDR": ":30121"},
+			set:  map[string]string{"RPGW_V4_LISTEN_ADDR": ":30121"},
 			want: "must not overlap",
 		},
 		{
 			name: "specific overlaps wildcard",
-			set:  map[string]string{"V4_LISTEN_ADDR": "127.0.0.1:30121"},
+			set:  map[string]string{"RPGW_V4_LISTEN_ADDR": "127.0.0.1:30121"},
 			want: "must not overlap",
 		},
 		{
 			name: "invalid host",
-			set:  map[string]string{"ADMIN_ADDR": "bad host!:30120"},
+			set:  map[string]string{"RPGW_ADMIN_ADDR": "bad host!:30120"},
 			want: "invalid host",
 		},
 		{
 			name: "no proxy listeners",
 			set: map[string]string{
-				"MIXED_LISTEN_ADDR": "",
-				"V4_LISTEN_ADDR":    "",
-				"V6_LISTEN_ADDR":    "",
+				"RPGW_MIXED_LISTEN_ADDR": "",
+				"RPGW_V4_LISTEN_ADDR":    "",
+				"RPGW_V6_LISTEN_ADDR":    "",
 			},
 			want: "at least one proxy listener",
 		},

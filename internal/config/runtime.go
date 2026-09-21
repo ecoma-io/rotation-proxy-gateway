@@ -260,10 +260,41 @@ type apiFileConfig struct {
 	Timeout string            `mapstructure:"timeout"`
 }
 
+// legacyEnvNames pairs each retired unprefixed bootstrap variable with its
+// RPGW_-prefixed replacement, in sorted order so a multi-name report is
+// deterministic. Sorted, not mapped, because a set legacy name is an error we
+// print, not a value we look up.
+var legacyEnvNames = [][2]string{
+	{"ADMIN_ADDR", "RPGW_ADMIN_ADDR"},
+	{"CONFIG_FILE", "RPGW_CONFIG_FILE"},
+	{"MIXED_LISTEN_ADDR", "RPGW_MIXED_LISTEN_ADDR"},
+	{"SHUTDOWN_GRACE", "RPGW_SHUTDOWN_GRACE"},
+	{"V4_LISTEN_ADDR", "RPGW_V4_LISTEN_ADDR"},
+	{"V6_LISTEN_ADDR", "RPGW_V6_LISTEN_ADDR"},
+}
+
+// checkLegacyEnv refuses to start while any retired unprefixed name is set.
+// Ignoring them would let an upgraded deployment silently boot on default
+// addresses and the default config path — the exact quiet failure the rename
+// exists to prevent — so presence at all (empty value included) is fatal.
+func checkLegacyEnv() error {
+	var errs []error
+	for _, pair := range legacyEnvNames {
+		if _, ok := os.LookupEnv(pair[0]); ok {
+			errs = append(errs, fmt.Errorf("%s was renamed to %s: set the prefixed name instead (all bootstrap environment variables carry the RPGW_ prefix)", pair[0], pair[1]))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // LoadBootstrap applies bootstrap defaults and explicit environment overrides.
-// An explicit empty proxy listener address disables that listener; other empty
-// bootstrap values retain their defaults.
+// Every environment variable carries the RPGW_ prefix. An explicit empty proxy
+// listener address disables that listener; other empty bootstrap values retain
+// their defaults.
 func LoadBootstrap() (*BootstrapConfig, error) {
+	if err := checkLegacyEnv(); err != nil {
+		return nil, err
+	}
 	cfg := &BootstrapConfig{
 		ConfigFile:      DefaultConfigFile,
 		AdminAddr:       DefaultRuntimeAdminAddr,
@@ -272,17 +303,17 @@ func LoadBootstrap() (*BootstrapConfig, error) {
 		V6ListenAddr:    DefaultV6ListenAddr,
 		ShutdownGrace:   DefaultShutdownGrace,
 	}
-	envStr("CONFIG_FILE", &cfg.ConfigFile)
-	envStr("ADMIN_ADDR", &cfg.AdminAddr)
-	envAddr("MIXED_LISTEN_ADDR", &cfg.MixedListenAddr)
-	envAddr("V4_LISTEN_ADDR", &cfg.V4ListenAddr)
-	envAddr("V6_LISTEN_ADDR", &cfg.V6ListenAddr)
+	envStr("RPGW_CONFIG_FILE", &cfg.ConfigFile)
+	envStr("RPGW_ADMIN_ADDR", &cfg.AdminAddr)
+	envAddr("RPGW_MIXED_LISTEN_ADDR", &cfg.MixedListenAddr)
+	envAddr("RPGW_V4_LISTEN_ADDR", &cfg.V4ListenAddr)
+	envAddr("RPGW_V6_LISTEN_ADDR", &cfg.V6ListenAddr)
 	// Parsed inline rather than through a helper so a malformed value fails
 	// fast instead of silently falling back to the default.
-	if raw, ok := os.LookupEnv("SHUTDOWN_GRACE"); ok && raw != "" {
+	if raw, ok := os.LookupEnv("RPGW_SHUTDOWN_GRACE"); ok && raw != "" {
 		d, err := time.ParseDuration(raw)
 		if err != nil {
-			return nil, fmt.Errorf("SHUTDOWN_GRACE %q must be a Go duration", raw)
+			return nil, fmt.Errorf("RPGW_SHUTDOWN_GRACE %q must be a Go duration", raw)
 		}
 		cfg.ShutdownGrace = d
 	}
@@ -295,10 +326,10 @@ func LoadBootstrap() (*BootstrapConfig, error) {
 func (c *BootstrapConfig) validate() error {
 	var errs []error
 	if strings.TrimSpace(c.ConfigFile) == "" {
-		errs = append(errs, errors.New("CONFIG_FILE must not be empty"))
+		errs = append(errs, errors.New("RPGW_CONFIG_FILE must not be empty"))
 	}
 	if c.ShutdownGrace <= 0 {
-		errs = append(errs, fmt.Errorf("SHUTDOWN_GRACE must be positive, got %s", c.ShutdownGrace))
+		errs = append(errs, fmt.Errorf("RPGW_SHUTDOWN_GRACE must be positive, got %s", c.ShutdownGrace))
 	}
 	if c.MixedListenAddr == "" && c.V4ListenAddr == "" && c.V6ListenAddr == "" {
 		errs = append(errs, errors.New("at least one proxy listener must be enabled"))
@@ -308,13 +339,13 @@ func (c *BootstrapConfig) validate() error {
 		name string
 		addr string
 	}{
-		{"ADMIN_ADDR", c.AdminAddr},
-		{"MIXED_LISTEN_ADDR", c.MixedListenAddr},
-		{"V4_LISTEN_ADDR", c.V4ListenAddr},
-		{"V6_LISTEN_ADDR", c.V6ListenAddr},
+		{"RPGW_ADMIN_ADDR", c.AdminAddr},
+		{"RPGW_MIXED_LISTEN_ADDR", c.MixedListenAddr},
+		{"RPGW_V4_LISTEN_ADDR", c.V4ListenAddr},
+		{"RPGW_V6_LISTEN_ADDR", c.V6ListenAddr},
 	}
 	for i, listener := range listeners {
-		if listener.addr == "" && listener.name != "ADMIN_ADDR" {
+		if listener.addr == "" && listener.name != "RPGW_ADMIN_ADDR" {
 			continue
 		}
 		if err := validateListenAddr(listener.name, listener.addr); err != nil {
@@ -415,7 +446,7 @@ func newViper(path string) (*viper.Viper, error) {
 	v.SetConfigType("yaml")
 	if err := v.ReadInConfig(); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("runtime config %q not found; copy config.example.yaml to config.yaml and configure CONFIG_FILE if needed", path)
+			return nil, fmt.Errorf("runtime config %q not found; copy config.example.yaml to config.yaml and configure RPGW_CONFIG_FILE if needed", path)
 		}
 		return nil, fmt.Errorf("read runtime config: %w", err)
 	}

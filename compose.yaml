@@ -17,12 +17,12 @@ services:
       - "30120:30120" # admin (HTTP): healthz and status
     environment:
       # Bootstrap-only settings: changes require a container restart.
-      CONFIG_FILE: /app/config.yaml
+      RPGW_CONFIG_FILE: /app/config.yaml
       # Optional. The drain budget is shared by all listeners and must stay
       # below stop_grace_period so docker's SIGKILL never cuts it short.
-      # SHUTDOWN_GRACE: 45s
+      # RPGW_SHUTDOWN_GRACE: 45s
     # docker stop sends SIGTERM and waits this long before SIGKILL. Keep it
-    # above the gateway's SHUTDOWN_GRACE (default 55s) plus a little margin.
+    # above the gateway's RPGW_SHUTDOWN_GRACE (default 55s) plus a little margin.
     stop_grace_period: 60s
     logging:
       driver: json-file

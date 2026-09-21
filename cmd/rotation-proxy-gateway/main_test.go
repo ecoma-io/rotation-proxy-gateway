@@ -49,11 +49,11 @@ func TestHealthcheckURL(t *testing.T) {
 func isolateHealthcheckEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
-		"CONFIG_FILE", "ADMIN_ADDR", "MIXED_LISTEN_ADDR", "V4_LISTEN_ADDR", "V6_LISTEN_ADDR",
+		"RPGW_CONFIG_FILE", "RPGW_ADMIN_ADDR", "RPGW_MIXED_LISTEN_ADDR", "RPGW_V4_LISTEN_ADDR", "RPGW_V6_LISTEN_ADDR",
 	} {
 		t.Setenv(k, "")
 	}
-	t.Setenv("MIXED_LISTEN_ADDR", ":30121")
+	t.Setenv("RPGW_MIXED_LISTEN_ADDR", ":30121")
 }
 
 func adminAddrFor(t *testing.T, srv *httptest.Server) string {
@@ -76,7 +76,7 @@ func TestHealthcheck(t *testing.T) {
 			w.Write([]byte("ok\n")) //nolint:errcheck
 		}))
 		defer srv.Close()
-		t.Setenv("ADMIN_ADDR", adminAddrFor(t, srv))
+		t.Setenv("RPGW_ADMIN_ADDR", adminAddrFor(t, srv))
 		if got := healthcheck(); got != 0 {
 			t.Fatalf("healthcheck() = %d, want 0", got)
 		}
@@ -89,7 +89,7 @@ func TestHealthcheck(t *testing.T) {
 			w.Write([]byte("ok\n")) //nolint:errcheck
 		}))
 		defer srv.Close()
-		t.Setenv("ADMIN_ADDR", adminAddrFor(t, srv))
+		t.Setenv("RPGW_ADMIN_ADDR", adminAddrFor(t, srv))
 		if got := healthcheck(); got != 1 {
 			t.Fatalf("healthcheck() = %d, want 1 for non-200", got)
 		}
@@ -101,7 +101,7 @@ func TestHealthcheck(t *testing.T) {
 			w.Write([]byte("nope\n")) //nolint:errcheck
 		}))
 		defer srv.Close()
-		t.Setenv("ADMIN_ADDR", adminAddrFor(t, srv))
+		t.Setenv("RPGW_ADMIN_ADDR", adminAddrFor(t, srv))
 		if got := healthcheck(); got != 1 {
 			t.Fatalf("healthcheck() = %d, want 1 for bad body", got)
 		}
@@ -112,7 +112,7 @@ func TestHealthcheck(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 		addr := adminAddrFor(t, srv)
 		srv.Close()
-		t.Setenv("ADMIN_ADDR", addr)
+		t.Setenv("RPGW_ADMIN_ADDR", addr)
 		if got := healthcheck(); got != 1 {
 			t.Fatalf("healthcheck() = %d, want 1 for unreachable admin", got)
 		}
@@ -134,7 +134,7 @@ func TestHealthcheckURLRejectsMalformed(t *testing.T) {
 
 func TestHealthcheckInvalidBootstrapFails(t *testing.T) {
 	isolateHealthcheckEnv(t)
-	t.Setenv("ADMIN_ADDR", "bad host!:30120")
+	t.Setenv("RPGW_ADMIN_ADDR", "bad host!:30120")
 	if got := healthcheck(); got != 1 {
 		t.Fatalf("healthcheck() = %d, want 1 for invalid bootstrap", got)
 	}
@@ -210,7 +210,7 @@ func TestDefaultShutdownGrace(t *testing.T) {
 	if config.DefaultShutdownGrace != 55*time.Second {
 		t.Fatalf("DefaultShutdownGrace = %s, want 55s", config.DefaultShutdownGrace)
 	}
-	t.Setenv("SHUTDOWN_GRACE", "") // neutralize the environment
+	t.Setenv("RPGW_SHUTDOWN_GRACE", "") // neutralize the environment
 	cfg, err := config.LoadBootstrap()
 	if err != nil {
 		t.Fatalf("LoadBootstrap: %v", err)
@@ -222,7 +222,7 @@ func TestDefaultShutdownGrace(t *testing.T) {
 
 func TestBootstrapShutdownGraceEnv(t *testing.T) {
 	t.Run("override", func(t *testing.T) {
-		t.Setenv("SHUTDOWN_GRACE", "2s")
+		t.Setenv("RPGW_SHUTDOWN_GRACE", "2s")
 		cfg, err := config.LoadBootstrap()
 		if err != nil {
 			t.Fatalf("LoadBootstrap: %v", err)
@@ -232,13 +232,13 @@ func TestBootstrapShutdownGraceEnv(t *testing.T) {
 		}
 	})
 	t.Run("not a duration", func(t *testing.T) {
-		t.Setenv("SHUTDOWN_GRACE", "soon")
+		t.Setenv("RPGW_SHUTDOWN_GRACE", "soon")
 		if _, err := config.LoadBootstrap(); err == nil || !strings.Contains(err.Error(), "must be a Go duration") {
 			t.Fatalf("err = %v, want a Go-duration error", err)
 		}
 	})
 	t.Run("not positive", func(t *testing.T) {
-		t.Setenv("SHUTDOWN_GRACE", "0s")
+		t.Setenv("RPGW_SHUTDOWN_GRACE", "0s")
 		if _, err := config.LoadBootstrap(); err == nil || !strings.Contains(err.Error(), "must be positive") {
 			t.Fatalf("err = %v, want a positivity error", err)
 		}

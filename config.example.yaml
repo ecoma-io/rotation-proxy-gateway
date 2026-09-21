@@ -65,7 +65,7 @@ rotation:
   # pool can be unavailable at the same moment.
   max-concurrent: 1
   # How long to wait for a rotating route's in-flight requests and tunnels to
-  # finish before rotating anyway. Independent of the SHUTDOWN_GRACE
+  # finish before rotating anyway. Independent of the RPGW_SHUTDOWN_GRACE
   # environment variable.
   drain-timeout: 55s
   # Rotate every manual route once at process start (max-concurrent still
