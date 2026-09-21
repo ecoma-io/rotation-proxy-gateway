@@ -270,12 +270,13 @@ func TestServeTunnelStopsRetryingAfterHandshakeDeadline(t *testing.T) {
 	waitForRecord(t, &logs, map[string]string{"msg": "inbound handshake deadline expired before the next attempt", "error_kind": "setup"})
 }
 
-// Close-record classification when both relay directions fail: an upstream
-// reset behind a client-side failure must surface as a broken tunnel (warn),
-// while the artifact error of our own teardown close must not change a clean
-// classification.
+// Close-record classification across relay direction outcomes: an upstream
+// reset must surface as a broken tunnel (warn) whichever way it orders —
+// first, behind a client-side failure, or behind a clean client half-close —
+// while the artifact error of our own teardown close and client-side write
+// failures must not change a clean classification.
 func TestRecordTunnelCloseBothDirectionsFailed(t *testing.T) {
-	realReset := errors.New("read: connection reset by peer")
+	realReset := &upstreamBreakError{err: errors.New("read: connection reset by peer")}
 	for _, tc := range []struct {
 		name          string
 		first, second relayResult
@@ -308,6 +309,25 @@ func TestRecordTunnelCloseBothDirectionsFailed(t *testing.T) {
 			first:   relayResult{direction: relayToClient, err: realReset},
 			second:  relayResult{direction: relayToUpstream, err: net.ErrClosed},
 			wantMsg: "tunnel broken", wantReason: "upstream_broken", wantLevel: "warn",
+		},
+		{
+			// A clean client half-close first (nil error) with a genuine
+			// upstream break behind it: still a broken tunnel, never a clean
+			// client close.
+			name:    "upstream break behind client half-close",
+			first:   relayResult{direction: relayToUpstream, err: nil},
+			second:  relayResult{direction: relayToClient, err: realReset},
+			wantMsg: "tunnel broken", wantReason: "upstream_broken", wantLevel: "warn",
+			wantErrSubstr: "connection reset",
+		},
+		{
+			// A client-side write failure in the response direction is a
+			// vanished client, not an upstream break: no warn, no reset.
+			name:    "client write failure is not an upstream break",
+			first:   relayResult{direction: relayToClient, err: errors.New("write to client: broken pipe")},
+			second:  relayResult{direction: relayToUpstream, err: net.ErrClosed},
+			wantMsg: "tunnel closed", wantReason: "client_aborted", wantLevel: "debug",
+			wantErrSubstr: "broken pipe",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

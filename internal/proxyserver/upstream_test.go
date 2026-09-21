@@ -138,7 +138,16 @@ func (s *fakeSocks) handle(conn net.Conn) {
 		_, _ = up.Write(b)
 	}
 	go func() {
-		io.Copy(up, conn) //nolint:errcheck
+		_, gerr := io.Copy(up, conn)
+		if gerr == nil {
+			// The gateway half-closed its write side: propagate the FIN to
+			// the target instead of closing it, so a reply still in flight
+			// can flow back through the response copy below.
+			if cw, ok := up.(interface{ CloseWrite() error }); ok {
+				_ = cw.CloseWrite()
+				return
+			}
+		}
 		_ = up.Close()
 	}()
 	if _, err := io.Copy(conn, up); err != nil {

@@ -53,6 +53,11 @@ type SocksSim struct {
 	// use it to send reserved names (example.test) that must be recorded, not
 	// resolved.
 	TunnelTo string
+	// BreakTunnel, when true, skips the target dial: the sim answers CONNECT
+	// with success, streams a partial payload, then resets the client-facing
+	// connection ~100ms later — a provider dropping a live stream mid-flight.
+	// The pause keeps the reset from destroying the unread reply in flight.
+	BreakTunnel bool
 
 	// Latency, when positive, delays every protocol reply (greeting, auth,
 	// CONNECT) by this duration, modeling a remote endpoint's processing and
@@ -262,6 +267,18 @@ func (s *SocksSim) handle(conn net.Conn) {
 	if s.Mode == SocksDropConnect {
 		return
 	}
+	if s.BreakTunnel {
+		s.delay()
+		if _, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+			return
+		}
+		_, _ = conn.Write([]byte("partial"))
+		time.Sleep(100 * time.Millisecond)
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetLinger(0) // reset instead of a clean close
+		}
+		return
+	}
 	up, err := s.dialOutbound(target)
 	if err != nil {
 		_, _ = conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
@@ -279,7 +296,16 @@ func (s *SocksSim) handle(conn net.Conn) {
 		_, _ = up.Write(b)
 	}
 	go func() {
-		_, _ = io.Copy(up, conn)
+		_, gerr := io.Copy(up, conn)
+		if gerr == nil {
+			// The gateway half-closed its write side: propagate the FIN to
+			// the target instead of closing it, so a reply still in flight
+			// can flow back through the response copy below.
+			if cw, ok := up.(interface{ CloseWrite() error }); ok {
+				_ = cw.CloseWrite()
+				return
+			}
+		}
 		_ = up.Close()
 	}()
 	_, _ = io.Copy(conn, up)

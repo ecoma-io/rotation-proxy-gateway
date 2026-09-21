@@ -454,6 +454,41 @@ func startParkedTarget(t *testing.T) string {
 	return ln.Addr().String()
 }
 
+// startHalfCloseTarget accepts connections, holds them until the peer ends
+// its write side (EOF), optionally delays, then writes one banner and closes:
+// a target whose reply arrives only after the client half-closed. delay may
+// be zero; banner may be empty for a pure parked-then-close target.
+func startHalfCloseTarget(t *testing.T, delay time.Duration, banner string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				// Hold the tunnel until the peer's FIN arrives.
+				if _, err := io.Copy(io.Discard, conn); err != nil {
+					return
+				}
+				if delay > 0 {
+					time.Sleep(delay)
+				}
+				if banner != "" {
+					_, _ = conn.Write([]byte(banner))
+				}
+			}(conn)
+		}
+	}()
+	return ln.Addr().String()
+}
+
 // startAbortTarget answers each tunnel with a few bytes and then resets the
 // connection, modeling a target that drops a live stream mid-flight.
 func startAbortTarget(t *testing.T) string {
@@ -1453,13 +1488,16 @@ func TestShutdownWithNoSessionsReturnsNil(t *testing.T) {
 	}
 }
 
-// Shutdown waits for a live session instead of tearing it down early.
+// Shutdown waits for a live session instead of tearing it down early. The
+// target ends only when the client does (a pure parked target would now hold
+// the half-closed relay open indefinitely, which is the relay contract, not a
+// drain defect).
 func TestShutdownWaitsForActiveSession(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
 
-	tunnel := socksDialVia(t, addr, startParkedTarget(t))
+	tunnel := socksDialVia(t, addr, startHalfCloseTarget(t, 0, ""))
 	done := make(chan error, 1)
 	go func() { done <- s.Shutdown(context.Background()) }()
 	select {
