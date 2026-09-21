@@ -457,7 +457,7 @@ func TestRotationReloadRemovesRouteAbortsProcedure(t *testing.T) {
 		t.Fatal("procedure never reached the rotate API")
 	}
 	g.ReloadConfig(defaultGatewayConfig([]RouteConfig{{Proxy: dead, Kind: "v4"}}),
-		[]string{strings.TrimPrefix(dead, "socks5://")})
+		[]string{dead})
 
 	time.Sleep(2 * time.Second) // outlast the parked API call
 	if n := rt.api.Hits.Load(); n != 1 {
@@ -512,7 +512,7 @@ func TestRotationReloadMidDrainNeverCallsRotateAPI(t *testing.T) {
 	// procedure itself must quit instead of proceeding to the API.
 	dead := deadRouteValue(t)
 	g.ReloadConfig(defaultGatewayConfig([]RouteConfig{{Proxy: dead, Kind: "v4"}}),
-		[]string{strings.TrimPrefix(dead, "socks5://")})
+		[]string{dead})
 
 	select {
 	case err := <-done:
@@ -639,7 +639,7 @@ func TestRotationConfigRejectionsKeepLastGood(t *testing.T) {
 			c.Routes = append(c.Routes, RouteConfig{Proxy: rt.sims[0].RouteValue(), Kind: "v4"})
 		}},
 	}
-	want := []string{strings.TrimPrefix(dead, "socks5://"), rt.sims[0].Addr} // auto first, then manual
+	want := []string{dead, rt.sims[0].Addr} // auto first, then manual
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			bad := base()

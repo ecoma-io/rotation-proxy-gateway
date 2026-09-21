@@ -68,7 +68,10 @@ single-file bind mount (the mount pins the old inode) — see README
 The removed HTTP era's `global:` block is rejected: a config containing
 `target-tls-insecure` or `max-body-buffer` fails validation — the
 last-known-good config keeps serving, and on first boot the process refuses
-to start.
+to start. Route proxy lines carry no scheme (`host:port`,
+`user:pass@host:port`, `host:port:user:pass`): the endpoint protocol is
+always SOCKS5, so a line containing `socks5://` — or any scheme — is
+rejected the same way.
 
 `kind: v4|v6` means the provider-backed **public egress IP family**. It does
 not classify the SOCKS endpoint transport address and does not restrict target

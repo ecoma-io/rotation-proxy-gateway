@@ -352,7 +352,7 @@ func runGatewayOnce(t *testing.T, configPath, admin, mixed, v4, v6 string) (int,
 func writeBootstrapConfig(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	cfg := defaultGatewayConfig([]RouteConfig{{Proxy: "socks5://127.0.0.1:1", Kind: "v4"}})
+	cfg := defaultGatewayConfig([]RouteConfig{{Proxy: "127.0.0.1:1", Kind: "v4"}})
 	if err := os.WriteFile(path, []byte(renderConfig(cfg)), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -396,6 +396,22 @@ func TestE2E_BootstrapValidationFailsFast(t *testing.T) {
 			t.Fatalf("output missing missing-config error:\n%s", out)
 		}
 	})
+	t.Run("schemed route line", func(t *testing.T) {
+		// Route lines carry no scheme; on first boot the process must refuse
+		// to start rather than serve a config it would have to reject.
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		cfg := defaultGatewayConfig([]RouteConfig{{Proxy: "socks5://127.0.0.1:1", Kind: "v4"}})
+		if err := os.WriteFile(path, []byte(renderConfig(cfg)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		code, out := runGatewayOnce(t, path, freeAddr(t), freeAddr(t), freeAddr(t), freeAddr(t))
+		if code == 0 {
+			t.Fatalf("exit=0, want failure\noutput:\n%s", out)
+		}
+		if !strings.Contains(out, "carry no scheme") {
+			t.Fatalf("output missing scheme rejection:\n%s", out)
+		}
+	})
 }
 
 // A session stuck inside an upstream dial must not stretch shutdown: once the
@@ -425,7 +441,7 @@ func TestE2E_ShutdownGraceBoundsStuckDial(t *testing.T) {
 	}()
 
 	cfg := defaultGatewayConfig([]RouteConfig{
-		{Proxy: "socks5://" + bhLn.Addr().String(), Kind: "v4"},
+		{Proxy: bhLn.Addr().String(), Kind: "v4"},
 	})
 	cfg.DialTimeout = "30s"
 	g := NewGatewayWithEnv(t, cfg, "SHUTDOWN_GRACE=2s")

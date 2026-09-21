@@ -21,6 +21,7 @@ import (
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/logging"
 	"rotation-proxy-gateway/internal/pool"
+	"rotation-proxy-gateway/internal/socksdial"
 
 	"github.com/rs/zerolog"
 )
@@ -100,7 +101,7 @@ func (s *ipServer) set(ip string) { s.static.Store(ip) }
 func testEngine(t *testing.T, ips *ipServer, store *pool.Store, routeFail *atomic.Bool) *Engine {
 	t.Helper()
 	e := New(store, discardLogger())
-	e.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+	e.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
 		if routeFail != nil && routeFail.Load() {
 			return nil, errors.New("route endpoint unreachable (TEST)")
 		}
@@ -557,7 +558,7 @@ func TestProcedureUnverifiedDoesNotCountCurrentIP(t *testing.T) {
 	// succeeds, and the route serves the SAME address it already had. No
 	// baseline exists, but the outcome is still not a rotation.
 	var dials atomic.Int64
-	s.e.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+	s.e.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
 		if dials.Add(1) <= 3 {
 			return nil, errors.New("route endpoint unreachable (TEST)")
 		}
@@ -586,7 +587,7 @@ func TestProbeIPBudgetMeasuredFromEntry(t *testing.T) {
 	const timeout = 300 * time.Millisecond
 	deadlineSeen := make(chan time.Time, 1)
 	start := time.Now()
-	s.e.dial = func(ctx context.Context, _ *url.URL, _ string, _ time.Duration) (net.Conn, error) {
+	s.e.dial = func(ctx context.Context, _ *url.URL, _ socksdial.Target, _ time.Duration) (net.Conn, error) {
 		time.Sleep(200 * time.Millisecond) // the slow dial under test
 		conn, err := net.Dial("tcp", ips.srv.Listener.Addr().String())
 		if err != nil {
@@ -637,7 +638,7 @@ func TestProcedureDeadRouteRotatesUnverified(t *testing.T) {
 	// after the API call the route is reachable again and the first
 	// non-colliding IP counts as the new one.
 	var dials atomic.Int64
-	s.e.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+	s.e.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
 		if dials.Add(1) <= 3 {
 			return nil, errors.New("route endpoint unreachable (TEST)")
 		}
@@ -1022,7 +1023,7 @@ func TestBootPrecheckRecordsBaselines(t *testing.T) {
 		s, _ := newOne(t, ips, nil)
 		base := s.e.dial
 		var dials atomic.Int64
-		s.e.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+		s.e.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
 			if dials.Add(1) == 2 {
 				ips.set("198.51.100.9") // the provider moved it between probes
 			}

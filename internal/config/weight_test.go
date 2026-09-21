@@ -19,13 +19,13 @@ proxies:
 func TestLoadRuntimeRouteWeights(t *testing.T) {
 	content := weightPrologue + `
   auto:
-    - proxy: socks5://v4.example:1080
+    - proxy: v4.example:1080
       kind: v4
-    - proxy: socks5://v4b.example:1080
+    - proxy: v4b.example:1080
       kind: v4
       weight: 7
   manual:
-    - proxy: socks5://m.example:1080
+    - proxy: m.example:1080
       kind: v6
       weight: 3
       rotate-interval: 90s
@@ -54,7 +54,7 @@ func TestLoadRuntimeAcceptsWeightBounds(t *testing.T) {
 	for _, w := range []int{1, DefaultRouteWeight, MaxRouteWeight} {
 		content := weightPrologue + `
   auto:
-    - proxy: socks5://v4.example:1080
+    - proxy: v4.example:1080
       kind: v4
       weight: ` + strconv.Itoa(w) + `
 `
@@ -80,7 +80,7 @@ func TestLoadRuntimeRejectsInvalidRouteWeights(t *testing.T) {
 	for name, line := range cases {
 		content := weightPrologue + `
   auto:
-    - proxy: socks5://v4.example:1080
+    - proxy: v4.example:1080
       kind: v4
       ` + line + `
 `

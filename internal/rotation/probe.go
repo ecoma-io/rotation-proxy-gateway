@@ -20,6 +20,7 @@ import (
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/sanitize"
+	"rotation-proxy-gateway/internal/socksdial"
 
 	"github.com/rs/zerolog"
 )
@@ -55,7 +56,14 @@ func (e *Engine) probeIP(ctx context.Context, gen *pool.Generation, spec config.
 		deadline = dl
 	}
 
-	conn, err := e.dial(ctx, spec.URL, hostPort, timeout)
+	// The ip-check target originates in configuration, not in an inbound
+	// frame, so its address type is classified once here at creation and then
+	// travels with the target.
+	target, err := socksdial.TargetFromAddr(hostPort)
+	if err != nil {
+		return "", &errProbe{"ip-check endpoint address is not usable"}
+	}
+	conn, err := e.dial(ctx, spec.URL, target, timeout)
 	if err != nil {
 		return "", err // socksdial errors are already host-only and sanitized
 	}

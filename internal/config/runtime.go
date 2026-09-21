@@ -813,7 +813,7 @@ func parseKindedProxy(proxy, kind string) (RouteSpec, error) {
 
 func validateProxyURL(u *url.URL) error {
 	switch {
-	case !validSchemes[u.Scheme]:
+	case u.Scheme != "socks5":
 		return fmt.Errorf("unsupported scheme %q (want socks5)", u.Scheme)
 	case u.Hostname() == "":
 		return errors.New("missing host")

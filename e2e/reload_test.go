@@ -3,7 +3,9 @@ package e2e_test
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -172,9 +174,9 @@ func TestE2E_ReloadChangedCredsResetState(t *testing.T) {
 	}
 	socks := NewSocksSim(t, SocksAuthRequired, "e2e-user", "e2e-right-pass")
 	target := NewEchoTarget(t)
-	right := fmt.Sprintf("socks5://e2e-user:e2e-right-pass@%s", socks.Addr)
+	right := fmt.Sprintf("e2e-user:e2e-right-pass@%s", socks.Addr)
 	cfg := defaultGatewayConfig([]RouteConfig{
-		{Proxy: fmt.Sprintf("socks5://e2e-user:e2e-wrong-pass@%s", socks.Addr), Kind: "v4"},
+		{Proxy: fmt.Sprintf("e2e-user:e2e-wrong-pass@%s", socks.Addr), Kind: "v4"},
 		{Proxy: deadRouteValue(t), Kind: "v4"},
 	})
 	g := NewGateway(t, cfg)
@@ -273,6 +275,39 @@ func TestE2E_ReloadPreservesHealthForUnchangedRoutes(t *testing.T) {
 	}
 	if st.Pool[1].Successes != 1 {
 		t.Fatalf("reload dropped success counters: %+v", st.Pool[1])
+	}
+}
+
+// Equivalent spellings of one endpoint — here the same port zero-padded — are
+// one route identity, so a reload that only respells the line must carry the
+// pool state across instead of resetting it: the pre-reload success stays
+// counted and the next request lands on the preserved entry.
+func TestE2E_ReloadEquivalentSpellingKeepsState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	socks := NewSocksSim(t, SocksOK, "", "")
+	target := NewEchoTarget(t)
+	cfg := defaultGatewayConfig([]RouteConfig{{Proxy: socks.RouteValue(), Kind: "v4"}})
+	g := NewGateway(t, cfg)
+
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
+
+	host, port, _ := net.SplitHostPort(socks.Addr)
+	n, _ := strconv.Atoi(port)
+	cfg.Routes = []RouteConfig{{Proxy: fmt.Sprintf("%s:%06d", host, n), Kind: "v4"}}
+	g.ReloadConfig(cfg, []string{socks.Addr})
+	g.WaitForCondition(reloadSettle, "equivalent respelling kept route state", func(st *Status) bool {
+		return len(st.Pool) == 1 && st.Pool[0].Successes == 1
+	})
+
+	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/after", "e2e-echo:/after")
+	st, err := g.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Pool[0].Proxy != socks.Addr || st.Pool[0].Successes != 2 {
+		t.Fatalf("respelling reset the route instead of preserving it: %+v", st.Pool[0])
 	}
 }
 

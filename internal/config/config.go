@@ -3,7 +3,6 @@ package config
 
 import (
 	"errors"
-	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -25,26 +24,32 @@ func envAddr(key string, dst *string) {
 	}
 }
 
-var validSchemes = map[string]bool{"socks5": true}
-
-// parseProxyLine accepts a socks5:// URL or either bare SOCKS5 form:
-// "host:port:user:pass" or "user:pass@host:port". Bracketed IPv6 hosts are
-// supported in all forms. Callers validate explicit ports and disallow URL
-// paths, queries, and fragments after parsing.
+// parseProxyLine accepts one of the three bare SOCKS5 forms: "host:port"
+// without credentials, "host:port:user:pass", or "user:pass@host:port". The
+// endpoint protocol is not configurable — every route is a SOCKS5 endpoint —
+// so route lines carry no scheme, and anything containing "://" is rejected.
+// The parsed URL carries the implicit socks5 scheme for the rest of the
+// process. Bracketed IPv6 hosts are supported in all forms. Callers validate
+// explicit ports and disallow URL paths, queries, and fragments after
+// parsing.
 func parseProxyLine(line string) (*url.URL, error) {
 	if strings.Contains(line, "://") {
-		u, err := url.Parse(line)
-		if err != nil {
-			return nil, errors.New("invalid proxy URL")
-		}
-		u.Scheme = strings.ToLower(u.Scheme)
-		return u, nil
+		return nil, errors.New("route proxy lines carry no scheme: the endpoint protocol is always SOCKS5 (forms: host:port, user:pass@host:port, host:port:user:pass)")
 	}
 	if strings.Contains(line, "@") {
-		// Bare "user:pass@host:port" defaults to SOCKS5.
+		// "user:pass@host:port". Both credentials are required: a username
+		// without a password (or an empty pair) is not one of the documented
+		// forms, and an empty-but-present pair would dial without auth while
+		// holding a route identity distinct from the bare host:port form.
 		u, err := url.Parse("socks5://" + line)
 		if err != nil {
 			return nil, errors.New("invalid proxy URL")
+		}
+		if u.User == nil || u.User.Username() == "" {
+			return nil, errors.New("proxy credentials must be user:pass@host:port")
+		}
+		if pass, ok := u.User.Password(); !ok || pass == "" {
+			return nil, errors.New("proxy credentials must be user:pass@host:port")
 		}
 		if u.Hostname() == "" {
 			return nil, errors.New("proxy host is required")
@@ -60,24 +65,34 @@ func parseProxyLine(line string) (*url.URL, error) {
 		}
 		return u, nil
 	}
-	// Bare "host:port:user:pass" defaults to SOCKS5. The host may be a
-	// bracketed IPv6 literal such as "[2001:db8::1]:1080:user:pass".
+	// "host:port" or "host:port:user:pass". The host may be a bracketed IPv6
+	// literal such as "[2001:db8::1]:1080:user:pass".
 	host, port, user, pass, ok := splitHostPortCreds(line)
 	if !ok {
-		return nil, errors.New("invalid proxy format (want socks5://..., host:port:user:pass, or user:pass@host:port)")
+		return nil, errors.New("invalid proxy format (want host:port, user:pass@host:port, or host:port:user:pass)")
+	}
+	// The bare branches never run url.Parse, so screen the host characters
+	// here: whitespace or URL separators would otherwise load as a route that
+	// can only ever fail to dial.
+	if strings.ContainsAny(host, " \t/?#%\\") {
+		return nil, errors.New("invalid proxy format (want host:port, user:pass@host:port, or host:port:user:pass)")
 	}
 	if err := checkPort(port); err != nil {
 		return nil, err
 	}
-	return &url.URL{
+	u := &url.URL{
 		Scheme: "socks5",
-		User:   url.UserPassword(user, pass),
 		Host:   net.JoinHostPort(host, port),
-	}, nil
+	}
+	if user != "" {
+		u.User = url.UserPassword(user, pass)
+	}
+	return u, nil
 }
 
-// splitHostPortCreds splits bare "host:port:user:pass", accepting a bracketed
-// IPv6 host. It reports false for any malformed shape.
+// splitHostPortCreds splits bare "host:port" or "host:port:user:pass",
+// accepting a bracketed IPv6 host. An absent credential pair returns empty
+// user and pass. It reports false for any malformed shape.
 func splitHostPortCreds(line string) (host, port, user, pass string, ok bool) {
 	rest := line
 	if strings.HasPrefix(rest, "[") {
@@ -98,11 +113,15 @@ func splitHostPortCreds(line string) (host, port, user, pass string, ok bool) {
 			return "", "", "", "", false
 		}
 	}
-	port, rest, ok = strings.Cut(rest, ":")
-	if !ok || port == "" || rest == "" {
+	port, creds, hasCreds := strings.Cut(rest, ":")
+	if port == "" {
 		return "", "", "", "", false
 	}
-	user, pass, ok = strings.Cut(rest, ":")
+	if !hasCreds {
+		// "host:port" — a route without credentials.
+		return host, port, "", "", true
+	}
+	user, pass, ok = strings.Cut(creds, ":")
 	if !ok || user == "" || pass == "" || strings.Contains(pass, ":") {
 		return "", "", "", "", false
 	}
@@ -139,9 +158,13 @@ func normalizePort(port string) string {
 // checkPort validates a proxy port is numeric and in range without including a
 // potentially credential-bearing pool entry in the error.
 func checkPort(port string) error {
+	// Static on purpose: the offending text sits in the credential position
+	// of a mistyped bare line ("host:password"), so quoting it would leak
+	// into boot and reload-reject logs. The route index in the wrapped error
+	// names the line to fix.
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 1 || n > 65535 {
-		return fmt.Errorf("invalid proxy port %q", port)
+		return errors.New("invalid proxy port (want 1-65535)")
 	}
 	return nil
 }

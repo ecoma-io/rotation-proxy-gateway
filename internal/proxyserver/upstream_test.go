@@ -17,7 +17,20 @@ import (
 
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
+	"rotation-proxy-gateway/internal/socksdial"
 )
+
+// mustTarget classifies a host:port string once for tests that dial through
+// string-shaped targets. The production ingress path never classifies a
+// string: it carries the inbound frame's own address type (see server.go).
+func mustTarget(t testing.TB, addr string) socksdial.Target {
+	t.Helper()
+	target, err := socksdial.TargetFromAddr(addr)
+	if err != nil {
+		t.Fatalf("TargetFromAddr(%q): %v", addr, err)
+	}
+	return target
+}
 
 type socksOptions struct {
 	user, pass string
@@ -272,7 +285,7 @@ func TestDialViaSocks5(t *testing.T) {
 	target := startEchoTarget(t)
 	t.Run("no auth", func(t *testing.T) {
 		fs := startSocks5Proxy(t, socksOptions{})
-		conn, err := dialVia(context.Background(), fs.URL, target, time.Second)
+		conn, err := dialVia(context.Background(), fs.URL, mustTarget(t, target), time.Second)
 		if err != nil {
 			t.Fatalf("dialVia: %v", err)
 		}
@@ -286,7 +299,7 @@ func TestDialViaSocks5(t *testing.T) {
 	t.Run("auth", func(t *testing.T) {
 		fs := startSocks5Proxy(t, socksOptions{user: "u", pass: "p"})
 		fs.URL.User = url.UserPassword("u", "p")
-		conn, err := dialVia(context.Background(), fs.URL, target, time.Second)
+		conn, err := dialVia(context.Background(), fs.URL, mustTarget(t, target), time.Second)
 		if err != nil {
 			t.Fatalf("dialVia: %v", err)
 		}
@@ -302,13 +315,13 @@ func TestDialViaClassifiesEndpointAndAuthFailures(t *testing.T) {
 	addr := closed.Addr().String()
 	_ = closed.Close()
 	pu := &url.URL{Scheme: "socks5", Host: addr}
-	_, err = dialVia(context.Background(), pu, "example.com:80", time.Second)
+	_, err = dialVia(context.Background(), pu, mustTarget(t, "example.com:80"), time.Second)
 	if !isProxyDialError(err) || isProxyAuthError(err) {
 		t.Fatalf("dial error classification = %T %v", err, err)
 	}
 
 	fs := startSocks5Proxy(t, socksOptions{user: "u", pass: "p"})
-	_, err = dialVia(context.Background(), fs.URL, "example.com:80", time.Second)
+	_, err = dialVia(context.Background(), fs.URL, mustTarget(t, "example.com:80"), time.Second)
 	if !isProxyAuthError(err) || isProxyDialError(err) {
 		t.Fatalf("auth error classification = %T %v", err, err)
 	}
@@ -316,7 +329,7 @@ func TestDialViaClassifiesEndpointAndAuthFailures(t *testing.T) {
 
 func TestDialViaConnectReplyIsHandshakeError(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
-	_, err := dialVia(context.Background(), fs.URL, "example.com:80", time.Second)
+	_, err := dialVia(context.Background(), fs.URL, mustTarget(t, "example.com:80"), time.Second)
 	handshakeErr := assertSocksHandshakeError(t, err, "connect target")
 	if !strings.Contains(handshakeErr.Error(), "SOCKS reply 0x05") {
 		t.Fatalf("handshake error = %q, want it to name the reply", handshakeErr.Error())
@@ -370,7 +383,7 @@ func TestDialViaGreetingFailuresAreHandshakeErrors(t *testing.T) {
 	for name, opts := range cases {
 		t.Run(name, func(t *testing.T) {
 			fs := startSocks5Proxy(t, opts)
-			_, err := dialVia(context.Background(), fs.URL, "example.com:80", time.Second)
+			_, err := dialVia(context.Background(), fs.URL, mustTarget(t, "example.com:80"), time.Second)
 			op := "read greeting"
 			if name == "unsupported method" {
 				op = "negotiate authentication"
@@ -382,7 +395,7 @@ func TestDialViaGreetingFailuresAreHandshakeErrors(t *testing.T) {
 
 func TestDialViaNoAcceptableMethodIsAuthError(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{greetingRaw: []byte{0x05, 0xff}})
-	_, err := dialVia(context.Background(), fs.URL, "example.com:80", time.Second)
+	_, err := dialVia(context.Background(), fs.URL, mustTarget(t, "example.com:80"), time.Second)
 	if !isProxyAuthError(err) || isProxyDialError(err) || isSocksHandshakeError(err) {
 		t.Fatalf("auth error classification = %T %v", err, err)
 	}
@@ -403,7 +416,7 @@ func TestDialViaAuthFramingFailuresAreHandshakeErrors(t *testing.T) {
 			fs := startSocks5Proxy(t, opts)
 			pu := *fs.URL
 			pu.User = url.UserPassword("u", "p")
-			_, err := dialVia(context.Background(), &pu, "example.com:80", time.Second)
+			_, err := dialVia(context.Background(), &pu, mustTarget(t, "example.com:80"), time.Second)
 			_ = assertSocksHandshakeError(t, err, "read authentication")
 		})
 	}
@@ -424,7 +437,7 @@ func TestDialViaConnectFramingFailuresAreHandshakeErrors(t *testing.T) {
 	for name, opts := range cases {
 		t.Run(name, func(t *testing.T) {
 			fs := startSocks5Proxy(t, opts)
-			conn, err := dialVia(context.Background(), fs.URL, "example.com:80", time.Second)
+			conn, err := dialVia(context.Background(), fs.URL, mustTarget(t, "example.com:80"), time.Second)
 			switch name {
 			case "ipv6 bound ok", "domain bound ok", "ipv4 bound ok":
 				if err != nil {
@@ -443,7 +456,7 @@ func TestDialViaConnectFramingFailuresAreHandshakeErrors(t *testing.T) {
 func TestDialViaOversizedTargetHostnameIsProtocolError(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	long := strings.Repeat("a", 256) + ".example:80"
-	_, err := dialVia(context.Background(), fs.URL, long, time.Second)
+	_, err := dialVia(context.Background(), fs.URL, mustTarget(t, long), time.Second)
 	_ = assertSocksProtocolError(t, err, "encode target")
 	if got := len(fs.hits); got != 1 {
 		t.Fatalf("SOCKS attempts = %d, want 1", got)
@@ -452,7 +465,7 @@ func TestDialViaOversizedTargetHostnameIsProtocolError(t *testing.T) {
 
 func TestDialViaBufferedPrefixDelivered(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{connectPrefix: []byte("early-bytes")})
-	conn, err := dialVia(context.Background(), fs.URL, startEchoTarget(t), time.Second)
+	conn, err := dialVia(context.Background(), fs.URL, mustTarget(t, startEchoTarget(t)), time.Second)
 	if err != nil {
 		t.Fatalf("dialVia: %v", err)
 	}

@@ -91,7 +91,7 @@ func TestNoRouteRecordShowsPoolAndKindView(t *testing.T) {
 	runtime.MaxRetries = 1
 	var logs safeLogBuffer
 	s := newRuntimeServer(pl, runtime, captureLogger(&logs), config.EgressV4)
-	s.dial = func(context.Context, *url.URL, string, time.Duration) (net.Conn, error) {
+	s.dial = func(context.Context, *url.URL, socksdial.Target, time.Duration) (net.Conn, error) {
 		return nil, &socksdial.ProxyDialError{Err: errors.New("connect refused (TEST)")}
 	}
 	addr := startServer(t, s)
@@ -169,7 +169,7 @@ func TestShutdownLogsForceCloseMilestone(t *testing.T) {
 	s := newRuntimeServer(pl, defaultRuntime(), captureLogger(&logs))
 
 	dialStarted := make(chan struct{})
-	s.dial = func(ctx context.Context, _ *url.URL, _ string, _ time.Duration) (net.Conn, error) {
+	s.dial = func(ctx context.Context, _ *url.URL, _ socksdial.Target, _ time.Duration) (net.Conn, error) {
 		close(dialStarted)
 		<-ctx.Done()
 		return nil, ctx.Err()

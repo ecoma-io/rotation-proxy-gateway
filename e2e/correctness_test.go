@@ -98,7 +98,7 @@ func deadRouteValue(t *testing.T) string {
 	}
 	addr := ln.Addr().String()
 	_ = ln.Close()
-	return "socks5://" + addr
+	return addr
 }
 
 // failedSocksTunnel asserts the gateway rejects the CONNECT attempt with the
@@ -233,7 +233,7 @@ func TestE2E_AuthFailureFallsBackWithoutCooldown(t *testing.T) {
 	good := NewSocksSim(t, SocksOK, "", "")
 	target := NewEchoTarget(t)
 	// Gateway offers no credentials: the simulator demands them.
-	badNoCreds := "socks5://" + bad.Addr
+	badNoCreds := bad.Addr
 	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
 		{Proxy: badNoCreds, Kind: "v4"},
 		{Proxy: good.RouteValue(), Kind: "v4"},
@@ -398,7 +398,7 @@ func TestE2E_NoCredentialLeak(t *testing.T) {
 	socks := NewSocksSim(t, SocksOK, "", "")
 	target := NewEchoTarget(t)
 	user, pass := "e2e-leak-user", "e2e-leak-pass-9f8"
-	route := fmt.Sprintf("socks5://%s:%s@%s", user, pass, socks.Addr)
+	route := fmt.Sprintf("%s:%s@%s", user, pass, socks.Addr)
 	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
 		{Proxy: route, Kind: "v4"},
 	}))
@@ -440,7 +440,7 @@ func TestE2E_ManualRouteServesWithoutExposingSecrets(t *testing.T) {
 	api := NewRotateAPISim(t)
 	cfg := defaultGatewayConfig(nil)
 	cfg.Manual = []ManualRouteConfig{{
-		Proxy:          "socks5://manual-user:" + proxySecret + "@" + socks.Addr,
+		Proxy:          "manual-user:" + proxySecret + "@" + socks.Addr,
 		Kind:           "v4",
 		RotateInterval: "1h", // no rotation fires during the test
 		API: ManualAPIConfig{

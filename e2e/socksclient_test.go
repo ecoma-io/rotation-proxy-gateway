@@ -37,6 +37,17 @@ func socksTransport(proxyAddr string, insecureTLS bool) *http.Transport {
 // dialSocksTunnel connects through a gateway listener to targetAddr
 // (host:port) and returns the established tunnel.
 func dialSocksTunnel(ctx context.Context, proxyAddr, targetAddr string) (net.Conn, error) {
+	req, err := socksConnectRequestBytes(targetAddr)
+	if err != nil {
+		return nil, err
+	}
+	return dialSocksTunnelFrame(ctx, proxyAddr, req)
+}
+
+// dialSocksTunnelFrame connects through a gateway listener and sends frame as
+// the CONNECT request verbatim — the ingress-side half of the address-type
+// preservation tests, which must control the request's ATYP exactly.
+func dialSocksTunnelFrame(ctx context.Context, proxyAddr string, frame []byte) (net.Conn, error) {
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
@@ -55,12 +66,7 @@ func dialSocksTunnel(ctx context.Context, proxyAddr, targetAddr string) (net.Con
 		_ = conn.Close()
 		return nil, fmt.Errorf("unexpected method selection 0x%02x 0x%02x", choice[0], choice[1])
 	}
-	req, err := socksConnectRequestBytes(targetAddr)
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	if _, err := conn.Write(req); err != nil {
+	if _, err := conn.Write(frame); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("send connect: %w", err)
 	}
@@ -83,6 +89,40 @@ func dialSocksTunnel(ctx context.Context, proxyAddr, targetAddr string) (net.Con
 		return nil, err
 	}
 	return conn, nil
+}
+
+// socksConnectFrameWithATYP renders a CONNECT request carrying exactly atyp —
+// 0x01 as four address bytes, 0x03 as the hostname bytes, 0x04 as sixteen
+// address bytes — regardless of what the host string looks like. Client
+// conventions differ only in this byte: a socks5 client resolves and sends
+// ATYP=IP, a socks5h client sends ATYP=DOMAIN.
+func socksConnectFrameWithATYP(host string, port uint16, atyp byte) ([]byte, error) {
+	req := []byte{0x05, 0x01, 0x00, atyp}
+	switch atyp {
+	case 0x01:
+		ip := net.ParseIP(host)
+		if ip == nil || ip.To4() == nil {
+			return nil, fmt.Errorf("host %q does not encode as IPv4", host)
+		}
+		req = append(req, ip.To4()...)
+	case 0x03:
+		if len(host) == 0 || len(host) > 255 {
+			return nil, fmt.Errorf("target hostname length %d is invalid", len(host))
+		}
+		req = append(req, byte(len(host)))
+		req = append(req, host...)
+	case 0x04:
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return nil, fmt.Errorf("host %q does not encode as IPv6", host)
+		}
+		req = append(req, ip.To16()...)
+	default:
+		return nil, fmt.Errorf("unsupported ATYP 0x%02x", atyp)
+	}
+	var portBytes [2]byte
+	binary.BigEndian.PutUint16(portBytes[:], port)
+	return append(req, portBytes[:]...), nil
 }
 
 // socksConnectRequestBytes renders a CONNECT request for host:port, sending

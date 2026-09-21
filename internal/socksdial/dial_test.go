@@ -15,6 +15,10 @@ import (
 
 const dialTestTimeout = 5 * time.Second
 
+// domainTarget443 is the hostname target the handshake and taxonomy tests
+// dial through: ATYP 0x03, the name passed through unmodified.
+var domainTarget443 = Target{Host: "example.com", Port: 443, Type: AddrDomain}
+
 // socksScript programs one scripted SOCKS5 endpoint conversation. Zero values
 // mean "happy path": accept the offered methods, succeed authentication, and
 // answer CONNECT with code 0x00.
@@ -30,8 +34,13 @@ type socksScript struct {
 	dropConn   bool   // close before answering CONNECT
 	wantUser   string
 	wantPass   string
+	wantAtyp   byte   // expected CONNECT ATYP; 0x00 skips the check
 	wantHost   string // expected CONNECT target host; empty skips the check
 	wantPort   uint16 // expected CONNECT target port; 0 skips the check
+	// wantRawAddr pins the exact DST.ADDR bytes on the wire; nil skips the
+	// check. It is how the address-type preservation tests prove bytes, not
+	// renderings, survive the dialer.
+	wantRawAddr []byte
 }
 
 func startScriptedSocks(t *testing.T, script socksScript) string {
@@ -120,9 +129,15 @@ func handleScriptedConn(t *testing.T, conn net.Conn, script socksScript) {
 	if !ok {
 		return
 	}
-	host, port, ok := scriptReadConnectTarget(br, head[3])
+	host, port, raw, ok := scriptReadConnectTarget(br, head[3])
 	if !ok {
 		return
+	}
+	if script.wantAtyp != 0 && head[3] != script.wantAtyp {
+		t.Errorf("CONNECT ATYP = 0x%02x, want 0x%02x", head[3], script.wantAtyp)
+	}
+	if len(script.wantRawAddr) > 0 && string(raw) != string(script.wantRawAddr) {
+		t.Errorf("CONNECT DST.ADDR = %v, want %v", raw, script.wantRawAddr)
 	}
 	if script.wantHost != "" && host != script.wantHost {
 		t.Errorf("CONNECT host = %q, want %q", host, script.wantHost)
@@ -170,34 +185,34 @@ func handleScriptedConn(t *testing.T, conn net.Conn, script socksScript) {
 	}
 }
 
-func scriptReadConnectTarget(br *bufio.Reader, atyp byte) (string, uint16, bool) {
+func scriptReadConnectTarget(br *bufio.Reader, atyp byte) (string, uint16, []byte, bool) {
 	switch atyp {
 	case 0x01:
 		raw, ok := scriptRead(br, 6)
 		if !ok {
-			return "", 0, false
+			return "", 0, nil, false
 		}
-		return net.IP(raw[:4]).String(), uint16(raw[4])<<8 | uint16(raw[5]), true
+		return net.IP(raw[:4]).String(), uint16(raw[4])<<8 | uint16(raw[5]), raw[:4], true
 	case 0x03:
 		n, ok := scriptRead(br, 1)
 		if !ok {
-			return "", 0, false
+			return "", 0, nil, false
 		}
 		raw, ok := scriptRead(br, int(n[0])+2)
 		if !ok {
-			return "", 0, false
+			return "", 0, nil, false
 		}
 		host := string(raw[:len(raw)-2])
 		port := uint16(raw[len(raw)-2])<<8 | uint16(raw[len(raw)-1])
-		return host, port, true
+		return host, port, raw[:len(raw)-2], true
 	case 0x04:
 		raw, ok := scriptRead(br, 18)
 		if !ok {
-			return "", 0, false
+			return "", 0, nil, false
 		}
-		return net.IP(raw[:16]).String(), uint16(raw[16])<<8 | uint16(raw[17]), true
+		return net.IP(raw[:16]).String(), uint16(raw[16])<<8 | uint16(raw[17]), raw[:16], true
 	default:
-		return "", 0, false
+		return "", 0, nil, false
 	}
 }
 
@@ -233,7 +248,7 @@ func assertTaxonomy(t *testing.T, err error, dial, auth, hs bool) {
 
 func TestDialSuccessRoundTripNoAuth(t *testing.T) {
 	addr := startScriptedSocks(t, socksScript{})
-	conn, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+	conn, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), domainTarget443, dialTestTimeout)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -252,16 +267,61 @@ func TestDialSuccessRoundTripNoAuth(t *testing.T) {
 
 func TestDialConnectRequestTargetEncoding(t *testing.T) {
 	addr := startScriptedSocks(t, socksScript{wantHost: "example.com", wantPort: 8443})
-	conn, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:8443", dialTestTimeout)
+	conn, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), Target{Host: "example.com", Port: 8443, Type: AddrDomain}, dialTestTimeout)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
 	_ = conn.Close()
 }
 
+// The caller's address type is what reaches the wire. The critical regression
+// is the domain path: this scripted endpoint only accepts ATYP 0x03 with
+// DST.ADDR exactly "example.test", so any local resolution — ATYP 0x01 or
+// 0x04 with an address literal — fails the scripted checks. The ".test" name
+// resolves nowhere and no DNS is consulted anywhere in the test: determinism
+// comes from the script, not from the network.
+func TestDialPreservesTargetAddressType(t *testing.T) {
+	roundTrip := func(t *testing.T, conn net.Conn) {
+		t.Helper()
+		defer func() { _ = conn.Close() }()
+		if _, err := conn.Write([]byte("ping")); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		got := make([]byte, 4)
+		if _, err := io.ReadFull(conn, got); err != nil || string(got) != "ping" {
+			t.Fatalf("echo = %q, err = %v", got, err)
+		}
+	}
+	t.Run("ipv4 arrives as ATYP 0x01 with exact bytes", func(t *testing.T) {
+		addr := startScriptedSocks(t, socksScript{wantAtyp: 0x01, wantHost: "1.2.3.4", wantRawAddr: []byte{1, 2, 3, 4}, wantPort: 443})
+		conn, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), Target{Host: "1.2.3.4", Port: 443, Type: AddrIPv4}, dialTestTimeout)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		roundTrip(t, conn)
+	})
+	t.Run("ipv6 arrives as ATYP 0x04 with exact bytes", func(t *testing.T) {
+		raw := append([]byte{0x20, 0x01, 0x0d, 0xb8}, append(make([]byte, 11), 0x01)...) // 2001:db8::1
+		addr := startScriptedSocks(t, socksScript{wantAtyp: 0x04, wantHost: "2001:db8::1", wantRawAddr: raw, wantPort: 443})
+		conn, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), Target{Host: "2001:db8::1", Port: 443, Type: AddrIPv6}, dialTestTimeout)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		roundTrip(t, conn)
+	})
+	t.Run("domain arrives as ATYP 0x03 with the exact hostname", func(t *testing.T) {
+		addr := startScriptedSocks(t, socksScript{wantAtyp: 0x03, wantHost: "example.test", wantRawAddr: []byte("example.test"), wantPort: 443})
+		conn, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), Target{Host: "example.test", Port: 443, Type: AddrDomain}, dialTestTimeout)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		roundTrip(t, conn)
+	})
+}
+
 func TestDialSuccessWithAuth(t *testing.T) {
 	addr := startScriptedSocks(t, socksScript{method: 0x02, wantUser: "route-user", wantPass: "route-pass"})
-	conn, err := Dial(context.Background(), dialURL(t, "socks5://route-user:route-pass@"+addr), "example.com:443", dialTestTimeout)
+	conn, err := Dial(context.Background(), dialURL(t, "socks5://route-user:route-pass@"+addr), domainTarget443, dialTestTimeout)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -279,7 +339,7 @@ func TestDialBoundAddressTypes(t *testing.T) {
 	for _, atyp := range []byte{0x01, 0x03, 0x04} {
 		t.Run(fmt.Sprintf("atyp-%#02x", atyp), func(t *testing.T) {
 			addr := startScriptedSocks(t, socksScript{atyp: atyp})
-			conn, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+			conn, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), domainTarget443, dialTestTimeout)
 			if err != nil {
 				t.Fatalf("Dial: %v", err)
 			}
@@ -299,7 +359,7 @@ func TestDialBoundAddressTypes(t *testing.T) {
 // stream (withBufferedPrefix path).
 func TestDialPipelinedHandshakeData(t *testing.T) {
 	addr := startScriptedSocks(t, socksScript{pipeline: []byte("PRE")})
-	conn, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+	conn, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), domainTarget443, dialTestTimeout)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -320,17 +380,17 @@ func TestDialPipelinedHandshakeData(t *testing.T) {
 func TestDialAuthenticationFailures(t *testing.T) {
 	t.Run("rejected credentials", func(t *testing.T) {
 		addr := startScriptedSocks(t, socksScript{method: 0x02, authStatus: 0x01})
-		_, err := Dial(context.Background(), dialURL(t, "socks5://u:p@"+addr), "example.com:443", dialTestTimeout)
+		_, err := Dial(context.Background(), dialURL(t, "socks5://u:p@"+addr), domainTarget443, dialTestTimeout)
 		assertTaxonomy(t, err, false, true, false)
 	})
 	t.Run("no acceptable method", func(t *testing.T) {
 		addr := startScriptedSocks(t, socksScript{method: 0xff})
-		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), domainTarget443, dialTestTimeout)
 		assertTaxonomy(t, err, false, true, false)
 	})
 	t.Run("credentials required but none configured", func(t *testing.T) {
 		addr := startScriptedSocks(t, socksScript{method: 0x02})
-		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), domainTarget443, dialTestTimeout)
 		assertTaxonomy(t, err, false, true, false)
 	})
 }
@@ -338,22 +398,22 @@ func TestDialAuthenticationFailures(t *testing.T) {
 func TestDialHandshakeFailures(t *testing.T) {
 	t.Run("closed before greeting reply", func(t *testing.T) {
 		addr := startScriptedSocks(t, socksScript{dropGreet: true})
-		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), domainTarget443, dialTestTimeout)
 		assertTaxonomy(t, err, false, false, true)
 	})
 	t.Run("unsupported method choice", func(t *testing.T) {
 		addr := startScriptedSocks(t, socksScript{method: 0x01})
-		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), domainTarget443, dialTestTimeout)
 		assertTaxonomy(t, err, false, false, true)
 	})
 	t.Run("closed before connect reply", func(t *testing.T) {
 		addr := startScriptedSocks(t, socksScript{dropConn: true})
-		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), domainTarget443, dialTestTimeout)
 		assertTaxonomy(t, err, false, false, true)
 	})
 	t.Run("nonzero reply code", func(t *testing.T) {
 		addr := startScriptedSocks(t, socksScript{replyCode: 0x05})
-		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), domainTarget443, dialTestTimeout)
 		assertTaxonomy(t, err, false, false, true)
 		if !IsConnectTargetError(err) {
 			t.Fatalf("explicit CONNECT refusal must classify as connect-target: %v", err)
@@ -368,33 +428,58 @@ func TestDialHandshakeFailures(t *testing.T) {
 	})
 	t.Run("unsupported bound address type", func(t *testing.T) {
 		addr := startScriptedSocks(t, socksScript{atyp: 0x06, bound: []byte{}})
-		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), domainTarget443, dialTestTimeout)
 		assertTaxonomy(t, err, false, false, true)
 	})
 }
 
 func TestDialLocalSetupFailures(t *testing.T) {
 	addr := startScriptedSocks(t, socksScript{})
-	for _, tc := range []struct{ name, target string }{
-		{"missing port", "example.com"},
-		{"empty target", ""},
-		{"bad port", "example.com:notaport"},
-		{"zero port", "example.com:0"},
-		{"oversized hostname", strings.Repeat("a", 256) + ":443"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), tc.target, dialTestTimeout)
-			var proto *SocksProtocolError
-			if !errors.As(err, &proto) {
-				t.Fatalf("err = %v, want SocksProtocolError", err)
-			}
-			if IsDialError(err) || IsAuthError(err) || IsHandshakeError(err) {
-				t.Fatalf("setup error must not classify as dial/auth/handshake: %v", err)
-			}
-		})
-	}
+	t.Run("malformed target strings", func(t *testing.T) {
+		for _, tc := range []struct{ name, addr string }{
+			{"missing port", "example.com"},
+			{"empty target", ""},
+			{"bad port", "example.com:notaport"},
+			{"zero port", "example.com:0"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := TargetFromAddr(tc.addr)
+				if err == nil {
+					t.Fatalf("TargetFromAddr(%q) succeeded, want error", tc.addr)
+				}
+			})
+		}
+	})
+	t.Run("zero port target", func(t *testing.T) {
+		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), Target{Host: "example.com", Port: 0, Type: AddrDomain}, dialTestTimeout)
+		assertTaxonomy(t, err, false, false, false)
+		var proto *SocksProtocolError
+		if !errors.As(err, &proto) {
+			t.Fatalf("err = %v, want SocksProtocolError", err)
+		}
+	})
+	t.Run("oversized hostname target", func(t *testing.T) {
+		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), Target{Host: strings.Repeat("a", 256), Port: 443, Type: AddrDomain}, dialTestTimeout)
+		var proto *SocksProtocolError
+		if !errors.As(err, &proto) {
+			t.Fatalf("err = %v, want SocksProtocolError", err)
+		}
+		if IsDialError(err) || IsAuthError(err) || IsHandshakeError(err) {
+			t.Fatalf("setup error must not classify as dial/auth/handshake: %v", err)
+		}
+	})
+	t.Run("hostname declared as ipv4", func(t *testing.T) {
+		_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), Target{Host: "example.com", Port: 443, Type: AddrIPv4}, dialTestTimeout)
+		var proto *SocksProtocolError
+		if !errors.As(err, &proto) {
+			t.Fatalf("err = %v, want SocksProtocolError", err)
+		}
+		if IsDialError(err) || IsAuthError(err) || IsHandshakeError(err) {
+			t.Fatalf("setup error must not classify as dial/auth/handshake: %v", err)
+		}
+	})
 	t.Run("unsupported scheme", func(t *testing.T) {
-		_, err := Dial(context.Background(), dialURL(t, "http://"+addr), "example.com:443", dialTestTimeout)
+		_, err := Dial(context.Background(), dialURL(t, "http://"+addr), domainTarget443, dialTestTimeout)
 		var proto *SocksProtocolError
 		if !errors.As(err, &proto) {
 			t.Fatalf("err = %v, want SocksProtocolError", err)
@@ -403,7 +488,7 @@ func TestDialLocalSetupFailures(t *testing.T) {
 	t.Run("oversized credentials", func(t *testing.T) {
 		big := strings.Repeat("u", 256)
 		srv := startScriptedSocks(t, socksScript{method: 0x02})
-		_, err := Dial(context.Background(), dialURL(t, "socks5://"+big+":p@"+srv), "example.com:443", dialTestTimeout)
+		_, err := Dial(context.Background(), dialURL(t, "socks5://"+big+":p@"+srv), domainTarget443, dialTestTimeout)
 		var proto *SocksProtocolError
 		if !errors.As(err, &proto) {
 			t.Fatalf("err = %v, want SocksProtocolError", err)
@@ -421,7 +506,7 @@ func TestDialConnectTargetScope(t *testing.T) {
 	t.Run("refusal carries the endpoint's reply code", func(t *testing.T) {
 		for _, code := range []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08} {
 			addr := startScriptedSocks(t, socksScript{replyCode: code})
-			_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+			_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), domainTarget443, dialTestTimeout)
 			assertTaxonomy(t, err, false, false, true)
 			if !IsConnectTargetError(err) {
 				t.Fatalf("reply 0x%02x must classify as connect-target: %v", code, err)
@@ -436,7 +521,7 @@ func TestDialConnectTargetScope(t *testing.T) {
 			{atyp: 0x06, bound: []byte{}},
 		} {
 			addr := startScriptedSocks(t, script)
-			_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), "example.com:443", dialTestTimeout)
+			_, err := Dial(context.Background(), dialURL(t, "socks5://"+addr), domainTarget443, dialTestTimeout)
 			assertTaxonomy(t, err, false, false, true)
 			if IsConnectTargetError(err) {
 				t.Fatalf("handshake failure %v must stay route-scoped", err)
@@ -445,7 +530,7 @@ func TestDialConnectTargetScope(t *testing.T) {
 	})
 	t.Run("auth and dial failures are not connect-target", func(t *testing.T) {
 		authAddr := startScriptedSocks(t, socksScript{method: 0x02, authStatus: 0x01})
-		_, err := Dial(context.Background(), dialURL(t, "socks5://u:p@"+authAddr), "example.com:443", dialTestTimeout)
+		_, err := Dial(context.Background(), dialURL(t, "socks5://u:p@"+authAddr), domainTarget443, dialTestTimeout)
 		assertTaxonomy(t, err, false, true, false)
 		if IsConnectTargetError(err) {
 			t.Fatalf("auth failure must not classify as connect-target: %v", err)
@@ -456,7 +541,7 @@ func TestDialConnectTargetScope(t *testing.T) {
 		}
 		refused := ln.Addr().String()
 		_ = ln.Close()
-		_, err = Dial(context.Background(), dialURL(t, "socks5://"+refused), "example.com:443", dialTestTimeout)
+		_, err = Dial(context.Background(), dialURL(t, "socks5://"+refused), domainTarget443, dialTestTimeout)
 		assertTaxonomy(t, err, true, false, false)
 		if IsConnectTargetError(err) {
 			t.Fatalf("dial failure must not classify as connect-target: %v", err)
@@ -471,7 +556,7 @@ func TestDialEndpointRefused(t *testing.T) {
 	}
 	refused := ln.Addr().String()
 	_ = ln.Close()
-	_, err = Dial(context.Background(), dialURL(t, "socks5://"+refused), "example.com:443", dialTestTimeout)
+	_, err = Dial(context.Background(), dialURL(t, "socks5://"+refused), domainTarget443, dialTestTimeout)
 	assertTaxonomy(t, err, true, false, false)
 }
 

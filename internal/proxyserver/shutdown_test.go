@@ -58,7 +58,7 @@ func TestShutdownCancelsPendingUpstreamDial(t *testing.T) {
 	s := newRuntimeServer(pl, defaultRuntime(), testLogger())
 
 	dialStarted := make(chan struct{})
-	s.dial = func(ctx context.Context, _ *url.URL, _ string, _ time.Duration) (net.Conn, error) {
+	s.dial = func(ctx context.Context, _ *url.URL, _ socksdial.Target, _ time.Duration) (net.Conn, error) {
 		close(dialStarted)
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -180,7 +180,7 @@ func TestLastAttemptFailureIsNotAFailover(t *testing.T) {
 	var logs safeLogBuffer
 	s := newRuntimeServer(pl, runtime, captureLogger(&logs))
 	dials := make(chan struct{}, 4)
-	s.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+	s.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
 		dials <- struct{}{}
 		return nil, &socksdial.ProxyDialError{Err: errors.New("connect refused (TEST)")}
 	}
@@ -218,7 +218,7 @@ func TestServeTunnelStopsRetryingAfterHandshakeDeadline(t *testing.T) {
 	var logs safeLogBuffer
 	s := newRuntimeServer(pl, runtime, captureLogger(&logs))
 	dials := make(chan struct{}, 4)
-	s.dial = func(ctx context.Context, pu *url.URL, target string, timeout time.Duration) (net.Conn, error) {
+	s.dial = func(ctx context.Context, pu *url.URL, target socksdial.Target, timeout time.Duration) (net.Conn, error) {
 		dials <- struct{}{}
 		return nil, &socksdial.ProxyDialError{Err: errors.New("connect refused (TEST)")}
 	}
@@ -228,7 +228,7 @@ func TestServeTunnelStopsRetryingAfterHandshakeDeadline(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.serveTunnel(server, "example.test:80", time.Now().Add(-time.Second), captureLogger(&logs))
+		s.serveTunnel(server, socksdial.Target{Host: "example.test", Port: 80, Type: socksdial.AddrDomain}, time.Now().Add(-time.Second), captureLogger(&logs))
 	}()
 	// Drain the general-failure reply the cut chain writes to the client;
 	// a synchronous pipe would otherwise block the handler forever.
