@@ -24,8 +24,9 @@ bug:
 
 - **A credential, URL userinfo, rotate-API header/body, or route identity
   reaching logs, `/status`, error text, or a proxied response.** The
-  documented contract forbids each of these (see README "Failure and
-  route-health contract" and "Admin and observability"); a redaction that
+  documented contract forbids each of these (see
+  [docs/failure-and-health.md](docs/failure-and-health.md) and
+  [docs/observability.md](docs/observability.md)); a redaction that
   misses a format fails in the quiet direction — the report is a leak, not
   a typo.
 - **A path that lets a proxy client reach what the network policy did not

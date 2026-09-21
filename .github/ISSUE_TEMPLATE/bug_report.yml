@@ -6,10 +6,13 @@ body:
   - type: markdown
     attributes:
       value: |
-        [`README.md`](../../blob/main/README.md) is the behavior contract —
+        The [`docs/`](../../tree/main/docs) pages are the behavior contract —
         please quote the passage the behavior disagrees with. Failure
-        classification, reload semantics, rotation states, and the
-        logging/`/status` contract each have their own section.
+        classification ([`failure-and-health`](../../blob/main/docs/failure-and-health.md)),
+        reload semantics ([`configuration`](../../blob/main/docs/configuration.md)),
+        rotation states ([`rotation`](../../blob/main/docs/rotation.md)), and the
+        logging/`/status` contract ([`observability`](../../blob/main/docs/observability.md))
+        each have their own page.
 
         **Do not report a security vulnerability here.** A credential, URL
         userinfo, or rotate-API value reaching a log line, `/status`, or an
@@ -38,7 +41,7 @@ body:
     id: what-should-happen
     attributes:
       label: What should happen instead?
-      description: Quote the documented contract (README/AGENTS passage) the behavior disagrees with.
+      description: Quote the documented contract (docs page/AGENTS passage) the behavior disagrees with.
     validations:
       required: true
   - type: textarea

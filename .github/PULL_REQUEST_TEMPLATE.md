@@ -5,7 +5,7 @@ Closes #
 ## Type of change
 
 - [ ] Bug fix — behavior disagrees with the documented contract
-- [ ] Contract change — documented behavior moves; README/AGENTS updated in this PR
+- [ ] Contract change — documented behavior moves; docs/AGENTS updated in this PR
 - [ ] New feature
 - [ ] Refactor — no behavior change
 - [ ] Documentation only
@@ -14,7 +14,7 @@ Closes #
 ## Contract impact
 
 - [ ] Trivial — moves no documented behavior (failure classification, reload, shutdown, rotation states, the logging/`/status` contract)
-- [ ] Contract-bearing — the affected README/AGENTS sections are updated in this same PR
+- [ ] Contract-bearing — the affected docs/AGENTS sections are updated in this same PR
 
 ## Could this fail silently?
 
@@ -38,7 +38,7 @@ Closes #
 ## Checklist
 
 - [ ] Self-reviewed the diff
-- [ ] Docs updated in the same pass (README/AGENTS when behavior moves)
+- [ ] Docs updated in the same pass (docs pages/AGENTS when behavior moves)
 - [ ] No `config.yaml`, credentials, or route URLs anywhere in the diff
 - [ ] I have the right to contribute this work under the Apache License 2.0
 
