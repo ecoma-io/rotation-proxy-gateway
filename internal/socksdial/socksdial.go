@@ -318,3 +318,15 @@ func (c *prefixConn) Read(b []byte) (int, error) {
 	}
 	return c.Conn.Read(b)
 }
+
+// CloseWrite forwards a half-close through the prefix wrapper so a FIN the
+// caller sends reaches the endpoint even when reply bytes were buffered here.
+// CloseWrite is not part of net.Conn, so without this method the type
+// assertion on the wrapper would fail and silently drop the half-close.
+func (c *prefixConn) CloseWrite() error {
+	cw, ok := c.Conn.(interface{ CloseWrite() error })
+	if !ok {
+		return errors.New("half-close unsupported by the underlying connection")
+	}
+	return cw.CloseWrite()
+}

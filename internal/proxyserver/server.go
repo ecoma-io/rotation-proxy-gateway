@@ -501,19 +501,26 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 		Int("attempts", attempts).Str("duration", logDuration(time.Since(start))).
 		Msg("tunnel")
 
-	// Relay until either side ends the stream. Established tunnels carry no
-	// health or retry semantics; the close record is the only trace of which
-	// side ended the stream first and why.
+	// Relay until both directions end. Established tunnels carry no health or
+	// retry semantics; the close record is the only trace of which side ended
+	// the stream first and why.
 	closes := make(chan relayResult, 2)
+	// relayDone closes only after the response relay armed its teardown
+	// options and closed the client side, so the handler's own deferred
+	// client close can never race ahead of an armed reset.
+	relayDone := make(chan struct{})
 	go func() {
-		n, err := copyWithPooledBuffer(clientConn, upstream)
+		defer close(relayDone)
+		n, err := copyToClient(clientConn, upstream)
 		// Send before teardown: whichever result lands first is the cause;
 		// the one our own closes unblock is the artifact.
 		closes <- relayResult{direction: relayToClient, bytes: n, err: err}
-		if err != nil {
+		if isUpstreamBreak(err) {
 			// A broken upstream must not masquerade as a clean end of stream:
 			// reset the client side so a truncated stream stays truncated.
-			if tc, ok := clientConn.(*net.TCPConn); ok {
+			// tcpConnOf looks through the pipelining prefix wrapper, so the
+			// reset reaches the socket for pipelining clients too.
+			if tc := tcpConnOf(clientConn); tc != nil {
 				// Best-effort: a failed SO_LINGER still leaves the close to
 				// end the stream, just with a FIN instead of a RST.
 				_ = tc.SetLinger(0)
@@ -523,11 +530,42 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 		_ = clientConn.Close() // unblocks the client-to-upstream direction
 	}()
 	n, err := copyWithPooledBuffer(upstream, clientConn)
+	if err == nil {
+		// A clean end of the client-to-upstream direction is a client
+		// half-close: one direction ended while the response direction may
+		// still carry bytes. Propagate the FIN to the upstream and keep
+		// relaying until the response ends on its own — the gateway never
+		// terminates a tunnel the client still has open. A full client close
+		// is indistinguishable here and gets the same relay: a write to a
+		// vanished client fails by itself, ending the response direction.
+		if cw, ok := upstream.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite() //nolint:errcheck // best-effort FIN propagation
+		}
+		// The response relay's result is guaranteed queued once relayDone
+		// closes (it defers after its send), so waiting there — not on the
+		// shared channel, which would hand back this direction's own result
+		// — is what keeps the session alive until the response truly ends.
+		select {
+		case <-relayDone:
+		case <-s.baseCtx.Done():
+			// Shutdown's force-close already closed the client side; unblock
+			// the response relay the way an abort teardown does, so the
+			// session cannot linger on a parked upstream.
+			_ = upstream.Close()
+			<-relayDone
+		}
+		second := <-closes
+		_ = upstream.Close() //nolint:errcheck // best-effort: the response direction ended
+		recordTunnelClose(log, logTarget, chosen, start,
+			relayResult{direction: relayToUpstream, bytes: n}, second)
+		return
+	}
 	closes <- relayResult{direction: relayToUpstream, bytes: n, err: err}
 	upstream.Close()   //nolint:errcheck // best-effort teardown
 	clientConn.Close() //nolint:errcheck // unblocks the other direction
 	first := <-closes
 	second := <-closes // the forced close of the remaining side is an artifact
+	<-relayDone        // the reset, when armed, lands before this returns
 	recordTunnelClose(log, logTarget, chosen, start, first, second)
 }
 
@@ -736,6 +774,70 @@ func copyWithPooledBuffer(dst io.Writer, src io.Reader) (int64, error) {
 	return n, err
 }
 
+// upstreamBreakError marks a relay failure raised on the upstream side of the
+// response direction: a read from the upstream conn failed, so the response
+// stream itself broke mid-flight. Failures raised on the client side of the
+// same relay — writes to a vanished client — stay bare and must never be
+// treated as an upstream break.
+type upstreamBreakError struct{ err error }
+
+func (e *upstreamBreakError) Error() string { return e.err.Error() }
+func (e *upstreamBreakError) Unwrap() error { return e.err }
+
+// isUpstreamBreak reports whether err is a genuine upstream-side failure of
+// the response relay: not a clean end of stream, not the artifact of the
+// gateway's own teardown close, and not a client-side write failure.
+func isUpstreamBreak(err error) bool {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	var brk *upstreamBreakError
+	return errors.As(err, &brk)
+}
+
+// copyToClient relays the response direction, upstream to client, and keeps
+// the failing end distinguishable: an upstream read failure comes back wrapped
+// in upstreamBreakError, while a client write failure stays bare. The
+// reset-on-upstream-break decision and the close record's broken-tunnel
+// classification both key on that difference.
+func copyToClient(client, upstream net.Conn) (int64, error) {
+	bufp := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufp)
+	buf := *bufp
+	var total int64
+	for {
+		n, rerr := upstream.Read(buf)
+		if n > 0 {
+			m, werr := client.Write(buf[:n])
+			total += int64(m)
+			if werr != nil {
+				return total, fmt.Errorf("write to client: %w", werr)
+			}
+			if m < n {
+				return total, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return total, nil
+			}
+			return total, &upstreamBreakError{err: rerr}
+		}
+	}
+}
+
+// tcpConnOf looks through the pipelining prefix wrapper for the client
+// socket's *net.TCPConn, so teardown socket options reach the real socket
+// even when the framing reader handed the relay a wrapped conn. Non-TCP
+// client conns (tests) return nil.
+func tcpConnOf(c net.Conn) *net.TCPConn {
+	if pc, ok := c.(*prefixConn); ok {
+		c = pc.Conn
+	}
+	tc, _ := c.(*net.TCPConn)
+	return tc
+}
+
 // inboundBufPool lends the buffered readers that frame inbound SOCKS5
 // exchanges. Greeting and CONNECT frame together stay under 300 bytes, so
 // one 4KiB fill usually captures the whole exchange in a single socket read
@@ -782,11 +884,10 @@ const (
 // routine flow detail at debug. Tunnel closes never mutate route health.
 // recordTunnelClose classifies the tunnel's end. The direction that ended
 // first is the cause; the other direction's result is normally the artifact
-// of the teardown close. One artifact ordering lies: when the client side
-// failed first but the upstream direction also failed on its own — an error
-// that is not our close — an upstream reset killed the tunnel from the far
-// side, and it must be logged as broken (warn), not as a clean client end
-// (debug).
+// of the teardown close. A genuine upstream break must surface as broken
+// (warn) whichever way it orders: first, behind a client-side failure, or
+// behind a clean client half-close — while teardown artifacts (the gateway's
+// own closes) and client-side write failures stay routine closes.
 func recordTunnelClose(log zerolog.Logger, target string, p *pool.Proxy, start time.Time, first, second relayResult) {
 	toClient, toUpstream := second, first
 	if first.direction == relayToClient {
@@ -794,12 +895,12 @@ func recordTunnelClose(log zerolog.Logger, target string, p *pool.Proxy, start t
 	}
 	msg, reason, cause := "tunnel closed", "client_closed", first.err
 	switch {
-	case first.direction == relayToClient && first.err != nil:
+	case first.direction == relayToClient && isUpstreamBreak(first.err):
 		msg, reason = "tunnel broken", "upstream_broken"
-	case first.direction == relayToClient:
-		reason = "upstream_closed"
-	case first.err != nil && second.err != nil && !errors.Is(second.err, net.ErrClosed):
+	case second.direction == relayToClient && isUpstreamBreak(second.err):
 		msg, reason, cause = "tunnel broken", "upstream_broken", second.err
+	case first.direction == relayToClient && first.err == nil:
+		reason = "upstream_closed"
 	case first.err != nil:
 		reason = "client_aborted"
 	}
