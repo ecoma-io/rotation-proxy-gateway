@@ -143,6 +143,16 @@ steady-state win. Absolute numbers age; the **shape** is the reproducible
 claim: one RTT of upstream setup removed per borrow, zero regression when
 the pool is exhausted.
 
+WarmHA, same machine and date (rtt=0s, loopback upstreams): single-route
+downtime is identical in availability — success_ratio 1.000 on both sides,
+zero failed ops in clean iterations, borrow_ratio ~0.9 — and tail latency
+does not regress (p95 1.17→1.05ms, p99 1.83→1.63ms). Concurrent two-route
+failures keep availability at 0.9999 but show a small, consistent extra
+failure count under warm (median 4 vs 1 failed ops per 8s window of ~9k
+operations): a borrowed connection from a dying route adds one
+discard-and-redial leg before the route-level fallback serves the request.
+Reported as observed; it is the one measured cost of borrowing.
+
 ## Interpretation caveats — read before drawing conclusions
 
 - The setup-latency benchmarks (`SmallGET`, `SmallGETParallel`, `TunnelSetup`)

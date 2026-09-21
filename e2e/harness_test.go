@@ -365,7 +365,10 @@ func newGateway(t testing.TB, cfg GatewayConfig, extraEnv []string) *Gateway {
 	}
 	g.cmd = cmd
 	t.Cleanup(g.stop)
-	g.waitHealthy(10 * time.Second)
+	// 30s only matters on a machine that stalls: a healthy gateway answers
+	// healthz in milliseconds, but a shared box can freeze for ~10s and a
+	// tight budget turns environmental noise into a harness failure.
+	g.waitHealthy(30 * time.Second)
 	return g
 }
 
