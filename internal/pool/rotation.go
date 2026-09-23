@@ -52,19 +52,40 @@ func (p *Proxy) SetRotationPhase(phase RotationState) {
 // health is left to MarkRotated. The flag clears under p.mu so SetRotationPhase's
 // guarded check cannot slip between the state write and the flag clear.
 //
+// It is the single writer of the successful-rotation counters and the single
+// place the revisit decision is made: it returns whether the committed IP had
+// already been verified by this same route earlier in its lifetime, meaning
+// the provider handed back an address the route had already used. The ordering
+// is verify → commit succeeds → membership decided → candidate recorded →
+// rotationCount++ → ipRevisitCount++ when applicable, all inside one p.mu
+// section, so a rejected candidate can never move either counter.
+//
 // The rotation engine must not call this directly with a candidate that only
 // an unlocked check cleared: it records unconditionally, so two procedures
 // that verified the same address could both commit it. CommitRotation is the
 // engine's seam — the collision check and this record as one section.
-func (p *Proxy) EndRotation(ip string, at time.Time) {
+func (p *Proxy) EndRotation(ip string, at time.Time) bool {
+	key, indexed := verifiedIPKey(ip)
 	p.mu.Lock()
+	revisit := false
+	if indexed {
+		_, revisit = p.verifiedIPs[key]
+	}
 	p.rotationState = RotationIdle
 	p.lastIP = ip
 	p.lastRotationAt = at
 	p.nextRetryIn = 0
 	p.consecutiveSameIP = 0
+	if indexed {
+		p.recordVerifiedIP(key)
+	}
+	p.rotationCount++
+	if revisit {
+		p.ipRevisitCount++
+	}
 	p.rotating.Store(false)
 	p.mu.Unlock()
+	return revisit
 }
 
 // ErrRotationCollision reports that CommitRotation rejected a candidate egress
@@ -80,7 +101,12 @@ var ErrRotationCollision = errors.New("egress IP collides with another manual ro
 // verified the same candidate concurrently cannot both commit it — the loser
 // observes the winner's address under the lock. Dial health stays with
 // MarkRotated, which the caller runs only after a successful commit.
-func (pl *Pool) CommitRotation(p *Proxy, ip string, at time.Time) error {
+//
+// It reports whether the committed address is one this route had already
+// verified — its revisit signal, which the rotation engine aggregates into
+// the global ipRevisits total. A rejected candidate never reaches the record
+// and so reports false with the error.
+func (pl *Pool) CommitRotation(p *Proxy, ip string, at time.Time) (bool, error) {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
 	for _, e := range pl.entries {
@@ -91,11 +117,10 @@ func (pl *Pool) CommitRotation(p *Proxy, ip string, at time.Time) error {
 		collides := e.lastIP != "" && e.lastIP == ip
 		e.mu.Unlock()
 		if collides {
-			return ErrRotationCollision
+			return false, ErrRotationCollision
 		}
 	}
-	p.EndRotation(ip, at)
-	return nil
+	return p.EndRotation(ip, at), nil
 }
 
 // MarkStale returns a route to serving after a rotation that did not change
@@ -180,11 +205,18 @@ func (p *Proxy) LastIP() string {
 // the boot precheck uses it so cross-route collision checks and the status
 // view have a starting point. Unlike EndRotation it records no rotation time,
 // and it never overwrites a known IP: a slow boot probe must not clobber the
-// baseline a rotation recorded while the probe was in flight.
+// baseline a rotation recorded while the probe was in flight. It advances
+// neither successful-rotation counter — no rotation happened — but the
+// baseline joins the route's verified-IP history, so a later rotation that
+// comes back to it is a revisit.
 func (p *Proxy) SetBaselineIP(ip string) {
+	key, indexed := verifiedIPKey(ip)
 	p.mu.Lock()
 	if p.lastIP == "" {
 		p.lastIP = ip
+		if indexed {
+			p.recordVerifiedIP(key)
+		}
 	}
 	p.mu.Unlock()
 }

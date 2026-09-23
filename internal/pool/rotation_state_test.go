@@ -400,7 +400,7 @@ func TestCommitRotationIsAtomicWithCollisionCheck(t *testing.T) {
 			}
 			screened.Done()
 			screened.Wait() // both screens passed; now both commit
-			errs[i] = pl.CommitRotation(p, shared, c.now)
+			_, errs[i] = pl.CommitRotation(p, shared, c.now)
 		}(i)
 	}
 	done.Wait()
@@ -430,10 +430,10 @@ func TestCommitRotationIsAtomicWithCollisionCheck(t *testing.T) {
 	}
 
 	// The rejected address stays refused on retry, and a distinct one commits.
-	if err := pl.CommitRotation(pl.entries[loser], shared, c.now); !errors.Is(err, ErrRotationCollision) {
+	if _, err := pl.CommitRotation(pl.entries[loser], shared, c.now); !errors.Is(err, ErrRotationCollision) {
 		t.Fatalf("re-commit of a held address = %v, want a collision rejection", err)
 	}
-	if err := pl.CommitRotation(pl.entries[loser], "198.51.100.10", c.now); err != nil {
+	if _, err := pl.CommitRotation(pl.entries[loser], "198.51.100.10", c.now); err != nil {
 		t.Fatalf("commit of a distinct address = %v, want nil", err)
 	}
 }
