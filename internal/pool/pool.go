@@ -4,6 +4,7 @@ package pool
 
 import (
 	"math"
+	"net"
 	"net/url"
 	"strings"
 	"sync"
@@ -86,6 +87,49 @@ type Proxy struct {
 	lastRotationAt    time.Time
 	nextRetryIn       time.Duration
 	consecutiveSameIP int
+
+	// rotationCount and ipRevisitCount are the per-route successful-rotation
+	// counters: every verified commit advances rotationCount, and
+	// ipRevisitCount advances with it when the committed address had already
+	// been verified by this same route earlier in its lifetime. Neither
+	// measures failed attempts — consecutiveSameIP does that.
+	rotationCount  int
+	ipRevisitCount int
+
+	// verifiedIPs is the exact, internal history the revisit decision reads:
+	// every IP this route has verified — the baseline and each commit — keyed
+	// by its canonical 16-byte address form so 1.2.3.4 and ::ffff:1.2.3.4 are
+	// one identity. It is lazily allocated, never exposed as a list, never
+	// logged, and deliberately unbounded: an approximation would under-count
+	// exactly when a provider recycles addresses, which is the case the
+	// counter exists to expose. See docs/rotation.md for the memory trade.
+	verifiedIPs map[[16]byte]struct{}
+}
+
+// verifiedIPKey canonicalizes an egress IP into the 16-byte form the history
+// set is keyed by. The second result is false for a value that is not an
+// address literal — impossible for a probe-verified IP (the probe rejects
+// anything net.ParseIP cannot read), possible only for a directly-constructed
+// call. Such a value is still committed as an IP; it is simply not indexed,
+// so it can be neither a revisit nor a match for a later one. Keying by the
+// canonical bytes rather than the original string also matters because
+// parseIPLine returns a substring of the probe response body: retaining those
+// strings would pin the whole body string in a long-lived map.
+func verifiedIPKey(ip string) ([16]byte, bool) {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return [16]byte{}, false
+	}
+	return [16]byte(parsed.To16()), true
+}
+
+// recordVerifiedIP adds one already-canonicalized address to the route's
+// history, allocating the set on first use. Called with p.mu held.
+func (p *Proxy) recordVerifiedIP(key [16]byte) {
+	if p.verifiedIPs == nil {
+		p.verifiedIPs = make(map[[16]byte]struct{})
+	}
+	p.verifiedIPs[key] = struct{}{}
 }
 
 // processStart anchors the cooldown clock. Cooldown deadlines are stored as
@@ -285,13 +329,18 @@ type Status struct {
 
 // RotationStatus is the public rotation view of one manual route. LastIP is
 // the route's own public egress IP — an operational fact operators need to
-// verify rotations, not a credential.
+// verify rotations, not a credential. RotationCount and IPRevisitCount are
+// the successful-rotation counters and are always emitted, so an operator
+// sees an explicit zero; ConsecutiveSameIP is the opposite outcome — attempts
+// that did not change the IP — and the two never describe the same event.
 type RotationStatus struct {
 	State             string `json:"state"`
 	LastIP            string `json:"lastIP,omitempty"`
 	LastRotationAt    string `json:"lastRotationAt,omitempty"`
 	NextRetryIn       string `json:"nextRetryIn,omitempty"`
 	ConsecutiveSameIP int    `json:"consecutiveSameIP"`
+	RotationCount     int    `json:"rotationCount"`
+	IPRevisitCount    int    `json:"ipRevisitCount"`
 }
 
 // Pool is a set of upstream SOCKS routes with least-recently-used round-robin
@@ -754,6 +803,8 @@ func (p *Proxy) rotationStatus() *RotationStatus {
 	rs := &RotationStatus{
 		State:             string(p.rotationState),
 		ConsecutiveSameIP: p.consecutiveSameIP,
+		RotationCount:     p.rotationCount,
+		IPRevisitCount:    p.ipRevisitCount,
 	}
 	rs.LastIP = p.lastIP
 	if !p.lastRotationAt.IsZero() {

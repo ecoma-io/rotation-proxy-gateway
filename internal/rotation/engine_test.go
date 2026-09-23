@@ -450,6 +450,165 @@ func TestProcedureSuccessRecordsNewIP(t *testing.T) {
 	}
 }
 
+// TestProcedureRotationCountersTrackRevisits drives the full A → B → C → A
+// cycle through real procedures and pins the counters against each outcome:
+// every commit advances the per-route rotationCount and the global rotations,
+// and only the return to an address the route had already verified — the
+// boot-recorded baseline A — advances ipRevisitCount and the global
+// ipRevisits.
+func TestProcedureRotationCountersTrackRevisits(t *testing.T) {
+	const baseline = "203.0.113.7"
+	ips := newIPServer(t, baseline)
+	api := newAPIServer(t)
+	spec := manualRoute(t, "m1.test", time.Minute, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+
+	// The boot precheck records A as the route's baseline, which is what makes
+	// the third rotation's return to A a revisit rather than a first sighting.
+	s.e.bootPrecheck(context.Background(), s.gen)
+	if st := snapshotHost(t, s.pl, "m1.test"); st.Rotation.LastIP != baseline {
+		t.Fatalf("baseline = %+v, want %s", st.Rotation, baseline)
+	}
+
+	// The provider rotates on the API call: A → B → C → A.
+	sequence := []string{"198.51.100.9", "198.51.100.10", baseline}
+	var calls atomic.Int64
+	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if n := int(calls.Add(1)); n <= len(sequence) {
+			ips.set(sequence[n-1])
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	for _, want := range []struct {
+		lastIP        string
+		rotationCount int
+		revisitCount  int
+		rotations     uint64
+		ipRevisits    uint64
+	}{
+		{"198.51.100.9", 1, 0, 1, 0},
+		{"198.51.100.10", 2, 0, 2, 0},
+		{baseline, 3, 1, 3, 1},
+	} {
+		s.runOne(spec)
+		st := snapshotHost(t, s.pl, "m1.test")
+		if st.Rotation.State != "idle" || st.Rotation.LastIP != want.lastIP {
+			t.Fatalf("rotation view = %+v, want idle at %s", st.Rotation, want.lastIP)
+		}
+		if st.Rotation.RotationCount != want.rotationCount || st.Rotation.IPRevisitCount != want.revisitCount {
+			t.Fatalf("route counters after %s = %d/%d, want %d/%d", want.lastIP,
+				st.Rotation.RotationCount, st.Rotation.IPRevisitCount, want.rotationCount, want.revisitCount)
+		}
+		if got := s.e.Rotations(); got != want.rotations {
+			t.Fatalf("Rotations after %s = %d, want %d", want.lastIP, got, want.rotations)
+		}
+		if got := s.e.IPRevisits(); got != want.ipRevisits {
+			t.Fatalf("IPRevisits after %s = %d, want %d", want.lastIP, got, want.ipRevisits)
+		}
+	}
+}
+
+// An unchanged-IP procedure is the consecutiveSameIP outcome, not a rotation:
+// the provider declined to move the address, so no counter of either kind may
+// move — least of all ipRevisitCount, which counts successful changes.
+func TestProcedureUnchangedIPIncrementsNeitherCounter(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	api := newAPIServer(t)
+	spec := manualRoute(t, "m1.test", time.Second, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+
+	s.runOne(spec) // the API answers 200 and the IP stays put
+
+	if got := s.e.Rotations(); got != 0 {
+		t.Fatalf("Rotations = %d, want 0", got)
+	}
+	if got := s.e.IPRevisits(); got != 0 {
+		t.Fatalf("IPRevisits = %d, want 0", got)
+	}
+	st := snapshotHost(t, s.pl, "m1.test")
+	if st.Rotation.State != "stale" || st.Rotation.ConsecutiveSameIP != 1 {
+		t.Fatalf("same-IP status = %+v, want a stale route at one same-IP attempt", st.Rotation)
+	}
+	if st.Rotation.RotationCount != 0 || st.Rotation.IPRevisitCount != 0 {
+		t.Fatalf("same-IP counters = %d/%d, want 0/0", st.Rotation.RotationCount, st.Rotation.IPRevisitCount)
+	}
+}
+
+// A rotate API failure that leaves the egress IP unchanged is not a rotation
+// either, however loudly it fails: neither counter moves and the route goes
+// stale exactly as an unchanged 200 does.
+func TestProcedureRotateAPIFailureIncrementsNeitherCounter(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	api := newAPIServer(t)
+	api.status.Store(http.StatusInternalServerError)
+	spec := manualRoute(t, "m1.test", time.Minute, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+
+	s.runOne(spec)
+
+	if got := s.e.Rotations(); got != 0 {
+		t.Fatalf("Rotations = %d, want 0", got)
+	}
+	if got := s.e.IPRevisits(); got != 0 {
+		t.Fatalf("IPRevisits = %d, want 0", got)
+	}
+	st := snapshotHost(t, s.pl, "m1.test")
+	if st.Rotation.State != "stale" {
+		t.Fatalf("failed-API status = %+v, want stale", st.Rotation)
+	}
+	if st.Rotation.RotationCount != 0 || st.Rotation.IPRevisitCount != 0 {
+		t.Fatalf("failed-API counters = %d/%d, want 0/0", st.Rotation.RotationCount, st.Rotation.IPRevisitCount)
+	}
+}
+
+// A candidate rejected because another manual route already holds the address
+// is not a rotation of this route and never becomes history here: the rejected
+// address could not be a revisit even if the same route offered it again.
+func TestProcedureCollisionRejectionIncrementsNeitherCounter(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	api := newAPIServer(t)
+	spec := manualRoute(t, "m2.test", time.Minute, apiSpec(api))
+	other := manualRoute(t, "m1.test", time.Minute, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{other, spec}}
+	s := newSetup(t, cfg, nil, ips)
+
+	p := s.pl.Lookup(routeID(other.RouteSpec))
+	if p == nil {
+		t.Fatal("m1 missing")
+	}
+	const held = "198.51.100.9"
+	p.SetBaselineIP(held)
+
+	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		ips.set(held) // m2's provider hands back m1's current address
+		w.WriteHeader(http.StatusOK)
+	})
+
+	s.runOne(spec)
+
+	if got := s.e.Rotations(); got != 0 {
+		t.Fatalf("Rotations = %d, want 0 (collision)", got)
+	}
+	if got := s.e.IPRevisits(); got != 0 {
+		t.Fatalf("IPRevisits = %d, want 0 (collision)", got)
+	}
+	st := snapshotHost(t, s.pl, "m2.test")
+	if st.Rotation.State != "stale" {
+		t.Fatalf("collision status = %+v, want stale", st.Rotation)
+	}
+	if st.Rotation.RotationCount != 0 || st.Rotation.IPRevisitCount != 0 {
+		t.Fatalf("collision counters = %d/%d, want 0/0", st.Rotation.RotationCount, st.Rotation.IPRevisitCount)
+	}
+	// The route whose address was contested never committed anything either.
+	if st := snapshotHost(t, s.pl, "m1.test"); st.Rotation.RotationCount != 0 || st.Rotation.IPRevisitCount != 0 {
+		t.Fatalf("holder counters = %d/%d, want 0/0", st.Rotation.RotationCount, st.Rotation.IPRevisitCount)
+	}
+}
+
 func TestProcedureSameIPGoesStaleThenRecovers(t *testing.T) {
 	ips := newIPServer(t, "203.0.113.7")
 	api := newAPIServer(t)

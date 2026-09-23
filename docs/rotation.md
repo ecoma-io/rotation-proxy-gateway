@@ -96,7 +96,9 @@ Each attempt runs: **drain → baseline probe → rotate call → verify**.
 4. **Verify.** The gateway re-probes until `ip-check-timeout` elapses. The
    attempt **succeeds only if the reported IP differs from the baseline and is
    not the current IP of any other manual route** (a cross-route collision does
-   not count). Success records the new IP as the route's baseline, clears both
+   not count). Success records the new IP as the route's baseline and advances
+   the route's `rotationCount` — plus its `ipRevisitCount` when the new address
+   is one the route had already verified (see [states](#states)) — clears both
    dial-cooldown scopes learned against the old IP — the route-scope cooldown
    and every pair-scoped (route, target) cooldown, whose refusals were answered
    from the old address — and never clears an authentication block:
@@ -126,16 +128,55 @@ manual route twice and logs a warning when the two probes differ.
 | `verifying` | Mid-procedure: watching for a changed egress IP.                             |
 | `stale`     | Serving; the last attempt(s) did not change the IP; next retry is scheduled. |
 
-Each view additionally shows `lastIP` (the last verified egress IP — this is
-operational data, not a credential), `lastRotationAt` (RFC 3339), `nextRetryIn`
-(stale routes only), and `consecutiveSameIP`. The full `/status` contract is in
+Each view additionally shows:
+
+| Field               | Meaning                                                                                                                                                             |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lastIP`            | The last verified egress IP — operational data, not a credential.                                                                                                   |
+| `lastRotationAt`    | When that rotation was recorded (RFC 3339).                                                                                                                         |
+| `nextRetryIn`       | How long until the next attempt (stale routes only).                                                                                                                |
+| `consecutiveSameIP` | Attempts **in a row that did not change the IP** — the provider declining to rotate. Resets on a verified rotation.                                                 |
+| `rotationCount`     | Successful rotations **this route** has committed: verified, changed, non-colliding IPs. The per-route form of the global `rotations`, whose meaning is unchanged.  |
+| `ipRevisitCount`    | Of those, how many committed an IP **this same route had already verified earlier in its lifetime** — the baseline included. Always emitted, so a zero is explicit. |
+
+A **revisit** is a success that was not a surprise: the rotation worked, the
+egress IP really changed, and the provider handed back an address this route
+had already used. That is a different condition from `consecutiveSameIP`, and an
+operator must not read the two as one failure: `consecutiveSameIP = 4` means
+four consecutive rotation attempts **failed to change the current IP** (the
+provider ignored the call — the route keeps serving and retries with backoff),
+whereas `ipRevisitCount = 3` means three successful rotations **changed the IP
+to an address the route had used before** (the provider's pool is recycling —
+rotations are happening, but the route's egress diversity is not growing). The
+remediation differs too: the first points at the rotate call, the second at the
+size or turnover of the provider's address pool.
+
+Counters move only on a commit. An unchanged attempt, a failed rotate API call,
+a candidate rejected because another manual route currently holds it, and a
+candidate that loses the late-collision race at commit time move neither counter
+and leave no trace in the history. The ordering inside one critical section is:
+verify → commit succeeds → the committed IP's membership in the route's history
+is decided → the IP is recorded → `rotationCount` advances → `ipRevisitCount`
+advances when it was already there.
+
+The history behind `ipRevisitCount` is **internal**: it is never exposed as a
+list, never logged, and never approximated — the count is exact by design,
+because a bounded or probabilistic structure would under-count precisely when a
+provider recycles addresses. The cost is memory: an exact lifetime set of an
+address's 16 canonical bytes plus map overhead per manual route, on the order of
+10 MB per route per year for a route rotating every 90 s. Addresses are compared
+in canonical form, so `1.2.3.4` and `::ffff:1.2.3.4` are one identity. The
+history survives an identity-preserving reload (the same URL, kind, and origin
+keep the same route state); a route whose identity changes starts a fresh
+history, and so do its counters. The full `/status` contract is in
 [observability](observability.md).
 
 ## Reload and shutdown interplay
 
 Manual routes reload like everything else: new or changed entries are picked up
 on the next one-second scheduling cycle, and unchanged identities keep their
-rotation state. A route removed (or whose URL, kind, or origin changes) while
+rotation state — the successful-rotation counters and the verified-IP history
+behind them included. A route removed (or whose URL, kind, or origin changes) while
 its procedure runs has that procedure abandoned at the next checkpoint; the
 provider API is not called again for it and no outcome is recorded.
 
