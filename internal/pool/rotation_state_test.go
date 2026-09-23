@@ -386,6 +386,8 @@ func TestCommitRotationIsAtomicWithCollisionCheck(t *testing.T) {
 	pl := newManualPool(t, c, "socks5://m1:1", "socks5://m2:2")
 	const shared = "198.51.100.9"
 
+	store := storeOver(t, pl)
+
 	var screened, done sync.WaitGroup
 	screened.Add(2)
 	done.Add(2)
@@ -400,7 +402,7 @@ func TestCommitRotationIsAtomicWithCollisionCheck(t *testing.T) {
 			}
 			screened.Done()
 			screened.Wait() // both screens passed; now both commit
-			_, errs[i] = pl.CommitRotation(p, shared, c.now)
+			_, errs[i] = pl.CommitRotation(store, p, shared, c.now)
 		}(i)
 	}
 	done.Wait()
@@ -430,10 +432,10 @@ func TestCommitRotationIsAtomicWithCollisionCheck(t *testing.T) {
 	}
 
 	// The rejected address stays refused on retry, and a distinct one commits.
-	if _, err := pl.CommitRotation(pl.entries[loser], shared, c.now); !errors.Is(err, ErrRotationCollision) {
+	if _, err := pl.CommitRotation(store, pl.entries[loser], shared, c.now); !errors.Is(err, ErrRotationCollision) {
 		t.Fatalf("re-commit of a held address = %v, want a collision rejection", err)
 	}
-	if _, err := pl.CommitRotation(pl.entries[loser], "198.51.100.10", c.now); err != nil {
+	if _, err := pl.CommitRotation(store, pl.entries[loser], "198.51.100.10", c.now); err != nil {
 		t.Fatalf("commit of a distinct address = %v, want nil", err)
 	}
 }

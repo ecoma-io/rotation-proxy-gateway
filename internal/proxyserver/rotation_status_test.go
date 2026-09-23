@@ -37,10 +37,10 @@ func TestAdminStatusExposesRotationCounters(t *testing.T) {
 	// Baseline A, commit B, commit A: two successful rotations, one of them
 	// back onto an address the route had already verified.
 	route.SetBaselineIP("203.0.113.1")
-	if _, err := pl.CommitRotation(route, "203.0.113.2", time.Now()); err != nil {
+	if _, err := pl.CommitRotation(store, route, "203.0.113.2", time.Now()); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	if _, err := pl.CommitRotation(route, "203.0.113.1", time.Now()); err != nil {
+	if _, err := pl.CommitRotation(store, route, "203.0.113.1", time.Now()); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 

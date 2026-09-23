@@ -106,22 +106,54 @@ type Proxy struct {
 	verifiedIPs map[[16]byte]struct{}
 }
 
-// verifiedIPKey canonicalizes an egress IP into the 16-byte form the history
-// set is keyed by. The second result is false for a value that is not an
-// address literal — impossible for a probe-verified IP (the probe rejects
-// anything net.ParseIP cannot read), possible only for a directly-constructed
-// call. Such a value is still committed as an IP; it is simply not indexed,
-// so it can be neither a revisit nor a match for a later one. Keying by the
-// canonical bytes rather than the original string also matters because
-// parseIPLine returns a substring of the probe response body: retaining those
-// strings would pin the whole body string in a long-lived map.
-func verifiedIPKey(ip string) ([16]byte, bool) {
+// IPIdentity returns the canonical identity of an egress-IP literal: the
+// 16-byte form of the address. The second result is false for a value that is
+// not an address literal — impossible for a probe-verified IP (the probe
+// rejects anything net.ParseIP cannot read), possible only for a
+// directly-constructed call. Such a value is still recorded as an IP; it is
+// simply not indexed, so it can be neither a revisit nor a collision match.
+//
+// This is the single definition of "the same egress IP" in the rotation
+// subsystem. IPv4 and IPv4-mapped IPv6 collapse to one identity, as do
+// equivalent IPv6 spellings, so every rotation-path comparison — the baseline
+// check, the unverified-mode current-IP check, the cross-route collision
+// check, and history membership — goes through this function or through
+// CanonicalIP and SameIP, which are built on it. Keying by the canonical bytes
+// rather than the original string also matters because parseIPLine returns a
+// substring of the probe response body: retaining those strings would pin the
+// whole body string in a long-lived map.
+func IPIdentity(ip string) ([16]byte, bool) {
 	parsed := net.ParseIP(ip)
 	if parsed == nil {
 		return [16]byte{}, false
 	}
 	return [16]byte(parsed.To16()), true
 }
+
+// CanonicalIP returns the canonical textual form of an egress-IP literal —
+// what a route records as its last verified IP and what every rotation
+// comparison is made against. Two literals denote the same egress IP exactly
+// when their canonical forms are equal, which is what SameIP states. A value
+// that is not an address literal is returned unchanged, so such a value can
+// only ever match itself.
+//
+// The result is always a fresh string built from the parsed bytes, never a
+// slice of the caller's input: probe IPs are substrings of the ip-check
+// response body, and retaining those would pin the whole body for as long as
+// the route keeps its state.
+func CanonicalIP(ip string) string {
+	key, ok := IPIdentity(ip)
+	if !ok {
+		return ip
+	}
+	return net.IP(key[:]).String()
+}
+
+// SameIP reports whether two IP literals denote the same egress address. It is
+// the comparison the rotation path is written in terms of: the same canonical
+// IP is not a successful rotation, and a different canonical IP is eligible to
+// become one.
+func SameIP(a, b string) bool { return CanonicalIP(a) == CanonicalIP(b) }
 
 // recordVerifiedIP adds one already-canonicalized address to the route's
 // history, allocating the set on first use. Called with p.mu held.

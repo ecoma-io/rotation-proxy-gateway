@@ -1677,3 +1677,417 @@ func TestProcedureLogsPhaseTransitions(t *testing.T) {
 		t.Errorf("no completion record:\n%s", buf.String())
 	}
 }
+
+// armCommitBoundary parks a running procedure at the instant the pool is asked
+// to decide its commit — the clock read that supplies CommitRotation's
+// timestamp, which happens after the engine's fast-path membership check has
+// passed and immediately before the commit's critical section. Nothing reads
+// the clock between a candidate probe returning and that argument, and the
+// candidate is the servedProbes-th probe the ip-check server serves, so waiting
+// for that count parks the procedure deterministically: no sleep, no timing
+// assumption. reached closes once the procedure is parked; release lets it run
+// on into the commit.
+func armCommitBoundary(s *setup, ips *ipServer, servedProbes int32) (reached <-chan struct{}, release func()) {
+	reachedCh, releaseCh := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	base := time.Unix(0, 0)
+	s.e.Now = func() time.Time {
+		if ips.hits.Load() >= servedProbes {
+			once.Do(func() {
+				close(reachedCh)
+				<-releaseCh
+			})
+		}
+		return base
+	}
+	return reachedCh, func() { close(releaseCh) }
+}
+
+// TestProcedureUnchangedAcrossEquivalentAddressForms drives a whole procedure
+// with a provider that answers 200 but hands the same address back in another
+// spelling. No address changed, so nothing counts: neither the per-route nor
+// the global counters move, the route ends stale exactly as an unchanged
+// literal leaves it, and the spelling that arrived is never recorded. This is
+// the comparison that keeps ipRevisitCount meaning "the route returned to an
+// address it had already used", never "the IP did not change".
+func TestProcedureUnchangedAcrossEquivalentAddressForms(t *testing.T) {
+	for _, tc := range []struct{ name, baseline, reported string }{
+		{name: "IPv4 reported in its IPv4-mapped form", baseline: "203.0.113.7", reported: "::ffff:203.0.113.7"},
+		{name: "IPv6 reported in its expanded form", baseline: "2001:db8::1", reported: "2001:0db8:0:0:0:0:0:1"},
+		{name: "IPv6 reported in upper-case hex", baseline: "2001:db8::1", reported: "2001:DB8::1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ips := newIPServer(t, tc.baseline)
+			api := newAPIServer(t)
+			spec := manualRoute(t, "m1.test", time.Second, apiSpec(api))
+			settings := fastSettings()
+			settings.IPCheckTimeout = 150 * time.Millisecond
+			cfg := &config.RuntimeConfig{Rotation: settings, ManualRoutes: []config.ManualRouteSpec{spec}}
+			s := newSetup(t, cfg, nil, ips)
+
+			// The boot precheck records the baseline, so the procedure has a
+			// known starting address to compare the reported one against.
+			s.e.bootPrecheck(context.Background(), s.gen)
+			if got := snapshotHost(t, s.pl, "m1.test").Rotation.LastIP; got != tc.baseline {
+				t.Fatalf("baseline recorded as %q, want %q", got, tc.baseline)
+			}
+
+			api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				ips.set(tc.reported)
+				w.WriteHeader(http.StatusOK)
+			})
+
+			s.runOne(spec)
+
+			if got := s.e.Rotations(); got != 0 {
+				t.Fatalf("Rotations = %d, want 0: the address did not change", got)
+			}
+			if got := s.e.IPRevisits(); got != 0 {
+				t.Fatalf("IPRevisits = %d, want 0: the address did not change", got)
+			}
+			st := snapshotHost(t, s.pl, "m1.test").Rotation
+			if st.State != "stale" || st.ConsecutiveSameIP != 1 {
+				t.Fatalf("status = %+v, want a stale route at one same-IP attempt", st)
+			}
+			if st.RotationCount != 0 || st.IPRevisitCount != 0 {
+				t.Fatalf("counters = %d/%d, want 0/0", st.RotationCount, st.IPRevisitCount)
+			}
+			// The route kept its own spelling of the address: the equivalent
+			// form the provider used was recognized and discarded.
+			if st.LastIP != tc.baseline {
+				t.Fatalf("lastIP = %q, want the unchanged baseline %q", st.LastIP, tc.baseline)
+			}
+		})
+	}
+}
+
+// TestProcedureRevisitAcrossEquivalentAddressForms drives A → B → A where the
+// final A arrives in another spelling. The commit is a rotation, because the
+// address genuinely changed away from B, and it is also a revisit, because A is
+// what the route started on — the two properties are independent, and the pair
+// of counters has to report both. What is recorded is the address, not the
+// spelling it arrived in.
+func TestProcedureRevisitAcrossEquivalentAddressForms(t *testing.T) {
+	const baseline = "203.0.113.1"
+	const mapped = "::ffff:203.0.113.1"
+	ips := newIPServer(t, baseline)
+	api := newAPIServer(t)
+	spec := manualRoute(t, "m1.test", time.Minute, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+
+	// The boot precheck records A as the route's baseline, which is what makes
+	// the second rotation's return to A a revisit rather than a first sighting.
+	s.e.bootPrecheck(context.Background(), s.gen)
+
+	sequence := []string{"203.0.113.2", mapped} // A → B, then back to A
+	var calls atomic.Int64
+	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if n := int(calls.Add(1)); n <= len(sequence) {
+			ips.set(sequence[n-1])
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	for _, want := range []struct {
+		lastIP        string
+		rotationCount int
+		revisitCount  int
+		rotations     uint64
+		ipRevisits    uint64
+	}{
+		{"203.0.113.2", 1, 0, 1, 0},
+		{baseline, 2, 1, 2, 1},
+	} {
+		s.runOne(spec)
+		st := snapshotHost(t, s.pl, "m1.test").Rotation
+		if st.State != "idle" || st.LastIP != want.lastIP {
+			t.Fatalf("rotation view = %+v, want idle at %s", st, want.lastIP)
+		}
+		if st.RotationCount != want.rotationCount || st.IPRevisitCount != want.revisitCount {
+			t.Fatalf("route counters after %s = %d/%d, want %d/%d", want.lastIP,
+				st.RotationCount, st.IPRevisitCount, want.rotationCount, want.revisitCount)
+		}
+		if got := s.e.Rotations(); got != want.rotations {
+			t.Fatalf("Rotations after %s = %d, want %d", want.lastIP, got, want.rotations)
+		}
+		if got := s.e.IPRevisits(); got != want.ipRevisits {
+			t.Fatalf("IPRevisits after %s = %d, want %d", want.lastIP, got, want.ipRevisits)
+		}
+	}
+}
+
+// commitAtBoundaryTest wires one manual route, records a baseline, and runs one
+// successful procedure so the refusal asserted afterwards is measured against
+// values that would visibly move. It returns the setup, the engine's route
+// proxy, the committed address, and the rotate-API handler that hands the
+// second procedure the given candidate.
+func commitAtBoundaryTest(t *testing.T, baseline, committed, candidate string) (*setup, *pool.Proxy, *ipServer, config.ManualRouteSpec) {
+	t.Helper()
+	ips := newIPServer(t, baseline)
+	api := newAPIServer(t)
+	spec := manualRoute(t, "m1.test", time.Minute, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+
+	p := s.pl.Lookup(routeID(spec.RouteSpec))
+	if p == nil {
+		t.Fatal("the route is missing from the pool")
+	}
+	p.SetBaselineIP(baseline)
+
+	var calls atomic.Int64
+	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			ips.set(committed) // the rotation the setup procedure must commit
+		} else {
+			ips.set(candidate) // the candidate the refused commit must not record
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	s.runOne(spec)
+	before := snapshotHost(t, s.pl, "m1.test").Rotation
+	if s.e.Rotations() != 1 || before.LastIP != committed || before.RotationCount != 1 || before.IPRevisitCount != 0 {
+		t.Fatalf("setup rotation = %+v with %d global rotations, want %s committed exactly once",
+			before, s.e.Rotations(), committed)
+	}
+	return s, p, ips, spec
+}
+
+// assertRefusedCommitIsInvisible checks the ledger a leaked commit would have
+// moved: the route's recorded address, both its counters, its last-rotation
+// timestamp, both global aggregates, and the route's service state — a route
+// that no longer serves traffic must not go stale over an attempt the pool
+// refused as a non-rotation, and must not be left rotating.
+func assertRefusedCommitIsInvisible(t *testing.T, s *setup, before pool.RotationStatus) {
+	t.Helper()
+	after := *snapshotHost(t, s.pl, "m1.test").Rotation
+	if after.LastIP != before.LastIP {
+		t.Fatalf("lastIP = %q after the refused commit, want %q", after.LastIP, before.LastIP)
+	}
+	if after.RotationCount != before.RotationCount || after.IPRevisitCount != before.IPRevisitCount {
+		t.Fatalf("counters = %d/%d after the refused commit, want %d/%d unchanged",
+			after.RotationCount, after.IPRevisitCount, before.RotationCount, before.IPRevisitCount)
+	}
+	if after.LastRotationAt != before.LastRotationAt {
+		t.Fatalf("lastRotationAt = %q after the refused commit, want %q", after.LastRotationAt, before.LastRotationAt)
+	}
+	if got := s.e.Rotations(); got != 1 {
+		t.Fatalf("global rotations = %d after the refused commit, want 1 unchanged", got)
+	}
+	if got := s.e.IPRevisits(); got != 0 {
+		t.Fatalf("global ipRevisits = %d after the refused commit, want 0 unchanged", got)
+	}
+	if after.State != "idle" || after.ConsecutiveSameIP != 0 {
+		t.Fatalf("service state = %+v after the refused commit, want idle at zero same-IP attempts "+
+			"(a refused commit is not a rotation failure)", after)
+	}
+}
+
+// TestProcedureCommitBoundaryLosesTheRoute forces the interleave the engine's
+// own membership checks cannot cover, because they are evaluated before the
+// commit and are stale by the time it runs: the procedure reaches the commit
+// boundary — its candidate verified, its fast-path check passed — and only then
+// does a reload remove the route. The pool must refuse the commit as a
+// route-gone result, and the refusal must be invisible in every ledger.
+func TestProcedureCommitBoundaryLosesTheRoute(t *testing.T) {
+	const baseline = "203.0.113.1"
+	const committed = "203.0.113.2"
+	for _, tc := range []struct {
+		name      string
+		candidate string
+		// wantRevisitOnLateCommit is what committing the candidate through the
+		// pre-reload pool must report once the refusal has been asserted: false
+		// because the refused commit left no history entry behind.
+		wantRevisitOnLateCommit bool
+	}{
+		{name: "candidate unknown to the history", candidate: "203.0.113.3"},
+		{name: "candidate the route had already verified", candidate: baseline, wantRevisitOnLateCommit: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, p, ips, spec := commitAtBoundaryTest(t, baseline, committed, tc.candidate)
+			before := *snapshotHost(t, s.pl, "m1.test").Rotation
+
+			// Two probes have already been served by the setup procedure, so
+			// the fourth is this procedure's candidate: parking on the clock
+			// read that follows it parks the commit.
+			reached, release := armCommitBoundary(s, ips, 4)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				s.runOne(spec)
+			}()
+			select {
+			case <-reached:
+			case <-time.After(3 * time.Second):
+				t.Fatal("the procedure never reached the commit boundary")
+			}
+
+			// The candidate is verified and waiting on the pool. The route
+			// leaves the live pool in exactly that instant.
+			s.e.store.Publish(&config.RuntimeConfig{Rotation: fastSettings()})
+			release()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("the procedure kept running after its route was removed")
+			}
+
+			assertRefusedCommitIsInvisible(t, s, before)
+
+			// The procedure unwound as an abort, not as a same-IP outcome: the
+			// route is not stale and is not left holding a rotation marker.
+			if st := snapshotHost(t, s.pl, "m1.test"); !st.Available {
+				t.Fatalf("the route is not serving after the refusal: %+v", st)
+			}
+
+			// The refused candidate never entered the history: committing it
+			// now, through the pre-reload pool that still contains the route,
+			// reports exactly the history state the refusal left behind. That
+			// pool is no longer the live generation, so the commit is addressed
+			// to a generation of its own — the same shape every commit has, not
+			// an exemption from the generation check.
+			revisit, err := s.pl.CommitRotation(
+				pool.NewStore(&config.RuntimeConfig{}, s.pl), p, tc.candidate, time.Unix(0, 0))
+			if err != nil {
+				t.Fatalf("late commit after the refusal = %v, want a successful commit", err)
+			}
+			if revisit != tc.wantRevisitOnLateCommit {
+				t.Fatalf("late commit revisit = %v, want %v (the refused candidate reports the history "+
+					"it should and should not have left)", revisit, tc.wantRevisitOnLateCommit)
+			}
+		})
+	}
+}
+
+// TestProcedureCommitBoundaryReplacementIsNotWritten covers the other way a
+// route can leave the live pool: a reload that keeps the route's URL but
+// changes its identity rebuilds it as fresh state. A procedure still holding
+// the old identity is refused, and the replacement must come out of it
+// completely untouched — it was never that procedure's route.
+func TestProcedureCommitBoundaryReplacementIsNotWritten(t *testing.T) {
+	const baseline = "203.0.113.1"
+	const committed = "203.0.113.2"
+	s, stale, ips, spec := commitAtBoundaryTest(t, baseline, committed, "203.0.113.3")
+	before := *snapshotHost(t, s.pl, "m1.test").Rotation
+
+	reached, release := armCommitBoundary(s, ips, 4)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runOne(spec)
+	}()
+	select {
+	case <-reached:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the procedure never reached the commit boundary")
+	}
+
+	// The reload rebuilds the same URL as a different kind: a new route
+	// identity, with fresh state, in the live pool.
+	replaced := config.ManualRouteSpec{
+		RouteSpec:      config.RouteSpec{URL: spec.URL, Kind: config.EgressV4, Origin: config.RouteOriginManual},
+		RotateInterval: spec.RotateInterval,
+		API:            spec.API,
+	}
+	live := s.e.store.Publish(&config.RuntimeConfig{
+		Rotation:     fastSettings(),
+		ManualRoutes: []config.ManualRouteSpec{replaced},
+	}).Pool
+	release()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the procedure kept running after its route was replaced")
+	}
+
+	assertRefusedCommitIsInvisible(t, s, before)
+
+	next := live.Lookup(routeID(replaced.RouteSpec))
+	if next == nil {
+		t.Fatal("the replacement route is missing from the live pool")
+	}
+	if next == stale {
+		t.Fatal("a kind change reused the old route state")
+	}
+	// A stale procedure must not be able to write into the state that replaced
+	// it: the replacement is fresh in every field, and its service state was
+	// not disturbed by the abandoned procedure's unwind either.
+	replacement := *live.Snapshot()[0].Rotation
+	if replacement.LastIP != "" || replacement.RotationCount != 0 || replacement.IPRevisitCount != 0 {
+		t.Fatalf("the replacement recorded the abandoned procedure's outcome: %+v", replacement)
+	}
+	if replacement.State != "idle" || replacement.ConsecutiveSameIP != 0 || replacement.LastRotationAt != "" {
+		t.Fatalf("the replacement was disturbed by the abandoned procedure: %+v", replacement)
+	}
+}
+
+// TestProcedureCommitBoundaryHoldsAcrossAnIdentityPreservingReload is the
+// counterpart of the two refusals above: the reload changed nothing about this
+// route, so the route is still in the live pool and the rotation that was
+// verified under the old generation is still a rotation. The commit must land
+// — exactly once, in the generation that serves now — rather than being lost
+// because the pool the procedure started against stopped being current.
+//
+// The procedure is parked at the same boundary, so the reload lands while the
+// candidate is verified and waiting. What the commit then addresses is decided
+// at that instant, and the invariant it has to satisfy is the same one every
+// other commit does: the pool is the live one, the route is a member of it, and
+// the collision check passes.
+func TestProcedureCommitBoundaryHoldsAcrossAnIdentityPreservingReload(t *testing.T) {
+	const baseline = "203.0.113.1"
+	const committed = "203.0.113.2"
+	const candidate = "203.0.113.3"
+	s, p, ips, spec := commitAtBoundaryTest(t, baseline, committed, candidate)
+	before := *snapshotHost(t, s.pl, "m1.test").Rotation
+
+	reached, release := armCommitBoundary(s, ips, 4)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runOne(spec)
+	}()
+	select {
+	case <-reached:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the procedure never reached the commit boundary")
+	}
+
+	// The reload republishes the route unchanged: a new pool, but the very same
+	// route state behind it.
+	live := s.e.store.Publish(&config.RuntimeConfig{
+		Rotation:     fastSettings(),
+		ManualRoutes: []config.ManualRouteSpec{spec},
+	}).Pool
+	if live == s.pl {
+		t.Fatal("the reload did not publish a new pool")
+	}
+	if live.Lookup(routeID(spec.RouteSpec)) != p {
+		t.Fatal("an identity-preserving reload must keep the route state, or this test asserts nothing")
+	}
+	release()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the procedure did not finish after the reload")
+	}
+
+	// The rotation landed exactly once, recorded against the generation that is
+	// live now — the route serves the verified address rather than the one it
+	// held before.
+	st := snapshotHost(t, live, "m1.test").Rotation
+	if st == nil || st.State != "idle" || st.LastIP != candidate {
+		t.Fatalf("rotation view = %+v, want idle at the verified %s", st, candidate)
+	}
+	if st.RotationCount != before.RotationCount+1 || st.IPRevisitCount != before.IPRevisitCount {
+		t.Fatalf("counters = %d/%d, want %d/%d: the reload must neither lose nor duplicate the rotation",
+			st.RotationCount, st.IPRevisitCount, before.RotationCount+1, before.IPRevisitCount)
+	}
+	if got := s.e.Rotations(); got != 2 {
+		t.Fatalf("global rotations = %d, want 2: the setup rotation plus this one", got)
+	}
+	if got := s.e.IPRevisits(); got != 0 {
+		t.Fatalf("global ipRevisits = %d, want 0: neither address repeats one the route held", got)
+	}
+}

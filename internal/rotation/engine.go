@@ -9,6 +9,7 @@ package rotation
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"net/url"
 	"sync"
@@ -157,7 +158,7 @@ func (e *Engine) bootPrecheck(ctx context.Context, gen *pool.Generation) {
 			log.Debug().Msg("second boot probe failed; keeping the first baseline")
 			continue
 		}
-		if first != second {
+		if !pool.SameIP(first, second) {
 			log.Warn().Msg("route egress IP changed between boot probes without a rotation; provider IPs are not sticky")
 		}
 		p.SetBaselineIP(second)
@@ -325,11 +326,29 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 		if gone() {
 			return commitAborted
 		}
-		// The live pool decides: a second procedure may have committed this
-		// same candidate between verify's screen above and here, and only the
-		// pool's atomic check-and-record can catch that.
-		revisit, err := e.store.Load().Pool.CommitRotation(p, ip, e.Now())
-		if err != nil {
+		// The live pool decides both remaining questions in one critical
+		// section: whether this route is still a member of it (a reload may
+		// have removed or replaced it since the check above — that check is a
+		// fast path, not the guarantee), and whether a second procedure
+		// committed this same candidate between verify's screen above and
+		// here.
+		//
+		// The commit's timestamp is read before the pool is loaded so the pool
+		// committed into is the one live at the commit, not one observed a
+		// moment earlier: operand order decides which pool the check runs
+		// against, and the later load is the one whose answer is worth having.
+		at := e.Now()
+		revisit, err := e.store.Load().Pool.CommitRotation(e.store, p, ip, at)
+		switch {
+		case errors.Is(err, pool.ErrRotationRouteGone):
+			// The route left the live pool while the procedure was verifying.
+			// Nothing was recorded, and the route this procedure owns no
+			// longer serves traffic, so the attempt must not be reported as a
+			// rotation failure either: unwinding as an abort is what lets the
+			// caller stop without marking the route stale or backing it off.
+			log.Debug().Str("egress_ip", ip).Msg("route left the live pool before the commit")
+			return commitAborted
+		case err != nil: // pool.ErrRotationCollision
 			return commitLateCollision
 		}
 		// 5. Success: the new IP became the baseline, dial health earned by
@@ -430,11 +449,18 @@ func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.M
 			log.Debug().Int("attempt", attempt+1).Str("error", sanitize.ErrorString(err)).Msg("ip check probe failed")
 			continue
 		}
-		if verified && ip == baseline {
+		// Every comparison below is made under the canonical identity the pool
+		// defines, never on the literal the probe returned: two spellings of
+		// one address are one address, so a provider that switches between
+		// them has not rotated anything. A candidate that gets past these
+		// checks therefore differs from the current address — which is what
+		// keeps a revisit (a return to an older, already-verified address) from
+		// ever meaning "the IP did not change".
+		if verified && pool.SameIP(ip, baseline) {
 			log.Debug().Int("attempt", attempt+1).Str("egress_ip", ip).Msg("ip unchanged since the baseline")
 			continue
 		}
-		if !verified && ip == p.LastIP() {
+		if !verified && pool.SameIP(ip, p.LastIP()) {
 			// Without a baseline, an address identical to the route's last
 			// verified one is the provider declining to rotate, not a change;
 			// counting it would inflate the rotations metric.
@@ -442,8 +468,9 @@ func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.M
 			continue
 		}
 		// The collision set comes from the live pool so a reload that added
-		// or removed manual routes mid-procedure is reflected.
-		if e.store.Load().Pool.LastIPs(p)[ip] {
+		// or removed manual routes mid-procedure is reflected. Its keys are
+		// canonical, so the candidate is screened in the same form.
+		if held := e.store.Load().Pool.LastIPs(p); held[pool.CanonicalIP(ip)] {
 			// The "new" IP is another manual route's current address; that
 			// defeats rotating either route. Keep waiting for a distinct one.
 			log.Debug().Int("attempt", attempt+1).Str("egress_ip", ip).Msg("ip collides with another manual route")
