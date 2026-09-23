@@ -472,14 +472,16 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 			exhausted = true
 			break
 		}
+		// Both exits above end the iteration before this pick, so neither can
+		// leave an in-flight hold behind: a hold exists only between the pick
+		// below and the release that closes out the same attempt — an explicit
+		// release on every pre-tunnel failure, or the deferred one the winner
+		// registers further down.
 		p := gen.Pool.PickFor(exclude, s.allow, targetAddr)
 		if p == nil {
 			break
 		}
 		attempts = attempt + 1
-		// The winning pick holds the route for the tunnel's whole lifetime;
-		// earlier excluded attempts release when the handler ends.
-		defer p.Release()
 		if log.Debug().Enabled() {
 			ev := log.Debug().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
 				Int("attempt", attempts).Int("excluded", len(exclude))
@@ -492,6 +494,11 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 		}
 		up, err := s.dialWarmFirst(s.baseCtx, p, target, settings.dialTimeout)
 		if err != nil {
+			// This attempt never established a tunnel, so its in-flight hold
+			// ends here — classified and reported first, then released, at the
+			// same point the route is excluded. Carrying the hold any further
+			// would make the route look busy to a rotation drain, and to
+			// /status, for as long as a later attempt's tunnel lives.
 			switch {
 			case isProxyDialError(err):
 				cooldown := gen.Pool.ReportFailure(p, err)
@@ -500,6 +507,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 					Int("attempt", attempts).Str("error_kind", errorKindProxyConnect).
 					Str("error", logErrorValue(err)).Str("cooldown", cooldown.String()).
 					Msg("upstream dial failed")
+				p.Release()
 			case isConnectTargetError(err):
 				// The endpoint answered CONNECT itself: the route works and
 				// only the (route, target) pair is refused, so the cooldown
@@ -511,6 +519,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 					Int("attempt", attempts).Str("error_kind", errorKindConnectTarget).
 					Str("error", logErrorValue(err)).Str("cooldown", cooldown.String()).
 					Msg("upstream refused connect target")
+				p.Release()
 			case isSocksHandshakeError(err):
 				cooldown := gen.Pool.ReportFailure(p, err)
 				exclude[p] = true
@@ -518,6 +527,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 					Int("attempt", attempts).Str("error_kind", errorKindSocksConnect).
 					Str("error", logErrorValue(err)).Str("cooldown", cooldown.String()).
 					Msg("upstream handshake failed")
+				p.Release()
 			case isProxyAuthError(err):
 				gen.Pool.ReportAuthBlocked(p, err)
 				exclude[p] = true
@@ -525,12 +535,14 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 					Int("attempt", attempts).Str("error_kind", errorKindAuthRoute).
 					Str("error", logErrorValue(err)).
 					Msg("upstream auth failed")
+				p.Release()
 			default:
 				writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the connection closes either way
 				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
 					Int("attempt", attempts).Str("error_kind", logErrorKind(err)).Str("error", logErrorValue(err)).
 					Str("duration", logDuration(time.Since(start))).
 					Msg("upstream setup failed")
+				p.Release()
 				return
 			}
 			// A fallback is a real handoff to another attempt; the final
@@ -557,6 +569,13 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 			Msg("tunnel failed")
 		return
 	}
+	// The winning pick — the one attempt that really established a tunnel —
+	// holds its in-flight slot for the tunnel's whole lifetime, and this
+	// deferred release is the single thing that ends the hold: the relay has
+	// returned and the close record is written by the time serveTunnel exits.
+	// A failed attempt's hold never reaches here; it was released at its own
+	// failure point above.
+	defer chosen.Release()
 	// Framing gets a fresh inbound window: the original deadline may be
 	// nearly spent after a retry chain, and the established tunnel must not
 	// inherit a deadline from its handshake.
