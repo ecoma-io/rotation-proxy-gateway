@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0](https://github.com/ecoma-io/rotation-proxy-gateway/compare/v0.3.1...v0.4.0) (2026-09-23)
+
+
+### Features
+
+* **rotation:** per-route rotationCount and ipRevisitCount in /status ([#63](https://github.com/ecoma-io/rotation-proxy-gateway/issues/63)) ([71b3366](https://github.com/ecoma-io/rotation-proxy-gateway/commit/71b3366bee6ca2c8af23ebdd9e025fdf34cff9b8))
+
+
+### Bug Fixes
+
+* **proxyserver:** release the in-flight hold of a failed attempt immediately ([#65](https://github.com/ecoma-io/rotation-proxy-gateway/issues/65)) ([7ecedf9](https://github.com/ecoma-io/rotation-proxy-gateway/commit/7ecedf916e0549fe83c501eff0b8a6a77af7aa1d))
+* **rotation:** commit a rotation only into the live pool generation ([#70](https://github.com/ecoma-io/rotation-proxy-gateway/issues/70)) ([dbb8c48](https://github.com/ecoma-io/rotation-proxy-gateway/commit/dbb8c489fde8a0a97c9ce6a8534fb6521795e46f)), closes [#67](https://github.com/ecoma-io/rotation-proxy-gateway/issues/67) [#68](https://github.com/ecoma-io/rotation-proxy-gateway/issues/68) [#69](https://github.com/ecoma-io/rotation-proxy-gateway/issues/69)
+
 ## [0.3.1](https://github.com/ecoma-io/rotation-proxy-gateway/compare/v0.3.0...v0.3.1) (2026-09-21)
 
 
