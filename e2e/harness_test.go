@@ -130,15 +130,18 @@ type RotationView struct {
 	LastRotationAt    string `json:"lastRotationAt"`
 	NextRetryIn       string `json:"nextRetryIn"`
 	ConsecutiveSameIP int    `json:"consecutiveSameIP"`
+	RotationCount     int    `json:"rotationCount"`
+	IPRevisitCount    int    `json:"ipRevisitCount"`
 }
 
 // Status is the decoded /status body.
 type Status struct {
-	Version   string `json:"version"`
-	Requests  uint64 `json:"requests"`
-	Failovers uint64 `json:"failovers"`
-	Rotations uint64 `json:"rotations"`
-	Listeners map[string]struct {
+	Version    string `json:"version"`
+	Requests   uint64 `json:"requests"`
+	Failovers  uint64 `json:"failovers"`
+	Rotations  uint64 `json:"rotations"`
+	IPRevisits uint64 `json:"ipRevisits"`
+	Listeners  map[string]struct {
 		Requests  uint64 `json:"requests"`
 		Failovers uint64 `json:"failovers"`
 	} `json:"listeners"`

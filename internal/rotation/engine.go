@@ -48,6 +48,10 @@ type Engine struct {
 	Now func() time.Time
 
 	rotations atomic.Uint64 // completed rotations that observed a changed IP
+	// ipRevisits counts those of them that committed an address the same route
+	// had already verified; it is the global aggregate of the per-route
+	// ipRevisitCount, never larger than rotations.
+	ipRevisits atomic.Uint64
 
 	// dial and probeTLS are seams for tests. Production dials through the
 	// route's SOCKS endpoint and always verifies the ip-check certificate.
@@ -81,6 +85,12 @@ func New(store *pool.Store, log zerolog.Logger) *Engine {
 
 // Rotations reports how many rotations completed with a verified new egress IP.
 func (e *Engine) Rotations() uint64 { return e.rotations.Load() }
+
+// IPRevisits reports how many completed rotations committed an egress IP the
+// same route had already verified earlier in its lifetime — the sum of the
+// per-route ipRevisitCount, aggregated here exactly as Rotations aggregates
+// the per-route rotation counts.
+func (e *Engine) IPRevisits() uint64 { return e.ipRevisits.Load() }
 
 // routeID keys engine state by canonical URL+kind, matching pool.Lookup.
 func routeID(spec config.RouteSpec) string {
@@ -318,7 +328,8 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 		// The live pool decides: a second procedure may have committed this
 		// same candidate between verify's screen above and here, and only the
 		// pool's atomic check-and-record can catch that.
-		if err := e.store.Load().Pool.CommitRotation(p, ip, e.Now()); err != nil {
+		revisit, err := e.store.Load().Pool.CommitRotation(p, ip, e.Now())
+		if err != nil {
 			return commitLateCollision
 		}
 		// 5. Success: the new IP became the baseline, dial health earned by
@@ -326,6 +337,12 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 		p.MarkRotated()
 		e.clearConsecutive(id)
 		e.rotations.Add(1)
+		if revisit {
+			// The provider handed back an address this route had already
+			// verified: the commit is still a rotation, but it did not widen
+			// the route's egress diversity.
+			e.ipRevisits.Add(1)
+		}
 		e.setDue(id, e.Now().Add(spec.RotateInterval))
 		log.Info().Str("egress_ip", ip).Str("next_in", dlog(spec.RotateInterval)).Msg("rotation complete")
 		return commitDone

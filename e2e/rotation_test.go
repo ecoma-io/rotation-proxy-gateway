@@ -282,6 +282,58 @@ func TestRotationDrainTimeoutForceRotates(t *testing.T) {
 	}
 }
 
+// TestRotationIPRevisitCounters drives a provider whose egress IP travels
+// A → B → A through real rotations and asserts the counters /status reports:
+// the route's rotationCount follows every successful commit, ipRevisitCount
+// advances only for the return to A (an address the boot precheck recorded as
+// the route's baseline), and the global ipRevisits mirrors it next to the
+// unchanged rotations total.
+func TestRotationIPRevisitCounters(t *testing.T) {
+	skipShort(t)
+	rt := newRotationTest(t, 1)
+	const baselineIP, secondIP = "203.0.113.1", "198.51.100.9"
+	source := rt.source[rt.sims[0]]
+	var calls atomic.Int64
+	rt.api.OnCall(func() {
+		switch calls.Add(1) {
+		case 1:
+			rt.trace.SetIP(source, secondIP)
+		case 2:
+			rt.trace.SetIP(source, baselineIP)
+		default:
+			// Later rotations move to an address this route has never held,
+			// so a slow observer cannot mistake them for further revisits.
+			rt.trace.SetIP(source, fmt.Sprintf("198.51.100.%d", calls.Load()+20))
+		}
+	})
+
+	cfg := defaultGatewayConfig(nil)
+	cfg.Manual = []ManualRouteConfig{rt.entry(rt.sims[0], "2s")}
+	cfg.Rotation = fastRotation(rt.trace)
+	g := startRotationGateway(t, cfg, rt.trace)
+
+	// Two committed rotations, the second landing back on the baseline that
+	// the boot precheck recorded. The window is one interval wide, so the
+	// third procedure has not had time to commit before we read /status.
+	v := waitRotation(t, g, rt.sims[0], "to commit two rotations ending on a revisit",
+		func(v *RotationView) bool {
+			return v.State == "idle" && v.LastIP == baselineIP &&
+				v.RotationCount == 2 && v.IPRevisitCount == 1
+		}, 20*time.Second)
+	if v.ConsecutiveSameIP != 0 {
+		t.Fatalf("rotation view = %+v, want no same-IP streak alongside the revisits", v)
+	}
+
+	st, err := g.Status()
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if st.Rotations != 2 || st.IPRevisits != 1 {
+		t.Fatalf("global counters rotations=%d ipRevisits=%d, want 2/1\nlogs:\n%s",
+			st.Rotations, st.IPRevisits, g.Logs())
+	}
+}
+
 func TestRotationSameIPBacksOffThenSucceeds(t *testing.T) {
 	skipShort(t)
 	rt := newRotationTest(t, 1)

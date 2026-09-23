@@ -22,16 +22,17 @@ mapped to their loopback equivalent for the probe.
 
 `GET /status` returns JSON with:
 
-| Field       | Meaning                                                                                                  |
-| ----------- | -------------------------------------------------------------------------------------------------------- |
-| `version`   | Build version                                                                                            |
-| `uptime`    | Process uptime (duration string, second precision)                                                       |
-| `requests`  | Global `requests` sum over the proxy listeners                                                           |
-| `failovers` | Global `failovers` sum over the proxy listeners                                                          |
-| `listeners` | Per-listener object (`mixed`, `v4`, `v6` — enabled listeners only), each with `requests` and `failovers` |
-| `pool`      | Array of redacted route states (below)                                                                   |
-| `rotations` | Completed manual-route rotations that observed a changed egress IP                                       |
-| `warmPool`  | Warm-pool view (below)                                                                                   |
+| Field        | Meaning                                                                                                               |
+| ------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `version`    | Build version                                                                                                         |
+| `uptime`     | Process uptime (duration string, second precision)                                                                    |
+| `requests`   | Global `requests` sum over the proxy listeners                                                                        |
+| `failovers`  | Global `failovers` sum over the proxy listeners                                                                       |
+| `listeners`  | Per-listener object (`mixed`, `v4`, `v6` — enabled listeners only), each with `requests` and `failovers`              |
+| `pool`       | Array of redacted route states (below)                                                                                |
+| `rotations`  | Completed manual-route rotations that observed a changed egress IP (process-lifetime total)                           |
+| `ipRevisits` | Of those rotations, the ones that committed an egress IP the same route had already verified (process-lifetime total) |
+| `warmPool`   | Warm-pool view (below)                                                                                                |
 
 Counter semantics:
 
@@ -43,6 +44,13 @@ Counter semantics:
   another attempt. It is a listener metric and is distinct from `rotations`.
 - `rotations` counts completed manual-route rotations that observed a changed
   egress IP.
+- `ipRevisits` counts the subset of those rotations that committed an address
+  the same route had already verified earlier in its lifetime, the baseline
+  included. It is the aggregate of the per-route `ipRevisitCount`, aggregated
+  the same way `rotations` aggregates the per-route `rotationCount`, and it
+  never exceeds `rotations`. A revisit is still a successful rotation; it is
+  not the same condition as `consecutiveSameIP`, which counts attempts that
+  failed to change the IP — see [rotation states](rotation.md#states).
 
 Each route in `pool` carries: `proxy` (always `host:port`, never userinfo),
 `kind`, `origin` (`auto` or `manual`), `available`, `inFlight`,
@@ -56,8 +64,14 @@ set of safe labels, never raw error text. `targetCooldowns` counts the route's
 (route, target) pairs currently cooling from refused CONNECTs and
 `targetFailures` counts those refusals cumulatively — summary counts only,
 never the targets themselves. Manual routes additionally carry a `rotation`
-object (`state`, `lastIP`, `lastRotationAt`, `nextRetryIn`,
-`consecutiveSameIP`) — see [rotation states](rotation.md#states).
+object (`state`, `lastIP`, `lastRotationAt`, `nextRetryIn`, `consecutiveSameIP`,
+`rotationCount`, `ipRevisitCount`) — see [rotation states](rotation.md#states).
+`rotationCount` is that route's successful rotations and `ipRevisitCount` the
+subset of them that returned to an address the route had already verified; both
+are always present, so a zero is explicit, and both are per-route counters that
+survive an identity-preserving reload (a route whose identity changes restarts
+its history). The verified-IP history behind `ipRevisitCount` is internal: it is
+never exposed as a list, never logged, and never approximated.
 
 `warmPool` reports `enabled` (false while the `warm-pool` block is absent or
 says so), `stopped`, `workers`, the configured bounds
