@@ -70,7 +70,10 @@ object (`state`, `lastIP`, `lastRotationAt`, `nextRetryIn`, `consecutiveSameIP`,
 subset of them that returned to an address the route had already verified; both
 are always present, so a zero is explicit, and both are per-route counters that
 survive an identity-preserving reload (a route whose identity changes restarts
-its history). The verified-IP history behind `ipRevisitCount` is internal: it is
+its history). `lastIP` is stored in canonical form — IPv4 and its IPv4-mapped
+IPv6 form are one address, equivalent IPv6 textual forms are one address — and
+every rotation comparison is made under that same identity. The verified-IP
+history behind `ipRevisitCount` is internal: it is
 never exposed as a list, never logged, and never approximated.
 
 `warmPool` reports `enabled` (false while the `warm-pool` block is absent or

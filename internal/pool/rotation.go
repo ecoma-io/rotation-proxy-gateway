@@ -64,15 +64,19 @@ func (p *Proxy) SetRotationPhase(phase RotationState) {
 // an unlocked check cleared: it records unconditionally, so two procedures
 // that verified the same address could both commit it. CommitRotation is the
 // engine's seam — the collision check and this record as one section.
+//
+// The recorded address is stored in canonical form, so what /status shows and
+// what later comparisons are made against is the address itself rather than
+// whichever spelling the provider happened to use (see CanonicalIP).
 func (p *Proxy) EndRotation(ip string, at time.Time) bool {
-	key, indexed := verifiedIPKey(ip)
+	key, indexed := IPIdentity(ip)
 	p.mu.Lock()
 	revisit := false
 	if indexed {
 		_, revisit = p.verifiedIPs[key]
 	}
 	p.rotationState = RotationIdle
-	p.lastIP = ip
+	p.lastIP = CanonicalIP(ip)
 	p.lastRotationAt = at
 	p.nextRetryIn = 0
 	p.consecutiveSameIP = 0
@@ -93,28 +97,63 @@ func (p *Proxy) EndRotation(ip string, at time.Time) bool {
 // address. Fixed text only: it flows into sanitized logs.
 var ErrRotationCollision = errors.New("egress IP collides with another manual route")
 
+// ErrRotationRouteGone reports that CommitRotation rejected a candidate egress
+// IP because the route is no longer part of the live pool: a reload removed it,
+// or rebuilt it under a changed identity, while the procedure was running.
+// Nothing was recorded — not the address, not the counters, not the history —
+// and the caller unwinds its procedure without treating the attempt as a
+// rotation failure. Fixed text only: it flows into sanitized logs.
+var ErrRotationRouteGone = errors.New("route is no longer part of the live pool")
+
 // CommitRotation records ip as p's verified new egress IP and returns the
-// route to serving — unless another manual route in this pool already holds
-// the same address, in which case nothing is written and the caller treats
-// the candidate as rejected, not the rotation as failed. The collision scan
-// and the record are one critical section: two rotation procedures that
-// verified the same candidate concurrently cannot both commit it — the loser
-// observes the winner's address under the lock. Dial health stays with
-// MarkRotated, which the caller runs only after a successful commit.
+// route to serving. Four things are decided as one critical section:
+//
+//   - p is still a member of this pool. A reload that removed or replaced the
+//     route while the procedure was verifying publishes a pool without p, and
+//     a commit landing after that must not record a rotation for a route
+//     nothing serves. The engine's own membership check (gone) cannot decide
+//     this: it reads the store before the commit and is stale by construction
+//     the moment it returns.
+//   - The pool this commit is addressed to is still the live generation's pool.
+//     A reload that published a new generation between loading the store and the
+//     commit means this pool is stale; the procedure must abort without
+//     recording anything.
+//   - No other manual route currently holds the same address, compared under
+//     canonical identity so two spellings of one address collide. Two
+//     procedures that verified the same candidate concurrently cannot both
+//     commit it — the loser observes the winner's address under the lock.
+//   - The record itself, including whether the address is a revisit.
 //
 // It reports whether the committed address is one this route had already
 // verified — its revisit signal, which the rotation engine aggregates into
-// the global ipRevisits total. A rejected candidate never reaches the record
-// and so reports false with the error.
-func (pl *Pool) CommitRotation(p *Proxy, ip string, at time.Time) (bool, error) {
+// the global ipRevisits total. A rejected candidate never reaches the record:
+// it reports false, with ErrRotationCollision or ErrRotationRouteGone. Dial
+// health stays with MarkRotated, which the caller runs only after a commit
+// that returned nil.
+func (pl *Pool) CommitRotation(store *Store, p *Proxy, ip string, at time.Time) (bool, error) {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
+	// A commit is always addressed to a generation: without one there is no
+	// "current" to validate against, so no candidate can be accepted. There is
+	// deliberately no way to skip this check — the only production caller is
+	// the rotation engine, which always passes its store.
+	if store == nil {
+		return false, ErrRotationRouteGone
+	}
+	if cur := store.Load(); cur == nil || cur.Pool != pl {
+		return false, ErrRotationRouteGone
+	}
+	if !pl.containsLocked(p) {
+		return false, ErrRotationRouteGone
+	}
 	for _, e := range pl.entries {
 		if e == p || e.Origin != config.RouteOriginManual {
 			continue
 		}
 		e.mu.Lock()
-		collides := e.lastIP != "" && e.lastIP == ip
+		// e.lastIP is stored canonical, so a candidate in any equivalent
+		// spelling is compared as the same address.
+		collides := e.lastIP != "" && SameIP(e.lastIP, ip)
 		e.mu.Unlock()
 		if collides {
 			return false, ErrRotationCollision
@@ -175,7 +214,9 @@ func (p *Proxy) AbandonRotation() {
 // LastIPs returns the last verified egress IP of every manual route other than
 // exclude. The rotation engine rejects a "new" IP that duplicates one of
 // these: two manual routes serving from the same address defeats the purpose
-// of rotating either.
+// of rotating either. The keys are the canonical form the addresses are stored
+// in (see CanonicalIP), so a caller screening a candidate compares
+// CanonicalIP(candidate) against this set.
 func (pl *Pool) LastIPs(exclude *Proxy) map[string]bool {
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
@@ -210,10 +251,11 @@ func (p *Proxy) LastIP() string {
 // baseline joins the route's verified-IP history, so a later rotation that
 // comes back to it is a revisit.
 func (p *Proxy) SetBaselineIP(ip string) {
-	key, indexed := verifiedIPKey(ip)
+	key, indexed := IPIdentity(ip)
+	canonical := CanonicalIP(ip)
 	p.mu.Lock()
 	if p.lastIP == "" {
-		p.lastIP = ip
+		p.lastIP = canonical
 		if indexed {
 			p.recordVerifiedIP(key)
 		}
@@ -224,12 +266,21 @@ func (p *Proxy) SetBaselineIP(ip string) {
 // Contains reports whether p is part of this pool's route list. The rotation
 // engine re-checks between procedure steps: a reload that removed or replaced
 // the route makes the procedure's proxy stale, and the procedure must abort.
+// It is a membership test only — a procedure's commit re-checks the same thing
+// under the pool lock, since a check made here can be overtaken by a reload
+// before the commit reaches it (see CommitRotation).
 func (pl *Pool) Contains(p *Proxy) bool {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	return pl.containsLocked(p)
+}
+
+// containsLocked is the membership test shared by Contains and CommitRotation.
+// Called with pl.mu held.
+func (pl *Pool) containsLocked(p *Proxy) bool {
 	if p == nil {
 		return false
 	}
-	pl.mu.Lock()
-	defer pl.mu.Unlock()
 	for _, e := range pl.entries {
 		if e == p {
 			return true

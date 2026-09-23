@@ -96,7 +96,10 @@ Each attempt runs: **drain → baseline probe → rotate call → verify**.
 4. **Verify.** The gateway re-probes until `ip-check-timeout` elapses. The
    attempt **succeeds only if the reported IP differs from the baseline and is
    not the current IP of any other manual route** (a cross-route collision does
-   not count). Success records the new IP as the route's baseline and advances
+   not count). Every comparison is made under one canonical IP identity: two
+   spellings of one address — IPv4 and its IPv4-mapped IPv6 form, expanded and
+   compressed IPv6 — are one address, so a provider that switches spellings has
+   not rotated anything. Success records the new IP as the route's baseline and advances
    the route's `rotationCount` — plus its `ipRevisitCount` when the new address
    is one the route had already verified (see [states](#states)) — clears both
    dial-cooldown scopes learned against the old IP — the route-scope cooldown
@@ -164,12 +167,20 @@ list, never logged, and never approximated — the count is exact by design,
 because a bounded or probabilistic structure would under-count precisely when a
 provider recycles addresses. The cost is memory: an exact lifetime set of an
 address's 16 canonical bytes plus map overhead per manual route, on the order of
-10 MB per route per year for a route rotating every 90 s. Addresses are compared
-in canonical form, so `1.2.3.4` and `::ffff:1.2.3.4` are one identity. The
-history survives an identity-preserving reload (the same URL, kind, and origin
-keep the same route state); a route whose identity changes starts a fresh
-history, and so do its counters. The full `/status` contract is in
-[observability](observability.md).
+10 MB per route per year for a route rotating every 90 s.
+
+Every rotation-path comparison that means "is this the same egress IP" uses the
+same canonical identity — the 16-byte form of the address, with IPv4 and its
+IPv4-mapped IPv6 form one identity and equivalent IPv6 textual forms one
+identity. It governs the baseline check, the unverified-mode current-IP check,
+the cross-route collision check, and history membership alike, and what gets
+recorded as `lastIP` is always the canonical text, never the spelling a probe
+happened to return. It is also deliberately distinct from the revisit question:
+a successful rotation **may still be a revisit**, and `ipRevisitCount` never
+means "the IP did not change". The history survives an identity-preserving
+reload (the same URL, kind, and origin keep the same route state); a route whose
+identity changes starts a fresh history, and so do its counters. The full
+`/status` contract is in [observability](observability.md).
 
 ## Reload and shutdown interplay
 
@@ -179,6 +190,30 @@ rotation state — the successful-rotation counters and the verified-IP history
 behind them included. A route removed (or whose URL, kind, or origin changes) while
 its procedure runs has that procedure abandoned at the next checkpoint; the
 provider API is not called again for it and no outcome is recorded.
+
+The checkpoint the removal check cannot cover is the commit itself. A commit is
+always addressed to a generation, and it decides three things as one critical
+section under the pool lock, **atomically with recording the candidate**:
+
+- the pool it is addressed to is still the generation's live pool;
+- the route is still a member of that pool;
+- no other manual route claims the candidate IP.
+
+Both of the first two are needed. A reload publishes a whole new pool, so a
+procedure still holding the one it started against addresses a pool that no
+longer serves — even when the reload changed nothing about this route, in which
+case the route state is deliberately reused and the same route **is** a member
+of the new pool. Membership alone therefore cannot tell that case apart from a
+current commit, and the generation itself is what is compared.
+
+A commit that fails either check is refused as route-gone: nothing is recorded —
+no `lastIP`, no `lastRotationAt`, no counters, no history, no global aggregates —
+and the procedure unwinds without treating the attempt as a rotation failure, so
+a route no longer serving traffic is never reported stale. The commit result is
+exactly `success | collision | route-gone`; a commit that is not addressed to
+the live pool can never produce a successful rotation event, and a rotation
+verified just before an identity-preserving reload still commits — exactly once,
+into the generation that serves now.
 
 Shutdown cancels the rotation engine first, so every mid-flight procedure stops
 immediately and leaves the route in its last serving state; rotations never

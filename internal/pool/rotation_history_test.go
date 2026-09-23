@@ -9,11 +9,26 @@ import (
 	"rotation-proxy-gateway/internal/config"
 )
 
+// storeOver returns a Store whose live generation is pool pl itself: commits
+// made through it are addressed to the generation that currently serves, which
+// is what production always does. Tests that deliberately commit against a
+// pool a reload has already replaced pass the real store instead.
+func storeOver(t *testing.T, pl *Pool) *Store {
+	t.Helper()
+	cfg := &config.RuntimeConfig{}
+	for _, e := range pl.entries {
+		cfg.ManualRoutes = append(cfg.ManualRoutes, config.ManualRouteSpec{
+			RouteSpec: config.RouteSpec{URL: e.URL, Kind: e.Kind, Origin: e.Origin},
+		})
+	}
+	return NewStore(cfg, pl)
+}
+
 // commitVerified commits ip as a verified rotation of p and fails the test when
 // the pool rejects the candidate; it returns the revisit signal.
 func commitVerified(t *testing.T, pl *Pool, p *Proxy, ip string, at time.Time) bool {
 	t.Helper()
-	revisit, err := pl.CommitRotation(p, ip, at)
+	revisit, err := pl.CommitRotation(storeOver(t, pl), p, ip, at)
 	if err != nil {
 		t.Fatalf("CommitRotation(%q) = %v, want a successful commit", ip, err)
 	}
@@ -169,7 +184,7 @@ func TestRejectedCollisionLeavesCountersAndHistoryUntouched(t *testing.T) {
 		t.Fatal("the winner's first commit reported a revisit")
 	}
 	// The loser screened the address before the winner committed it.
-	revisit, err := pl.CommitRotation(loser, shared, c.now)
+	revisit, err := pl.CommitRotation(storeOver(t, pl), loser, shared, c.now)
 	if !errors.Is(err, ErrRotationCollision) {
 		t.Fatalf("lost race commit = %v, want ErrRotationCollision", err)
 	}
