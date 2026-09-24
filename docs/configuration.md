@@ -116,6 +116,97 @@ identity is the endpoint URL alone.
 Credentials never appear in errors, logs, or `/status`
 ([observability](observability.md)).
 
+### Route IDs
+
+Every route may carry an `id` — the operator-facing label that
+[routing rules](#request-routing-routing-block) refer to and `/status` shows:
+
+```yaml
+proxies:
+  auto:
+    - id: egress-a
+      proxy: username:password@provider.example:1080
+      kind: v4
+```
+
+An id is 1–128 characters of letters, digits, hyphens, and underscores. That
+grammar is also the log-safety guarantee: ids appear in configuration errors,
+`/status`, and debug logs, so nothing that reads as another field or carries
+whitespace is admitted. Ids must be unique across `proxies.auto` and
+`proxies.manual` combined — two routes answering to one label could be picked
+twice per request and would make every rule that names the label ambiguous.
+
+An id is a routing label, not the route's identity. Route identity stays
+canonical URL+kind+origin: renaming an id keeps the route's health state
+(cooldowns, counters, rotation history) exactly as any other
+identity-preserving reload does, and `/status` shows the new label from the
+moment the reload publishes. Ids are optional while no `routing` block exists;
+once one does, every serving route must carry an id — an unnamed route could
+never appear in a rule, and silently letting it serve outside every rule would
+narrow the pool behind the operator's back.
+
+### Request routing (`routing` block)
+
+The optional `routing` block scopes which routes each inbound CONNECT target
+may use. Without it (the default), every listener selects from the whole pool
+exactly as the rest of this document describes. With it, each target resolves
+to a **candidate set**, and the pool — still the sole authority on health,
+cooldown, order, and kind filtering — picks among exactly those candidates:
+
+```yaml
+routing:
+  rules:
+    - match:
+        domains:
+          - api.openai.com
+          - "*.openai.com"
+      routes:
+        - egress-a
+        - egress-b
+  default-routes:
+    - rotating-a
+```
+
+- **First match wins.** Rules are evaluated in order against the target's
+  hostname; the first rule whose patterns match decides the candidate set.
+  Later rules never merge into an earlier match.
+- **Only domain targets match.** A CONNECT sent as ATYP=DOMAIN (`0x03`) is
+  matched against the rules; IPv4 and IPv6 targets carry no hostname, so they
+  always resolve to `default-routes`. The gateway never reverse-resolves an
+  address to a name: routing follows what the client actually sent, not what
+  DNS would say.
+- **Matching is normalized and label-bound.** Names compare case-insensitively
+  with one trailing DNS dot ignored — `API.OpenAI.com.` matches
+  `api.openai.com`. A pattern is either a hostname or `*.` followed by a
+  hostname; `*.openai.com` matches `api.openai.com` and `a.b.openai.com`, never
+  `openai.com` itself (that is what the exact pattern is for) and never
+  `evilopenai.com` (the dot is the label boundary). The wire target is never
+  rewritten: whatever bytes arrive travel to the outbound CONNECT untouched.
+- **Unmatched targets resolve to `default-routes`.** Omit the key and an
+  unmatched target has no candidates at all: it receives the ordinary `05 01`
+  general failure and nothing else in the pool is contacted. An explicit empty
+  `default-routes: []` is rejected — omit the key for the same, documented
+  result.
+- **The block is deliberate.** A null `routing:` key means the block is absent
+  (unrestricted). A present-but-empty `routing: {}` is the configured kill
+  switch: every target fails closed unless a future rule admits it. Removing
+  the block restores unrestricted selection on the next reload.
+
+Validation is at load time, in one pass with the rest of the config: a rule
+with no domains or no routes, an unknown pattern form (anything beyond exact
+or a leading `*.`), a route id a rule or `default-routes` names but no route
+carries, or a route left unnamed are all rejected. A rejected routing block
+rejects the whole configuration, so on reload the last-known-good policy keeps
+serving, exactly like any other invalid change.
+
+The routing policy rides the same atomic generation as the pool and its
+routes: a reload that changes rules and routes together publishes both as one
+unit, and in-flight requests finish on the generation they started with.
+Renaming a route's id is a routing change, not a health change — but note the
+one transient: an in-flight request on the old generation may find a just-
+renamed route absent from its candidate set and fail closed (`05 01`), never
+open.
+
 ### Rejected configuration
 
 Unknown active YAML fields are rejected (strict decoding), which is what makes
@@ -191,7 +282,8 @@ The following settings apply to new client operations without restart:
 - `max-retries`
 - `cooldown.base` and `cooldown.max` (new dial failures only)
 - `dial-timeout`
-- `proxies.auto` and `proxies.manual`
+- `proxies.auto` and `proxies.manual`, their `id` labels included
+- the whole `routing` block (rules, `default-routes`, presence and absence)
 - every `rotation.*` setting (the scheduler reads them per cycle; a procedure
   already running keeps its own `drain-timeout` and probe settings)
 - every `warm-pool.*` setting (disabling the pool closes its parked
@@ -204,5 +296,6 @@ state: recency pass, cooldown, pair-scoped target cooldowns,
 authentication-block, rotation state (last verified IP, stale history), and
 counters. Changing the URL (including its userinfo) or `kind` — or moving a
 route between `proxies.auto` and `proxies.manual` — creates a fresh route
-state. See [failure and route health](failure-and-health.md) for what that
-state is.
+state. Renaming a route's `id` preserves all of it: the id is a routing label,
+not the route's identity. See
+[failure and route health](failure-and-health.md) for what that state is.

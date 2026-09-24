@@ -90,10 +90,18 @@ proxies:
   # accepted forms are host:port, user:pass@host:port, and
   # host:port:user:pass. A line containing socks5:// or any other scheme is
   # rejected. Bracket IPv6 literals.
+  #
+  # `id` is the optional operator-facing route label that routing rules refer
+  # to (see the routing block below). Ids must be unique across auto and
+  # manual routes, and every route must carry one when a routing block is
+  # present. Renaming an id changes routing only — the route's health state
+  # is keyed by its URL+kind+origin and survives the rename.
   auto:
-    - proxy: username:password@v4-provider.example:1080
+    - id: egress-a
+      proxy: username:password@v4-provider.example:1080
       kind: v4
-    - proxy: username:password@[2001:db8::1]:1080
+    - id: egress-b
+      proxy: username:password@[2001:db8::1]:1080
       kind: v6
 
   # API-rotated routes. The provider swaps the route's public egress IP when
@@ -101,7 +109,8 @@ proxies:
   # rotate-interval, drains the route first, and verifies the IP actually
   # changed afterwards.
   manual:
-    - proxy: username:password@v6-provider.example:1080
+    - id: rotating-a
+      proxy: username:password@v6-provider.example:1080
       kind: v6
       # Minimum time between two rotations of this route. It is also the
       # first backoff step when a rotation did not change the IP.
@@ -120,3 +129,33 @@ proxies:
             "token": "xxxx"
           }
         timeout: 10s
+
+# Optional domain-based request routing. Absent (the default), every listener
+# selects from the whole pool exactly as before the block existed. Present, it
+# narrows which routes each target may use — first matching rule wins, and an
+# unmatched target resolves to default-routes (or to no route at all, receiving
+# the ordinary 05 01 general failure). It never overrides health: the pool
+# still decides which candidate is picked, still cools and auth-blocks, and
+# still round-robins inside the candidate set.
+#
+# Only CONNECT targets sent as domain names (ATYP=0x03) can match a rule; IP
+# targets always resolve to the default set. Names compare case-insensitively
+# with one trailing DNS dot ignored. `*.openai.com` matches api.openai.com and
+# a.b.openai.com — never openai.com itself and never evilopenai.com — and the
+# only wildcard form is a leading `*.`.
+#
+# Every rule needs at least one domain and one route; every listed id must
+# name a configured route; every serving route must carry an id once this
+# block exists. Omit default-routes entirely when unmatched targets should
+# fail closed (an explicit empty list is rejected).
+# routing:
+#   rules:
+#     - match:
+#         domains:
+#           - api.openai.com
+#           - "*.openai.com"
+#       routes:
+#         - egress-a
+#         - rotating-a
+#   default-routes:
+#     - egress-b

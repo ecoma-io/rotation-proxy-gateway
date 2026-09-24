@@ -53,7 +53,9 @@ Counter semantics:
   failed to change the IP — see [rotation states](rotation.md#states).
 
 Each route in `pool` carries: `proxy` (always `host:port`, never userinfo),
-`kind`, `origin` (`auto` or `manual`), `available`, `inFlight`,
+`kind`, `origin` (`auto` or `manual`), `id` (the operator-facing
+[routing label](configuration.md#route-ids); omitted when the route is
+unnamed), `available`, `inFlight`,
 `consecutiveFailures`, `cooldownFor`, `successes`, `failures`, `lastDialError`
 (when set), `authFailures`, `authBlocked`, `lastAuthError` (when set), and the
 pair-scoped summary counts `targetCooldowns` and `targetFailures`. `failures`
@@ -100,7 +102,12 @@ Each request has a process-local `request_id`. Log lines additionally include
 counts, the error kind (`proxy_connect`, `auth_route`, `socks_connect`,
 `connect_target`, `setup`, `no_route`, `retry_exhausted`), and the applied
 cooldown for endpoint
-dial, SOCKS handshake, and refused connect-target failures. They never log
+dial, SOCKS handshake, and refused connect-target failures. With a
+[routing block](configuration.md#request-routing-routing-block) configured,
+`route selected` (debug) carries the picked route's `route_id`, and the
+terminal `tunnel failed` (warn) carries `routing_candidates` — the size of the
+candidate set the policy left open for that target (absent when no routing
+block is configured; `0` is the fail-closed unmatched target). They never log
 full URLs, headers, bodies, userinfo, the inbound account, or the rotate-API
 configuration.
 

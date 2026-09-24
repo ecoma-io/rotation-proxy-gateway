@@ -4,7 +4,9 @@
 SOCKS5 (RFC 1928) endpoints and routes connections through a health-aware pool
 of **SOCKS5-only** upstream routes. It runs three inbound proxy listeners —
 one mixed egress family, one IPv4-only, one IPv6-only — over a single shared
-route-health pool.
+route-health pool. An optional routing block scopes any domain target to a
+candidate set of named routes; the pool stays the sole authority on health,
+cooldowns, and selection order.
 
 <p align="center">
   <a href="https://github.com/ecoma-io/rotation-proxy-gateway/actions/workflows/ci.yml"><img src="https://github.com/ecoma-io/rotation-proxy-gateway/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
@@ -40,6 +42,15 @@ the available family, and the enabled dedicated listener without matching routes
 remains live but replies with the ordinary no-route SOCKS general-failure
 (`05 01`) until that family is added.
 
+Domain-based request routing is optional and configured in the runtime YAML:
+rules map domain patterns (exact or `*.`-prefixed) to candidate route sets,
+first match wins, and unmatched targets resolve to `default-routes` or fail
+closed with `05 01`. Only domain targets match rules — IP targets and the
+wire bytes are never rewritten — and routing never overrides health: the pool
+still decides which candidate serves. See
+[configuration](docs/configuration.md#request-routing-routing-block) and
+[failure and route health](docs/failure-and-health.md#routing-and-selection).
+
 ## Quick start
 
 ```bash
@@ -64,8 +75,9 @@ bootstrap variable carries the `RPGW_` prefix;
 ## Documentation
 
 - [Configuration](docs/configuration.md) — bootstrap environment variables
-  (`RPGW_*`), the runtime YAML (routes, cooldown, rotation, warm pool) and its
-  validation rules, and hot-reload behavior including the bind-mount table.
+  (`RPGW_*`), the runtime YAML (routes and their ids, cooldown, rotation, warm
+  pool, the domain-routing block) and its validation rules, and hot-reload
+  behavior including the bind-mount table.
 - [Manual rotation routes](docs/rotation.md) — provider-API routes that rotate
   their public egress IP: the procedure contract (drain → baseline probe →
   rotate call → verify), states, backoff, and reload/shutdown interplay.
