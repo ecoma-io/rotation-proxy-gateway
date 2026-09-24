@@ -431,9 +431,11 @@ func (s *Server) serveConn(conn net.Conn) {
 
 // serveTunnel dials the target through the pool with the retry/exclude loop,
 // sends the success reply once, and relays until either side ends the stream.
-// It loads one generation for the whole session so route picks and health
-// reports stay consistent across reloads. handshakeDeadline is the inbound
-// framing window serveConn armed; the retry chain must fit inside it.
+// It loads one generation for the whole session so route picks, health
+// reports, and the routing policy stay consistent across reloads — a
+// target's candidate set always comes from the same snapshot as the pool it
+// narrows. handshakeDeadline is the inbound framing window serveConn armed;
+// the retry chain must fit inside it.
 func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, handshakeDeadline time.Time, log zerolog.Logger) {
 	gen := s.generation()
 	settings := generationSettings(gen)
@@ -444,6 +446,23 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 	targetAddr := target.Addr()
 	logTarget := socksTargetLogValue(targetAddr)
 	log.Debug().Str("target", logTarget).Msg("tunnel start")
+
+	// Routing resolves the target before the first pick. A nil set means no
+	// routing policy applies: the listener's kind filter alone, the
+	// historical path with no per-request allocation. A non-nil set — empty
+	// included — is the complete candidate scope: the pool stays the sole
+	// authority on health, cooldown, and order, but only routes the set
+	// names can be picked. The closure is built once per tunnel and reused
+	// by every attempt, so a fallback never leaves the target's routing
+	// scope.
+	candidates := gen.Router.Match(target)
+	allow := s.allow
+	if candidates != nil {
+		restricted, listenerAllow := candidates, s.allow
+		allow = func(p *pool.Proxy) bool {
+			return (listenerAllow == nil || listenerAllow(p)) && restricted.Allows(p.RouteID())
+		}
+	}
 
 	exclude := map[*pool.Proxy]bool{}
 	var upstream net.Conn
@@ -480,14 +499,15 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 		// below and the release that closes out the same attempt — an explicit
 		// release on every pre-tunnel failure, or the deferred one the winner
 		// registers further down.
-		p := gen.Pool.PickFor(exclude, s.allow, targetAddr)
+		p := gen.Pool.PickFor(exclude, allow, targetAddr)
 		if p == nil {
 			break
 		}
 		attempts = attempt + 1
 		if log.Debug().Enabled() {
 			ev := log.Debug().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
-				Int("attempt", attempts).Int("excluded", len(exclude))
+				Int("attempt", attempts).Int("excluded", len(exclude)).
+				Str("route_id", p.RouteID())
 			// A pick from the all-cooling fallback arrives with cooldown left;
 			// the size of that bet is the whole point of the line.
 			if cd := gen.Pool.CoolingFor(p, targetAddr); cd > 0 {
@@ -565,11 +585,19 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 			kind = errorKindRetryExhausted
 		}
 		writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the connection closes either way
-		log.Warn().Str("target", logTarget).Int("attempts", attempts).
+		// The three counts read as one funnel: the pool's whole size, the
+		// listener's kind view of it, and — when routing restricts this
+		// target — the candidate scope the policy left open. routing_candidates
+		// absent means no routing block is configured; 0 present is the
+		// fail-closed unmatched target.
+		ev := log.Warn().Str("target", logTarget).Int("attempts", attempts).
 			Int("pool_size", gen.Pool.Size()).Int("kind_routes", gen.Pool.CountAllowed(s.allow)).
 			Int("excluded", len(exclude)).
-			Str("error_kind", kind).Str("duration", logDuration(time.Since(start))).
-			Msg("tunnel failed")
+			Str("error_kind", kind).Str("duration", logDuration(time.Since(start)))
+		if candidates != nil {
+			ev = ev.Int("routing_candidates", candidates.Size())
+		}
+		ev.Msg("tunnel failed")
 		return
 	}
 	// The winning pick — the one attempt that really established a tunnel —

@@ -57,6 +57,18 @@ type Proxy struct {
 	// across a rotation, whatever way the procedure ends.
 	rotationEpoch atomic.Uint64
 
+	// id is the route's operator-facing routing label — the name routing
+	// rules and the default set refer to. It is identity-adjacent but
+	// deliberately not identity: canonical URL+kind+origin stays the reload
+	// and health key, so renaming an id never resets health. The atomic
+	// pointer exists because Reconfigure retains the same *Proxy across an
+	// id rename: the new label must become visible to every reader without
+	// locks on the pick path. The swap is one-directional — a request still
+	// serving on the old generation may find a renamed route absent from its
+	// candidate set and fail closed (no_route at worst), but can never be
+	// handed a route outside the scope its generation's router computed.
+	id atomic.Pointer[string]
+
 	// Pair-scoped cooldown state: (route, target) refusals recorded by
 	// ReportTargetFailure — an upstream that answered CONNECT itself with a
 	// non-zero reply code is healthy, so the damage lands on the pair instead
@@ -179,10 +191,32 @@ func newProxy(route config.RouteSpec, anchor uint64) *Proxy {
 	origin := effectiveOrigin(route.Origin)
 	p := &Proxy{URL: route.URL, Kind: route.Kind, Origin: origin}
 	p.pass.Store(anchor)
+	p.setRouteID(route.ID)
 	if origin == config.RouteOriginManual {
 		p.rotationState = RotationIdle
 	}
 	return p
+}
+
+// RouteID returns the route's operator-facing routing label, empty when the
+// route is unnamed. /status exposes it; logs may quote it because the config
+// grammar guarantees it is log-safe.
+func (p *Proxy) RouteID() string {
+	if id := p.id.Load(); id != nil {
+		return *id
+	}
+	return ""
+}
+
+// setRouteID publishes the routing label. Reconfigure calls it on retained
+// entries so an id rename lands on the same health state instead of cloning
+// the route; readers go through the atomic and need no lock.
+func (p *Proxy) setRouteID(id string) {
+	if id == "" {
+		p.id.Store(nil)
+		return
+	}
+	p.id.Store(&id)
 }
 
 // effectiveOrigin treats an unset origin as auto: hand-built RouteSpecs may
@@ -344,6 +378,7 @@ type Status struct {
 	Proxy               string            `json:"proxy"`
 	Kind                config.EgressKind `json:"kind"`
 	Origin              string            `json:"origin"`
+	ID                  string            `json:"id,omitempty"`
 	Available           bool              `json:"available"`
 	InFlight            int               `json:"inFlight"`
 	ConsecutiveFailures int               `json:"consecutiveFailures"`
@@ -405,8 +440,9 @@ func NewRoutes(routes []config.RouteSpec, base, max time.Duration) *Pool {
 // retained only for canonical URL+kind+origin matches; moving a route between
 // proxies.auto and proxies.manual rebuilds it because its role changed.
 // Retained entries keep their health state, pair-scoped target cooldowns
-// included, exactly as their route cooldowns. Existing in-flight operations
-// may safely keep using the original pool.
+// included, exactly as their route cooldowns, and their routing label is
+// synced to the incoming spec so an id rename lands on the same state.
+// Existing in-flight operations may safely keep using the original pool.
 func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration) *Pool {
 	pl.mu.Lock()
 	entries := append([]*Proxy(nil), pl.entries...)
@@ -431,6 +467,7 @@ func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration) 
 	next := make([]*Proxy, 0, len(routes))
 	for _, route := range routes {
 		if prior, ok := kept[routeKey(route.URL, route.Kind, route.Origin)]; ok {
+			prior.setRouteID(route.ID)
 			next = append(next, prior)
 		} else {
 			next = append(next, newProxy(route, minPass))
@@ -807,6 +844,7 @@ func (pl *Pool) Snapshot() []Status {
 			Proxy:               e.URL.Host,
 			Kind:                e.Kind,
 			Origin:              string(e.Origin),
+			ID:                  e.RouteID(),
 			Available:           !e.authBlocked.Load() && !e.rotating.Load() && !cooling,
 			InFlight:            int(e.inFlight.Load()),
 			ConsecutiveFailures: e.consecutiveFailures,

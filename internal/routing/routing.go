@@ -156,7 +156,11 @@ func Compile(spec Spec) (*Router, error) {
 }
 
 // compilePattern normalizes one domain pattern into either an exact hostname
-// (wild "") or a wildcard suffix of the form ".suffix" (wild non-empty).
+// (wild "") or a wildcard suffix of the form ".suffix" (wild non-empty). The
+// wildcard marker is checked after normalization, so a pattern's trailing
+// DNS dot is stripped first: "*.example.com." compiles like
+// "*.example.com", and a bare "*" or "*." fails hostname validation as the
+// label "*" — the only wildcard form is "*.example.com".
 func compilePattern(pattern string) (exact, wild string, err error) {
 	if strings.TrimSpace(pattern) != pattern || pattern == "" {
 		return "", "", errors.New("domain pattern must not be empty or padded with whitespace")
@@ -166,9 +170,6 @@ func compilePattern(pattern string) (exact, wild string, err error) {
 	host := normalized
 	if wildcard {
 		host = normalized[len("*."):]
-	}
-	if host == "" {
-		return "", "", errors.New(`domain pattern "*" must name a domain: the only wildcard form is "*.example.com"`)
 	}
 	if err := validateHostname(host); err != nil {
 		return "", "", fmt.Errorf("invalid domain pattern %q: %w", pattern, err)
