@@ -181,7 +181,7 @@ func TestReplenishFillsToMinIdle(t *testing.T) {
 	w.MinIdlePerProxy = 2
 	store, _ := warmStore(w, mustURL(t, "socks5://"+srv.addr))
 	wp := newTestPool(store)
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 
 	wp.sweep()
 	drain(wp)
@@ -209,7 +209,7 @@ func TestPerRouteAndTotalBoundsHold(t *testing.T) {
 	w.MaxTotalIdle = 10
 	store, proxies := warmStore(w, mustURL(t, "socks5://"+srvA.addr), mustURL(t, "socks5://"+srvB.addr))
 	wp := newTestPool(store)
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 
 	wp.sweep()
 	drain(wp)
@@ -233,7 +233,7 @@ func TestGlobalCapLimitsRefill(t *testing.T) {
 	w.MaxTotalIdle = 1
 	store, proxies := warmStore(w, mustURL(t, "socks5://"+srvA.addr), mustURL(t, "socks5://"+srvB.addr))
 	wp := newTestPool(store)
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 
 	wp.sweep()
 	drain(wp)
@@ -283,7 +283,7 @@ func TestPerRouteReplenishCapHolds(t *testing.T) {
 		}
 		return socksdial.DialHalf(ctx, pu, timeout)
 	})
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 
 	wp.sweep()
 	t1, ok := wp.claimTask()
@@ -334,7 +334,7 @@ func TestBorrowPopsOldestAndMissesWhenEmpty(t *testing.T) {
 	srv := newHalfServer(t, "ok")
 	store, proxies := warmStore(defaultWarm(), mustURL(t, "socks5://"+srv.addr))
 	wp := newTestPool(store)
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 
 	wp.sweep()
 	drain(wp)
@@ -360,7 +360,7 @@ func TestRotationInvalidatesAndBlocksReplenish(t *testing.T) {
 	srv := newHalfServer(t, "ok")
 	store, proxies := warmStore(defaultWarm(), mustURL(t, "socks5://"+srv.addr))
 	wp := newTestPool(store)
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 
 	wp.sweep()
 	drain(wp)
@@ -405,7 +405,7 @@ func TestMidDialRotationDiscardsFreshConn(t *testing.T) {
 	srv := newHalfServer(t, "ok")
 	store, proxies := warmStore(defaultWarm(), mustURL(t, "socks5://"+srv.addr))
 	wp := newTestPool(store)
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 	p := proxies[0]
 
 	wp.sweep()
@@ -455,7 +455,7 @@ func TestBorrowDisabledAfterReload(t *testing.T) {
 	w := defaultWarm()
 	store, proxies := warmStore(w, u)
 	wp := newTestPool(store)
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 
 	wp.sweep()
 	drain(wp)
@@ -490,7 +490,7 @@ func TestAuthFailureStopsReplenishUntilEpochMoves(t *testing.T) {
 	srv := newHalfServer(t, "authreject")
 	store, proxies := warmStore(defaultWarm(), mustURL(t, "socks5://u:p@"+srv.addr))
 	wp := newTestPool(store)
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 
 	wp.sweep()
 	drain(wp)
@@ -526,7 +526,7 @@ func TestDialFailureBacksOff(t *testing.T) {
 	srv := newHalfServer(t, "refuse")
 	store, _ := warmStore(defaultWarm(), mustURL(t, "socks5://"+srv.addr))
 	wp := newTestPool(store)
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 
 	wp.sweep()
 	drain(wp)
@@ -546,7 +546,7 @@ func TestCooldownPausesReplenish(t *testing.T) {
 	srv := newHalfServer(t, "ok")
 	store, proxies := warmStore(defaultWarm(), mustURL(t, "socks5://"+srv.addr))
 	wp := newTestPool(store)
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 	pl := store.Load().Pool
 
 	wp.sweep()
@@ -586,7 +586,7 @@ func TestSweepExpiresIdleTTL(t *testing.T) {
 	w.IdleTTL = 20 * time.Millisecond
 	store, _ := warmStore(w, mustURL(t, "socks5://"+srv.addr))
 	wp := newTestPool(store)
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 
 	wp.sweep()
 	drain(wp)
@@ -607,7 +607,7 @@ func TestRouteRemovedClosesBucket(t *testing.T) {
 	w := defaultWarm()
 	store, _ := warmStore(w, mustURL(t, "socks5://"+srvA.addr), mustURL(t, "socks5://"+srvB.addr))
 	wp := newTestPool(store)
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 
 	wp.sweep()
 	drain(wp)
@@ -635,7 +635,7 @@ func TestDisabledDrainsAndReenable(t *testing.T) {
 	w := defaultWarm()
 	store, _ := warmStore(w, mustURL(t, "socks5://"+srv.addr))
 	wp := newTestPool(store)
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 
 	wp.sweep()
 	drain(wp)
@@ -679,7 +679,7 @@ func TestBorrowWakesSweeper(t *testing.T) {
 	wp.sweepEvery = 30 * time.Second
 
 	wp.Start()
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 	// The startup pass (not a tick — there is none for 30s) fills to min-idle.
 	waitFor(t, "startup fill", 5*time.Second, func() bool {
 		return wp.Snapshot().IdleTotal == 1
@@ -748,7 +748,7 @@ func TestReloadShrinksReplenishBoundsMidDial(t *testing.T) {
 		w.MaxReplenishConcurrency = 2
 		store, _ := warmStore(w, mustURL(t, "socks5://"+srv.addr))
 		wp, gate := gatedPool(store)
-		defer wp.Stop()
+		defer wp.Stop(context.Background())
 
 		wp.sweep() // four deficits scheduled, two may fly under the old cap
 		launch(wp, 2)
@@ -799,7 +799,7 @@ func TestReloadShrinksReplenishBoundsMidDial(t *testing.T) {
 		w.MaxReplenishPerRoute = 2
 		store, _ := warmStore(w, mustURL(t, "socks5://"+srv.addr))
 		wp, gate := gatedPool(store)
-		defer wp.Stop()
+		defer wp.Stop(context.Background())
 
 		wp.sweep() // four deficits scheduled, two may fly toward the route
 		launch(wp, 2)
@@ -849,7 +849,7 @@ func TestStartStopLifecycle(t *testing.T) {
 	wp := newTestPool(store)
 
 	wp.Start()
-	defer wp.Stop()
+	defer wp.Stop(context.Background())
 	// The real ticker/waker path fills the bucket without any manual sweep.
 	waitFor(t, "async warm fill", 5*time.Second, func() bool {
 		return wp.Snapshot().IdleTotal == 1
@@ -857,7 +857,7 @@ func TestStartStopLifecycle(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		wp.Stop()
+		wp.Stop(context.Background())
 		close(done)
 	}()
 	select {
@@ -875,4 +875,38 @@ func TestStartStopLifecycle(t *testing.T) {
 	waitFor(t, "far-end conns closed after stop", 2*time.Second, func() bool {
 		return srv.parked.Load() == 0
 	})
+}
+
+// Stop must honor the caller's deadline — the same shared shutdown budget the
+// process drains every listener against — not just the fixed stopWaitLimit
+// tail. A worker parked in a dial that ignores the context (shaped exactly
+// like a greeting read against a black-hole upstream, which only honors its
+// socket deadline) would otherwise pin shutdown for the full stopWaitLimit
+// on top of grace. With a 200ms ctx and a worker stuck for 5s, Stop must
+// return near 200ms, far below stopWaitLimit.
+func TestStopHonorsCallerDeadline(t *testing.T) {
+	store, _ := warmStore(defaultWarm(), mustURL(t, "socks5://127.0.0.1:9"))
+	// The dial ignores ctx entirely: it sleeps 5s, like a black-hole greeting
+	// read. Cancel cannot interrupt it; only the caller's Stop deadline can.
+	wp := New(store, zerolog.Nop(), func(_ context.Context, _ *url.URL, _ time.Duration) (*socksdial.HalfConn, error) {
+		time.Sleep(5 * time.Second)
+		return nil, errors.New("never reaches here")
+	})
+	wp.Start()
+
+	// Claim one task so a worker is parked in the 5s dial.
+	waitFor(t, "worker in flight", 3*time.Second, func() bool {
+		return wp.dialing.Load() == 1
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	wp.Stop(ctx)
+	elapsed := time.Since(start)
+	// stopWaitLimit is 1s; a fixed-only Stop would take ~1s. The shared ctx
+	// deadline must win and keep teardown inside the drain budget.
+	if elapsed > 800*time.Millisecond {
+		t.Fatalf("Stop with a 200ms deadline took %s; it must yield to the shared shutdown budget, not the fixed %s tail", elapsed, stopWaitLimit)
+	}
 }

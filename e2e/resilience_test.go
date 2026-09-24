@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -473,6 +474,13 @@ func TestE2E_BootstrapValidationFailsFast(t *testing.T) {
 // force-close tail — never anywhere near the dial timeout. The upstream here
 // is a black hole that accepts TCP but never answers the SOCKS greeting, so
 // the tunnel parks for dial-timeout (30s) unless shutdown unwinds it.
+//
+// The black hole's accepted connections must outlive the test: dropping the
+// only reference lets the Go runtime finalizer close the socket, which would
+// unwind the stuck dial as an EOF/reset and let shutdown finish in
+// milliseconds — the issue #66 false failure. Every accepted conn is therefore
+// retained until cleanup, and the test proves via /status that the gateway
+// session is genuinely holding its in-flight pick before SIGTERM is sent.
 func TestE2E_ShutdownGraceBoundsStuckDial(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
@@ -482,13 +490,32 @@ func TestE2E_ShutdownGraceBoundsStuckDial(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = bhLn.Close() })
+
+	// accepted feeds the accept loop; parked retains every accepted conn for
+	// the whole test so neither GC finalization nor a stray close can kill the
+	// session the gateway is stuck dialing.
 	accepted := make(chan net.Conn, 4)
+	var parked []net.Conn
+	var parkedMu sync.Mutex
+	t.Cleanup(func() {
+		parkedMu.Lock()
+		defer parkedMu.Unlock()
+		for _, c := range parked {
+			_ = c.Close()
+		}
+	})
+	retain := func(c net.Conn) {
+		parkedMu.Lock()
+		parked = append(parked, c)
+		parkedMu.Unlock()
+	}
 	go func() {
 		for {
 			c, err := bhLn.Accept()
 			if err != nil {
 				return
 			}
+			retain(c)
 			accepted <- c
 		}
 	}()
@@ -505,7 +532,7 @@ func TestE2E_ShutdownGraceBoundsStuckDial(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second)) // the whole fixture may wait out a grace cycle
 	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
 		t.Fatal(err)
 	}
@@ -526,22 +553,66 @@ func TestE2E_ShutdownGraceBoundsStuckDial(t *testing.T) {
 		t.Fatal("gateway never dialed the black-hole upstream")
 	}
 
+	// Prove the session genuinely holds its in-flight pick before SIGTERM: the
+	// pool reports inFlight=1 for the black-hole route and the listener counted
+	// the CONNECT. Without this, a fixture race could send SIGTERM against an
+	// idle gateway and report a spuriously-instant drain (the issue #66 shape).
+	g.WaitForCondition(5*time.Second, "stuck dial holds its in-flight pick", func(st *Status) bool {
+		if st.Requests != 1 || len(st.Pool) != 1 {
+			return false
+		}
+		// The pick is held in flight and no report has been recorded yet — the
+		// greeting read is still pending against the black hole. Available stays
+		// true until the dial failure actually lands, so it is not part of the
+		// in-flight proof.
+		return st.Pool[0].InFlight == 1 && st.Pool[0].Failures == 0
+	})
+
 	start := time.Now()
-	if err := g.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	exit := make(chan struct{})
-	go func() { _ = g.cmd.Wait(); close(exit) }()
-	select {
-	case <-exit:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("gateway still running %s after SIGTERM; shutdown is not bounded by the grace budget", time.Since(start))
+	// TerminateAndWait keeps the process's real exit status: a signal-defined
+	// death (the default SIGTERM disposition the old startup race produced)
+	// would land here as a non-zero, never a graceful 0.
+	exitCode := g.TerminateAndWait()
+	if exitCode != 0 {
+		t.Fatalf("exit=%d, want graceful 0\nlogs:\n%s", exitCode, g.Logs())
 	}
 	elapsed := time.Since(start)
 	// Grace 2s (established tunnels are never broken early) plus the bounded
 	// force-close tail; the 30s dial timeout must not appear in the exit time.
+	// The log dump on failure is deliberate: a shutdown-path panic or early
+	// unwind must carry its own trace, not be swallowed by the harness buffer.
 	if elapsed < 1900*time.Millisecond || elapsed > 4500*time.Millisecond {
-		t.Fatalf("shutdown took %s, want within [1.9s, 4.5s] (grace 2s + force-close tail)", elapsed)
+		t.Fatalf("shutdown took %s, want within [1.9s, 4.5s] (grace 2s + force-close tail)\nlogs:\n%s", elapsed, g.Logs())
 	}
-	g.cmd = nil // the Wait above reaped the process; cleanup must not Wait again
+}
+
+// A SIGTERM arriving the moment the gateway becomes healthy used to race the
+// signal handler's registration: /healthz could answer before signal.Notify
+// ran, so a manager that stopped a just-started instance could kill it with
+// the default disposition — no drain, non-zero exit. Registration now happens
+// before any listener binds, so SIGTERM at (or immediately after) readiness
+// must always drain gracefully and exit 0. Repeated start/stop rounds make the
+// race window observable.
+func TestE2E_SIGTERMAtReadinessExitsGracefully(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	const grace = time.Second
+	cfg := defaultGatewayConfig([]RouteConfig{
+		{Proxy: deadRouteValue(t), Kind: "v4"},
+	})
+	// Idle shutdown is immediate: no session to drain, so the process must
+	// exit well under the grace budget.
+	for round := range 20 {
+		g := NewGatewayWithEnv(t, cfg, "RPGW_SHUTDOWN_GRACE="+grace.String())
+		start := time.Now()
+		exitCode := g.TerminateAndWait()
+		if exitCode != 0 {
+			t.Fatalf("round %d: exit=%d, want graceful 0 (SIGTERM at readiness must not use the default disposition)\nlogs:\n%s",
+				round, exitCode, g.Logs())
+		}
+		if elapsed := time.Since(start); elapsed > grace+2*time.Second {
+			t.Fatalf("round %d: idle shutdown took %s, want immediate (well under the %s grace)", round, elapsed, grace)
+		}
+	}
 }
