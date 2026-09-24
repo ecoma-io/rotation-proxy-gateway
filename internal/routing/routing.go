@@ -242,12 +242,19 @@ func (r *Router) Match(target socksdial.Target) *Set {
 			return rule.routes
 		}
 		for _, suffix := range rule.wilds {
-			// The length check is the label boundary: "*.example.com" must
-			// match "api.example.com" and "a.b.example.com", never
-			// "example.com" (which does not end with the dotted suffix) nor
-			// "evilexample.com" (whose suffix match would eat a label).
-			if len(host) > len(suffix) && strings.HasSuffix(host, suffix) {
-				return rule.routes
+			// The boundary check is two-part: the suffix must match, and the
+			// byte before it must exist and not be a dot. The first is the
+			// label boundary — "*.example.com" matches "api.example.com" and
+			// "a.b.example.com", never "example.com" (which does not end
+			// with the dotted suffix) nor "evilexample.com" (whose suffix
+			// match would eat a label). The second demands that extra label
+			// be non-empty, so a client-spelled "a..example.com" or
+			// "..example.com" — an empty label — falls through to the
+			// default set like any other malformed name.
+			if strings.HasSuffix(host, suffix) {
+				if i := len(host) - len(suffix); i > 0 && host[i-1] != '.' {
+					return rule.routes
+				}
 			}
 		}
 	}

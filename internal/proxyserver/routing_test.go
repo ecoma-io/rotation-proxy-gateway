@@ -140,6 +140,63 @@ func TestRoutingCandidateIsolation(t *testing.T) {
 	}
 }
 
+// Two independent two-route candidate sets isolate symmetrically: openai
+// traffic round-robins its pair and never touches a kilo route, kilo traffic
+// round-robins its pair and never touches an openai route.
+func TestRoutingTwoRouteServingSets(t *testing.T) {
+	openaiA := startSocks5Proxy(t, socksOptions{connectRaw: connectSuccessRaw})
+	openaiB := startSocks5Proxy(t, socksOptions{connectRaw: connectSuccessRaw})
+	kiloC := startSocks5Proxy(t, socksOptions{connectRaw: connectSuccessRaw})
+	kiloD := startSocks5Proxy(t, socksOptions{connectRaw: connectSuccessRaw})
+	pl := pool.NewRoutes([]config.RouteSpec{
+		labeledRoute("openai-a", openaiA.URL),
+		labeledRoute("openai-b", openaiB.URL),
+		labeledRoute("kilo-c", kiloC.URL),
+		labeledRoute("kilo-d", kiloD.URL),
+	}, 30*time.Second, time.Minute)
+
+	rt := defaultRuntime()
+	rt.Routing = mustCompileRouter(t, routing.Spec{
+		Rules: []routing.RuleSpec{
+			{Domains: []string{"*.openai.com"}, Routes: []string{"openai-a", "openai-b"}},
+			{Domains: []string{"*.kilo.ai"}, Routes: []string{"kilo-c", "kilo-d"}},
+		},
+	})
+	srv := newRuntimeServer(pl, rt, testLogger())
+	addr := startServer(t, srv)
+
+	for i := range 6 {
+		target := "api.openai.com:80"
+		if i >= 3 {
+			target = "api.kilo.ai:80"
+		}
+		conn, code := socksConnectReply(t, addr, target, socksCmdConnect)
+		if code != socksReplySuccess {
+			t.Fatalf("CONNECT reply = 0x%02x, want success", code)
+		}
+		_ = conn.Close()
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if len(openaiA.hits)+len(openaiB.hits) >= 3 && len(kiloC.hits)+len(kiloD.hits) >= 3 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if len(openaiA.hits) == 0 || len(openaiB.hits) == 0 {
+		t.Fatalf("openai set hits = a:%d b:%d, want the pair round-robined", len(openaiA.hits), len(openaiB.hits))
+	}
+	if len(kiloC.hits) == 0 || len(kiloD.hits) == 0 {
+		t.Fatalf("kilo set hits = c:%d d:%d, want the pair round-robined", len(kiloC.hits), len(kiloD.hits))
+	}
+	if leaked := len(openaiA.hits) + len(openaiB.hits); leaked != 3 {
+		t.Fatalf("openai set served %d requests, want exactly its 3", leaked)
+	}
+	if leaked := len(kiloC.hits) + len(kiloD.hits); leaked != 3 {
+		t.Fatalf("kilo set served %d requests, want exactly its 3", leaked)
+	}
+}
+
 // A route-level failure inside the candidate set falls back to the next
 // candidate — never to a route outside the set.
 func TestRoutingFallbackStaysInCandidateSet(t *testing.T) {

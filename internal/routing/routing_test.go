@@ -66,6 +66,20 @@ func TestMatchWildcardLabelBoundary(t *testing.T) {
 	}
 }
 
+// The extra label a wildcard demands must be non-empty: a client-spelled
+// empty label ("a..openai.com", "..openai.com") is a malformed name, so it
+// falls through to the default set like any other non-match instead of
+// slipping through the dotted suffix.
+func TestMatchWildcardRejectsEmptyExtraLabel(t *testing.T) {
+	r := mustCompile(t, Spec{Rules: []RuleSpec{{Domains: []string{"*.openai.com"}, Routes: []string{"openai-a"}}}})
+	for _, host := range []string{"a..openai.com", "..openai.com", "evil..openai.com", ".openai.com"} {
+		set := r.Match(domainTarget(host))
+		if set == nil || set.Allows("openai-a") {
+			t.Fatalf("Match(%q) allowed openai-a, want the empty extra label to fall through", host)
+		}
+	}
+}
+
 func TestMatchCaseNormalization(t *testing.T) {
 	r := mustCompile(t, Spec{Rules: []RuleSpec{
 		{Domains: []string{"API.OpenAI.com"}, Routes: []string{"exact"}},

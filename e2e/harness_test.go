@@ -309,10 +309,14 @@ func renderConfig(cfg GatewayConfig) string {
 	}
 	sb.WriteString("proxies:\n  auto:\n")
 	for _, r := range cfg.Routes {
+		// The list marker leads the item's first key, named id or proxy:
+		// emitting it only on the id branch would drop unnamed routes'
+		// marker and splice every entry into one mapping.
 		if r.ID != "" {
-			fmt.Fprintf(&sb, "    - id: %s\n", yamlQuote(r.ID))
+			fmt.Fprintf(&sb, "    - id: %s\n      proxy: %s\n      kind: %s\n", yamlQuote(r.ID), yamlQuote(r.Proxy), r.Kind)
+		} else {
+			fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n", yamlQuote(r.Proxy), r.Kind)
 		}
-		fmt.Fprintf(&sb, "      proxy: %s\n      kind: %s\n", yamlQuote(r.Proxy), r.Kind)
 	}
 	if len(cfg.Manual) == 0 {
 		sb.WriteString("  manual: []\n")
@@ -321,9 +325,10 @@ func renderConfig(cfg GatewayConfig) string {
 	sb.WriteString("  manual:\n")
 	for _, m := range cfg.Manual {
 		if m.ID != "" {
-			fmt.Fprintf(&sb, "    - id: %s\n", yamlQuote(m.ID))
+			fmt.Fprintf(&sb, "    - id: %s\n      proxy: %s\n      kind: %s\n", yamlQuote(m.ID), yamlQuote(m.Proxy), m.Kind)
+		} else {
+			fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n", yamlQuote(m.Proxy), m.Kind)
 		}
-		fmt.Fprintf(&sb, "      proxy: %s\n      kind: %s\n", yamlQuote(m.Proxy), m.Kind)
 		fmt.Fprintf(&sb, "      rotate-interval: %s\n", m.RotateInterval)
 		fmt.Fprintf(&sb, "      api:\n        url: %s\n", m.API.URL)
 		if m.API.Method != "" {

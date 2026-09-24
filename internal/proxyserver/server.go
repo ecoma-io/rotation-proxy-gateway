@@ -447,20 +447,26 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 	logTarget := socksTargetLogValue(targetAddr)
 	log.Debug().Str("target", logTarget).Msg("tunnel start")
 
-	// Routing resolves the target before the first pick. A nil set means no
-	// routing policy applies: the listener's kind filter alone, the
-	// historical path with no per-request allocation. A non-nil set — empty
-	// included — is the complete candidate scope: the pool stays the sole
-	// authority on health, cooldown, and order, but only routes the set
-	// names can be picked. The closure is built once per tunnel and reused
-	// by every attempt, so a fallback never leaves the target's routing
-	// scope.
-	candidates := gen.Router.Match(target)
+	// Routing resolves the target before the first pick, against this
+	// request's own generation: the match returns the candidate names and
+	// Pool.Scope binds them to concrete routes in one frozen pass. A nil
+	// set means no routing policy applies: the listener's kind filter
+	// alone, the historical path with no per-request allocation. A non-nil
+	// scope — empty included — is the complete candidate set for the whole
+	// request: the pool stays the sole authority on health, cooldown, and
+	// order, but only routes in the scope can be picked. The closure is
+	// built once per tunnel and reused by every attempt, so a fallback
+	// never leaves the target's routing scope — and because membership is
+	// pointer identity against a resolution taken at request start, a
+	// reload that renames or moves route labels mid-request re-scopes only
+	// requests that load the new generation, never this one.
+	candidates := gen.Pool.Scope(gen.Router.Match(target))
 	allow := s.allow
 	if candidates != nil {
 		restricted, listenerAllow := candidates, s.allow
 		allow = func(p *pool.Proxy) bool {
-			return (listenerAllow == nil || listenerAllow(p)) && restricted.Allows(p.RouteID())
+			_, ok := restricted[p]
+			return ok && (listenerAllow == nil || listenerAllow(p))
 		}
 	}
 
@@ -506,8 +512,12 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 		attempts = attempt + 1
 		if log.Debug().Enabled() {
 			ev := log.Debug().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
-				Int("attempt", attempts).Int("excluded", len(exclude)).
-				Str("route_id", p.RouteID())
+				Int("attempt", attempts).Int("excluded", len(exclude))
+			// route_id names the pick only when routing narrowed this
+			// target; the legacy path keeps its exact historical shape.
+			if candidates != nil {
+				ev = ev.Str("route_id", p.RouteID())
+			}
 			// A pick from the all-cooling fallback arrives with cooldown left;
 			// the size of that bet is the whole point of the line.
 			if cd := gen.Pool.CoolingFor(p, targetAddr); cd > 0 {
@@ -595,7 +605,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 			Int("excluded", len(exclude)).
 			Str("error_kind", kind).Str("duration", logDuration(time.Since(start)))
 		if candidates != nil {
-			ev = ev.Int("routing_candidates", candidates.Size())
+			ev = ev.Int("routing_candidates", len(candidates))
 		}
 		ev.Msg("tunnel failed")
 		return

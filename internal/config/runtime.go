@@ -469,6 +469,16 @@ func LoadRuntime(path string) (*RuntimeConfig, error) {
 	if err := v.UnmarshalExact(&raw); err != nil {
 		return nil, fmt.Errorf("decode runtime config: %w", err)
 	}
+	// Viper's strict decode drops an empty mapping before it can reach the
+	// *routingFileConfig pointer, which would turn the documented kill
+	// switch (`routing: {}`) into unrestricted selection without a word of
+	// complaint. Presence is therefore read from the parsed document itself:
+	// a routing key holding a mapping — empty included — means the block is
+	// configured; an absent or null key means it is not. Unknown keys inside
+	// a non-empty block still fail the UnmarshalExact above.
+	if raw.Routing == nil && v.IsSet("routing") {
+		raw.Routing = &routingFileConfig{}
+	}
 	return runtimeFromFile(raw)
 }
 

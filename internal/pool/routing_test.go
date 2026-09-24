@@ -25,7 +25,8 @@ func domainTarget(host string) socksdial.Target {
 
 // TestRouteIDRoundTrip pins the label's lifecycle: unnamed routes read empty,
 // named routes read their id, /status carries it, and a reload that renames
-// the route keeps the health state while swapping the label.
+// the route keeps both the health state and the in-flight label view while
+// publishing the new name only to the new generation.
 func TestRouteIDRoundTrip(t *testing.T) {
 	pl := NewRoutes([]config.RouteSpec{
 		namedRoute(t, "openai-a", "a.test"),
@@ -45,7 +46,9 @@ func TestRouteIDRoundTrip(t *testing.T) {
 	}
 
 	// Rename openai-a to openai-a2 without touching its URL+kind+origin: the
-	// entry must be retained (success counter intact) with the new label.
+	// entry must be retained (success counter intact), the new generation's
+	// /status shows the new name, and the retained route keeps the label it
+	// was built under — the view in-flight requests resolved against.
 	pl.ReportSuccess(first, "t.test")
 	renamed := pl.Reconfigure([]config.RouteSpec{
 		namedRoute(t, "openai-a2", "a.test"),
@@ -55,10 +58,14 @@ func TestRouteIDRoundTrip(t *testing.T) {
 	if entries[0] != first {
 		t.Fatal("Reconfigure rebuilt a renamed route; health state must be retained")
 	}
-	if entries[0].RouteID() != "openai-a2" {
-		t.Fatalf("RouteID() after rename = %q, want openai-a2", entries[0].RouteID())
+	if entries[0].RouteID() != "openai-a" {
+		t.Fatalf("retained RouteID() = %q after rename, want the birth label openai-a", entries[0].RouteID())
 	}
-	if got := renamed.Snapshot()[0].Successes; got != 1 {
+	renamedSnaps := renamed.Snapshot()
+	if renamedSnaps[0].ID != "openai-a2" {
+		t.Fatalf("/status id after rename = %q, want openai-a2", renamedSnaps[0].ID)
+	}
+	if got := renamedSnaps[0].Successes; got != 1 {
 		t.Fatalf("successes = %d after rename, want the retained 1", got)
 	}
 }
@@ -81,7 +88,8 @@ func TestPickForHonorsCandidateSet(t *testing.T) {
 		t.Fatalf("routing.Compile(): %v", err)
 	}
 	inSet := func(candidates *routing.Set) func(*Proxy) bool {
-		return func(p *Proxy) bool { return candidates.Allows(p.RouteID()) }
+		scope := pl.Scope(candidates)
+		return func(p *Proxy) bool { _, ok := scope[p]; return ok }
 	}
 
 	seen := map[string]int{}
@@ -114,6 +122,12 @@ func TestPickForHonorsCandidateSet(t *testing.T) {
 	if !routed.Allows("openai-a") || routed.Allows("kilo-a") {
 		t.Fatalf("candidates = %+v, want {openai-a}", routed)
 	}
+	if scope := pl.Scope(routed); scope == nil || len(scope) != 1 {
+		t.Fatalf("Scope(resolved set) = %+v, want exactly the openai-a route", scope)
+	}
+	if scope := pl.Scope(nil); scope != nil {
+		t.Fatalf("Scope(nil) = %+v, want nil — the unrestricted path allocates nothing", scope)
+	}
 
 	// A nil set means unrestricted — the historical no-routing behavior — so
 	// every route incl. kilo is reachable again.
@@ -122,6 +136,77 @@ func TestPickForHonorsCandidateSet(t *testing.T) {
 		t.Fatal("PickFor() = nil without routing")
 	}
 	unrestricted.Release()
+}
+
+// TestScopeFrozenAcrossLabelMove pins the invariant a label swap must never
+// break: a request resolves its candidate set to concrete routes when it
+// starts, so a reload that moves that label onto another retained route
+// re-scopes only requests that load the new generation — never the one
+// already serving. This is the adversarial case where a mutable live label
+// would fail open, handing an in-flight request the new owner of the name.
+func TestScopeFrozenAcrossLabelMove(t *testing.T) {
+	euScope := func(t *testing.T, pool *Pool) map[*Proxy]struct{} {
+		t.Helper()
+		router := mustRouter(t, routing.Spec{
+			Rules: []routing.RuleSpec{{Domains: []string{"x.corp.internal"}, Routes: []string{"eu"}}},
+		})
+		return pool.Scope(router.Match(domainTarget("x.corp.internal")))
+	}
+
+	pl := NewRoutes([]config.RouteSpec{
+		namedRoute(t, "eu", "eu.test"),
+		namedRoute(t, "us", "us.test"),
+	}, 2*time.Second, time.Minute)
+	first, second := pl.RoutePointers()[0], pl.RoutePointers()[1]
+
+	// The in-flight request scoped its target to exactly the eu.test route.
+	scope := euScope(t, pl)
+	if len(scope) != 1 {
+		t.Fatalf("initial scope = %d routes, want 1", len(scope))
+	}
+	if _, ok := scope[first]; !ok {
+		t.Fatal("initial scope lost the eu.test route")
+	}
+
+	// A reload swaps the two labels across the retained routes — a valid,
+	// unique configuration, and the exact operator edit that would re-point
+	// the name eu at us.test's entry.
+	swapped := pl.Reconfigure([]config.RouteSpec{
+		namedRoute(t, "us", "eu.test"),
+		namedRoute(t, "eu", "us.test"),
+	}, 2*time.Second, time.Minute)
+	entries := swapped.RoutePointers()
+	if entries[0] != first || entries[1] != second {
+		t.Fatal("Reconfigure rebuilt routes on a pure label swap; state must be retained")
+	}
+
+	// The in-flight request's scope is untouched: still exactly the route it
+	// resolved at start, whatever the labels say now.
+	if len(scope) != 1 {
+		t.Fatalf("in-flight scope = %d routes after the label move, want 1", len(scope))
+	}
+	if _, ok := scope[first]; !ok {
+		t.Fatal("in-flight scope changed after a concurrent label move")
+	}
+
+	// A request that loads the new generation resolves eu to its new owner —
+	// never to both, never to neither.
+	next := euScope(t, swapped)
+	if len(next) != 1 {
+		t.Fatalf("new-generation scope = %d routes, want 1", len(next))
+	}
+	if _, ok := next[second]; !ok {
+		t.Fatal("new generation did not resolve eu to its new owner")
+	}
+	// /status reports the live labels; the retained route's birth label is
+	// unchanged for the requests still serving on the old generation.
+	snaps := swapped.Snapshot()
+	if snaps[0].ID != "us" || snaps[1].ID != "eu" {
+		t.Fatalf("/status ids after swap = %q, %q; want us, eu", snaps[0].ID, snaps[1].ID)
+	}
+	if first.RouteID() != "eu" {
+		t.Fatalf("retained route label = %q after the swap, want its birth label eu", first.RouteID())
+	}
 }
 
 // TestGenerationCarriesRouter pins the atomicity contract at the generation

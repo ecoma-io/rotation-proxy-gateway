@@ -140,10 +140,15 @@ An id is a routing label, not the route's identity. Route identity stays
 canonical URL+kind+origin: renaming an id keeps the route's health state
 (cooldowns, counters, rotation history) exactly as any other
 identity-preserving reload does, and `/status` shows the new label from the
-moment the reload publishes. Ids are optional while no `routing` block exists;
-once one does, every serving route must carry an id — an unnamed route could
-never appear in a rule, and silently letting it serve outside every rule would
-narrow the pool behind the operator's back.
+moment the reload publishes. A request binds its candidate set to concrete
+routes when it starts, so a reload that renames ids — even one that moves a
+label onto a different route — can never re-scope a request that is already
+serving: in-flight requests keep the scope they resolved under the old
+labels, and the new names apply from the first request after the reload
+publishes. Ids are optional while no `routing` block exists; once one does,
+every serving route must carry an id — an unnamed route could never appear in
+a rule, and silently letting it serve outside every rule would narrow the pool
+behind the operator's back.
 
 ### Request routing (`routing` block)
 
@@ -202,10 +207,12 @@ serving, exactly like any other invalid change.
 The routing policy rides the same atomic generation as the pool and its
 routes: a reload that changes rules and routes together publishes both as one
 unit, and in-flight requests finish on the generation they started with.
-Renaming a route's id is a routing change, not a health change — but note the
-one transient: an in-flight request on the old generation may find a just-
-renamed route absent from its candidate set and fail closed (`05 01`), never
-open.
+Renaming a route's id is a routing change, not a health change. A request
+resolves its candidate set to concrete routes when it starts and never reads
+the labels again, so a reload that renames ids — including one that moves a
+label onto a different route — re-scopes nothing in flight: the old
+generation's requests keep serving their original candidates, and the new
+names reach only the requests that load the new generation.
 
 ### Rejected configuration
 

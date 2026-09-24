@@ -219,4 +219,21 @@ func TestE2E_RoutingInvalidReloadKeepsServing(t *testing.T) {
 	if len(st.Pool) != 3 {
 		t.Fatalf("pool after the rejected reload has %d routes, want the last-known-good 3", len(st.Pool))
 	}
+
+	// A malformed pattern is rejected by the same load-time pass, not just
+	// reference checks: the last-known-good policy keeps serving.
+	malformed := defaultGatewayConfig(labeledRoutes3(openaiA, openaiB, kiloC))
+	malformed.Routing = openaiRouting()
+	malformed.Routing.Rules[0].Domains = []string{"*.*.openai.com"}
+	g.ReloadConfigRaw(renderConfig(malformed))
+	g.WaitForCondition(reloadSettle, "a rejected routing pattern to keep the previous policy serving",
+		func(*Status) bool {
+			return strings.Contains(g.Logs(), "invalid domain pattern") &&
+				strings.Contains(g.Logs(), "reload failed; keeping previous configuration")
+		})
+
+	GetVia(t, ProxyClient(g.MixedAddr), "http://api.openai.com/after2", "e2e-echo:/after2")
+	if kiloC.Hits.Load() != 0 {
+		t.Fatalf("rejected pattern reload changed serving (kilo hits = %d)", kiloC.Hits.Load())
+	}
 }

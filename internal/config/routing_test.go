@@ -324,3 +324,53 @@ func TestLoadRuntimeNullRoutingBlockIsAbsent(t *testing.T) {
 		t.Fatalf("Routing = %+v, want nil for a null routing key", cfg.Routing)
 	}
 }
+
+// TestLoadRuntimeEmptyRoutingBlockIsKillSwitch pins the documented kill
+// switch: `routing: {}` is a configured, empty policy, not the unrestricted
+// pool the decoder would otherwise mistake it for — viper drops empty
+// mappings, so presence is detected from the parsed document and the block
+// is rebuilt as empty. Every target then fails closed, and the mandatory
+// naming rule still applies because the block is present.
+func TestLoadRuntimeEmptyRoutingBlockIsKillSwitch(t *testing.T) {
+	cfg, err := LoadRuntime(writeRuntimeConfig(t, routingConfig("routing: {}\n")))
+	if err != nil {
+		t.Fatalf("LoadRuntime() error = %v", err)
+	}
+	if cfg.Routing == nil {
+		t.Fatal("Routing = nil for `routing: {}`, want the fail-closed empty policy")
+	}
+	for name, target := range map[string]socksdial.Target{
+		"domain":    domainRouteTarget("api.openai.com"),
+		"ipv4":      {Host: "23.3.14.2", Port: 443, Type: socksdial.AddrIPv4},
+		"ipv6":      {Host: "2606:4700::1", Port: 443, Type: socksdial.AddrIPv6},
+		"unlisted":  domainRouteTarget("other.example.com"),
+		"trailing.": domainRouteTarget("api.openai.com."),
+	} {
+		set := cfg.Routing.Match(target)
+		if set == nil || set.Size() != 0 {
+			t.Fatalf("%s target candidates = %+v, want the empty fail-closed set", name, set)
+		}
+	}
+
+	unnamed := `
+log-level: info
+max-retries: 3
+cooldown:
+  base: 2s
+  max: 1m
+dial-timeout: 5s
+proxies:
+  auto:
+    - proxy: 198.51.100.10:1080
+      kind: v4
+    - id: named-a
+      proxy: 198.51.100.11:1080
+      kind: v4
+routing: {}
+`
+	if _, err := LoadRuntime(writeRuntimeConfig(t, unnamed)); err == nil {
+		t.Fatal("LoadRuntime() accepted `routing: {}` with an unnamed serving route")
+	} else if !strings.Contains(err.Error(), "routing requires every serving route to carry an id") {
+		t.Fatalf("LoadRuntime() error = %v, want the mandatory-naming error", err)
+	}
+}

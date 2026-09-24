@@ -80,11 +80,13 @@ into the router.
 
 - The pool still selects, still round-robins, still cools and auth-blocks;
   routing only decides **which routes may be considered** for the target.
-- The candidate set is fixed for the whole request. Every retry —
-  `proxy_connect`, `socks_connect`, `auth_route`, and the pair-scoped
-  `connect_target` alike — falls back to the **next candidate in the same
-  set**, never to a route outside it, however healthy that route is for other
-  targets.
+- The candidate set is fixed for the whole request, bound to concrete routes
+  at request start: a reload that renames or moves route labels mid-request
+  re-scopes only requests that load the new configuration, never one already
+  serving. Every retry — `proxy_connect`, `socks_connect`, `auth_route`, and
+  the pair-scoped `connect_target` alike — falls back to the **next candidate
+  in the same set**, never to a route outside it, however healthy that route
+  is for other targets.
 - The all-cooling fallback and the kind filter apply inside the set: a
   set-scoped target waits for (or borrows from) the soonest-recovering
   candidate, and a dedicated listener's kind view still intersects the set.

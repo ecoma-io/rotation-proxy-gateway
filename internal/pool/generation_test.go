@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/routing"
 )
 
 func mustGenerationConfig(t *testing.T, routes []config.RouteSpec, base, max time.Duration) *config.RuntimeConfig {
@@ -32,6 +33,15 @@ func TestGenerationStoreRejectsIncomplete(t *testing.T) {
 		"nil config": func() { NewStore(nil, pl) },
 		"nil pool":   func() { NewStore(cfg, nil) },
 		"nil gen":    func() { NewStore(cfg, pl).Store(nil) },
+		// Config and routing policy must move as one unit: a hand-assembled
+		// generation pairing a router with someone else's config would serve
+		// candidate sets no pool in that generation was validated against.
+		"router mismatch": func() {
+			other := mustRouter(t, routing.Spec{
+				Rules: []routing.RuleSpec{{Domains: []string{"other.example"}, Routes: []string{"kilo-a"}}},
+			})
+			NewStore(cfg, pl).Store(&Generation{Config: cfg, Pool: pl, Router: other})
+		},
 	} {
 		func() {
 			defer func() {
