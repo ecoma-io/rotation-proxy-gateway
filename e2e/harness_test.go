@@ -37,16 +37,36 @@ func (b *lockedBuffer) String() string {
 
 // RouteConfig is one static SOCKS route in the generated gateway config.
 type RouteConfig struct {
+	// ID is the optional operator-facing routing label; empty omits the key.
+	ID string
+	// Proxy is the raw route line (host:port or user:pass@host:port) — the
+	// harness quotes it, so tests pass it unquoted.
 	Proxy string
 	Kind  string
 }
 
 // ManualRouteConfig is one API-driven rotation route in the generated config.
 type ManualRouteConfig struct {
+	ID             string
 	Proxy          string
 	Kind           string
 	RotateInterval string
 	API            ManualAPIConfig
+}
+
+// RoutingConfig renders the optional `routing` runtime block; nil in
+// GatewayConfig omits the block entirely. DefaultRoutes nil omits the
+// default-routes key (unmatched targets fail closed); a non-nil list renders
+// verbatim.
+type RoutingConfig struct {
+	Rules         []RoutingRuleConfig
+	DefaultRoutes []string
+}
+
+// RoutingRuleConfig is one first-match-wins rule.
+type RoutingRuleConfig struct {
+	Domains []string
+	Routes  []string
 }
 
 // ManualAPIConfig is the provider rotate endpoint of one manual route.
@@ -80,6 +100,7 @@ type GatewayConfig struct {
 	Manual       []ManualRouteConfig
 	Rotation     *RotationConfig
 	WarmPool     *WarmPoolConfig
+	Routing      *RoutingConfig
 }
 
 // WarmPoolConfig renders the warm-pool runtime block; zero fields fall back
@@ -110,6 +131,7 @@ type PoolEntry struct {
 	Proxy               string        `json:"proxy"`
 	Kind                string        `json:"kind"`
 	Origin              string        `json:"origin"`
+	ID                  string        `json:"id"`
 	Available           bool          `json:"available"`
 	InFlight            int           `json:"inFlight"`
 	ConsecutiveFailures int           `json:"consecutiveFailures"`
@@ -263,9 +285,38 @@ func renderConfig(cfg GatewayConfig) string {
 			fmt.Fprintf(&sb, "  idle-ttl: %s\n", w.IdleTTL)
 		}
 	}
+	if cfg.Routing != nil {
+		sb.WriteString("routing:\n")
+		if len(cfg.Routing.Rules) > 0 {
+			sb.WriteString("  rules:\n")
+			for _, r := range cfg.Routing.Rules {
+				sb.WriteString("    - match:\n        domains:\n")
+				for _, d := range r.Domains {
+					fmt.Fprintf(&sb, "          - %s\n", yamlQuote(d))
+				}
+				sb.WriteString("      routes:\n")
+				for _, id := range r.Routes {
+					fmt.Fprintf(&sb, "        - %s\n", yamlQuote(id))
+				}
+			}
+		}
+		if cfg.Routing.DefaultRoutes != nil {
+			sb.WriteString("  default-routes:\n")
+			for _, id := range cfg.Routing.DefaultRoutes {
+				fmt.Fprintf(&sb, "    - %s\n", yamlQuote(id))
+			}
+		}
+	}
 	sb.WriteString("proxies:\n  auto:\n")
 	for _, r := range cfg.Routes {
-		fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n", yamlQuote(r.Proxy), r.Kind)
+		// The list marker leads the item's first key, named id or proxy:
+		// emitting it only on the id branch would drop unnamed routes'
+		// marker and splice every entry into one mapping.
+		if r.ID != "" {
+			fmt.Fprintf(&sb, "    - id: %s\n      proxy: %s\n      kind: %s\n", yamlQuote(r.ID), yamlQuote(r.Proxy), r.Kind)
+		} else {
+			fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n", yamlQuote(r.Proxy), r.Kind)
+		}
 	}
 	if len(cfg.Manual) == 0 {
 		sb.WriteString("  manual: []\n")
@@ -273,7 +324,11 @@ func renderConfig(cfg GatewayConfig) string {
 	}
 	sb.WriteString("  manual:\n")
 	for _, m := range cfg.Manual {
-		fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n", yamlQuote(m.Proxy), m.Kind)
+		if m.ID != "" {
+			fmt.Fprintf(&sb, "    - id: %s\n      proxy: %s\n      kind: %s\n", yamlQuote(m.ID), yamlQuote(m.Proxy), m.Kind)
+		} else {
+			fmt.Fprintf(&sb, "    - proxy: %s\n      kind: %s\n", yamlQuote(m.Proxy), m.Kind)
+		}
 		fmt.Fprintf(&sb, "      rotate-interval: %s\n", m.RotateInterval)
 		fmt.Fprintf(&sb, "      api:\n        url: %s\n", m.API.URL)
 		if m.API.Method != "" {

@@ -71,6 +71,36 @@ reload.
 Cooldowns run on a monotonic clock, so wall-clock steps (NTP corrections,
 manual date changes) can neither expire nor extend them.
 
+## Routing and selection
+
+When a [routing block](configuration.md#request-routing-routing-block) is
+configured, the target's candidate set intersects selection before the pool
+scans: every rule above holds inside the set, and nothing about health moves
+into the router.
+
+- The pool still selects, still round-robins, still cools and auth-blocks;
+  routing only decides **which routes may be considered** for the target.
+- The candidate set is fixed for the whole request, bound to concrete routes
+  at request start: a reload that renames or moves route labels mid-request
+  re-scopes only requests that load the new configuration, never one already
+  serving. Every retry — `proxy_connect`, `socks_connect`, `auth_route`, and
+  the pair-scoped `connect_target` alike — falls back to the **next candidate
+  in the same set**, never to a route outside it, however healthy that route
+  is for other targets.
+- The all-cooling fallback and the kind filter apply inside the set: a
+  set-scoped target waits for (or borrows from) the soonest-recovering
+  candidate, and a dedicated listener's kind view still intersects the set.
+- `no_route` means no eligible untried **candidate** remains — including the
+  configured fail-closed case where the candidate set is empty (an unmatched
+  target with no `default-routes`, or an IP target under the same
+  configuration). The client sees the ordinary `05 01`; nothing outside the
+  set is ever contacted as a fallback.
+- Tunnel bytes stay invisible to routing as they are to health: an HTTP 429 or
+  any other application response relayed inside an established tunnel mutates
+  no state and triggers no failover. Routing decisions happen exactly once per
+  request, before the first pick, from the CONNECT frame's address type and
+  hostname alone.
+
 ## Cooldown scopes
 
 Cooldowns come in two scopes, and `cooldown.base`/`cooldown.max` drive both

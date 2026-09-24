@@ -62,8 +62,8 @@ name fails startup with an error naming its replacement, and
 
 Runtime settings and active routes live only in `config.yaml`:
 `log-level`, `max-retries`, `cooldown`, `dial-timeout`, `proxies.auto`,
-`proxies.manual`, the `rotation` block, and the optional
-`warm-pool` block. The process polls the file each
+`proxies.manual`, the `rotation` block, the optional `warm-pool` block, and
+the optional `routing` block. The process polls the file each
 second and reloads when its content hash changes, so in-place edits and atomic
 replacements both reload under any mount style. A failed parse/validation
 leaves the last-known-good pool and runtime settings serving. Do not add a
@@ -92,7 +92,12 @@ changing failure classification.
 - The pool selects the usable **eligible** route with the smallest recency
   pass, first-seen order breaking ties — true round-robin over the eligible
   set. It is a single shared pool: cooldown, pair-scoped target-cooldown, and
-  auth state are visible through both dedicated and mixed listeners.
+  auth state are visible through both dedicated and mixed listeners. The
+  optional routing block narrows selection to the target's candidate set
+  (first-match-wins domain rules, `*.` label-boundary wildcards, domain targets
+  only, `default-routes` or fail-closed `05 01`); the pool stays the sole
+  authority on health and order, retries stay inside the candidate set, and
+  routing never reads or writes health nor inspects tunnel bytes.
 - Endpoint DNS/TCP failure is `proxy_connect`: cooldown then a distinct
   eligible fallback. SOCKS auth failure is `auth_route`, blocks the route, and
   may fall back, but never creates dial cooldown. A SOCKS handshake failure
@@ -211,8 +216,9 @@ binary `healthcheck` subcommand (no shell in the scratch image).
 
 ## Layout
 
-- `internal/config` — bootstrap environment, Viper YAML validation, route parsing (auto + manual), rotation settings, content-hash change poller
-- `internal/pool` — LRU filtering, cooldown/auth state, in-flight work, rotation state, immutable generation snapshots
+- `internal/config` — bootstrap environment, Viper YAML validation, route parsing (auto + manual), rotation settings, routing-block compilation, content-hash change poller
+- `internal/pool` — LRU filtering, cooldown/auth state, in-flight work, rotation state, immutable generation snapshots (config + pool + routing policy as one unit)
+- `internal/routing` — the compiled domain-routing policy: it resolves one inbound CONNECT target to its candidate route set and never selects, never reads or writes health
 - `internal/proxyserver` — inbound SOCKS5 (RFC 1928) server plus the admin mux
 - `internal/socksdial` — the shared SOCKS5 dialer used by the proxy server and the rotation probes; `DialHalf` parks a half-handshake (TCP + greeting + auth) the warm pool completes later with `CompleteConnect`
 - `internal/warmpool` — background pool of half-established upstream connections, bounded per route and process-wide, epoch-invalidated by rotation, borrowed on the serving path

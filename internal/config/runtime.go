@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"rotation-proxy-gateway/internal/routing"
+
 	"github.com/spf13/viper"
 )
 
@@ -73,8 +75,13 @@ const (
 	RouteOriginManual RouteOrigin = "manual"
 )
 
-// RouteSpec is one validated static SOCKS route from the runtime config.
+// RouteSpec is one validated static SOCKS route from the runtime config. ID
+// is the optional operator-facing routing label: it names the route inside
+// routing rules and the default set, and is validated and unique whenever
+// set. It is deliberately not the route's health/reload identity — canonical
+// URL+kind+origin keeps that role, so renaming an id never resets health.
 type RouteSpec struct {
+	ID     string
 	URL    *url.URL
 	Kind   EgressKind
 	Origin RouteOrigin
@@ -189,6 +196,10 @@ type BootstrapConfig struct {
 
 // RuntimeConfig is the immutable set of values used by new client operations.
 // Callers must replace the entire value on reload rather than mutate it.
+// Routing carries the compiled routing policy: nil when the runtime YAML has
+// no `routing` block (every listener selects from the whole shared pool,
+// exactly as before the layer existed), otherwise the immutable router every
+// new session consults before pool selection.
 type RuntimeConfig struct {
 	MaxRetries   int
 	CooldownBase time.Duration
@@ -199,6 +210,7 @@ type RuntimeConfig struct {
 	ManualRoutes []ManualRouteSpec
 	Rotation     RotationSettings
 	WarmPool     WarmPoolSettings
+	Routing      *routing.Router
 }
 
 type fileConfig struct {
@@ -209,6 +221,7 @@ type fileConfig struct {
 	Rotation    rotationFileConfig `mapstructure:"rotation"`
 	Proxies     proxiesFileConfig  `mapstructure:"proxies"`
 	WarmPool    warmPoolFileConfig `mapstructure:"warm-pool"`
+	Routing     *routingFileConfig `mapstructure:"routing"`
 }
 
 type cooldownFileConfig struct {
@@ -245,11 +258,16 @@ type proxiesFileConfig struct {
 }
 
 type autoProxyFileConfig struct {
-	Proxy string `mapstructure:"proxy"`
-	Kind  string `mapstructure:"kind"`
+	// ID is a pointer so an absent `id` key is distinguishable from an
+	// explicit `id: ""`: absent is legal (the route is unnamed), while an
+	// explicitly empty id is a configuration smell and is rejected.
+	ID    *string `mapstructure:"id"`
+	Proxy string  `mapstructure:"proxy"`
+	Kind  string  `mapstructure:"kind"`
 }
 
 type manualProxyFileConfig struct {
+	ID             *string       `mapstructure:"id"`
 	Proxy          string        `mapstructure:"proxy"`
 	Kind           string        `mapstructure:"kind"`
 	RotateInterval string        `mapstructure:"rotate-interval"`
@@ -451,6 +469,16 @@ func LoadRuntime(path string) (*RuntimeConfig, error) {
 	if err := v.UnmarshalExact(&raw); err != nil {
 		return nil, fmt.Errorf("decode runtime config: %w", err)
 	}
+	// Viper's strict decode drops an empty mapping before it can reach the
+	// *routingFileConfig pointer, which would turn the documented kill
+	// switch (`routing: {}`) into unrestricted selection without a word of
+	// complaint. Presence is therefore read from the parsed document itself:
+	// a routing key holding a mapping — empty included — means the block is
+	// configured; an absent or null key means it is not. Unknown keys inside
+	// a non-empty block still fail the UnmarshalExact above.
+	if raw.Routing == nil && v.IsSet("routing") {
+		raw.Routing = &routingFileConfig{}
+	}
 	return runtimeFromFile(raw)
 }
 
@@ -521,10 +549,36 @@ func runtimeFromFile(raw fileConfig) (*RuntimeConfig, error) {
 		}
 		cfg.ManualRoutes = append(cfg.ManualRoutes, spec)
 	}
+	// Routing parses last: its validation needs every route id, and its
+	// compiled router is what the runtime generation will publish alongside
+	// the pool snapshot.
+	router, err := parseRoutingSettings(raw.Routing, labeledRoutes(cfg))
+	if err != nil {
+		return nil, err
+	}
+	cfg.Routing = router
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// labeledRoute pairs one serving route with the configuration address that
+// produced it, so a validation error can name the exact entry to fix.
+type labeledRoute struct {
+	spec  RouteSpec
+	where string
+}
+
+func labeledRoutes(cfg *RuntimeConfig) []labeledRoute {
+	all := make([]labeledRoute, 0, len(cfg.Routes)+len(cfg.ManualRoutes))
+	for i, route := range cfg.Routes {
+		all = append(all, labeledRoute{spec: route, where: fmt.Sprintf("proxies.auto[%d]", i)})
+	}
+	for i, route := range cfg.ManualRoutes {
+		all = append(all, labeledRoute{spec: route.RouteSpec, where: fmt.Sprintf("proxies.manual[%d]", i)})
+	}
+	return all
 }
 
 // parseRotationSettings applies defaults, then validates the overrides. Values
@@ -775,7 +829,23 @@ func parseRouteSpec(raw autoProxyFileConfig) (RouteSpec, error) {
 		return RouteSpec{}, err
 	}
 	spec.Origin = RouteOriginAuto
+	if err := applyRouteID(&spec, raw.ID); err != nil {
+		return RouteSpec{}, err
+	}
 	return spec, nil
+}
+
+// applyRouteID validates and attaches the optional operator-facing route id.
+// A nil raw is the absent key and leaves the route unnamed.
+func applyRouteID(spec *RouteSpec, raw *string) error {
+	if raw == nil {
+		return nil
+	}
+	if err := validateRouteID(*raw); err != nil {
+		return fmt.Errorf("id: %w", err)
+	}
+	spec.ID = *raw
+	return nil
 }
 
 // parseManualRouteSpec validates one manual entry: the same SOCKS endpoint
@@ -787,6 +857,9 @@ func parseManualRouteSpec(raw manualProxyFileConfig) (ManualRouteSpec, error) {
 	}
 	manual := ManualRouteSpec{RouteSpec: spec}
 	manual.Origin = RouteOriginManual
+	if err := applyRouteID(&manual.RouteSpec, raw.ID); err != nil {
+		return ManualRouteSpec{}, err
+	}
 	if raw.RotateInterval == "" {
 		return ManualRouteSpec{}, errors.New("rotate-interval is required (Go duration, e.g. 90s)")
 	}

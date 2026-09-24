@@ -14,6 +14,7 @@ export default {
       "always",
       [
         "pool",
+        "routing",
         "rotation",
         "proxyserver",
         "socksdial",

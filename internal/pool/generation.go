@@ -1,13 +1,14 @@
 // Generation and Store publish one immutable runtime snapshot: the validated
-// configuration together with the pool built from it. The Store lives in the
-// pool package because pool already depends on config; the reverse dependency
-// would be an import cycle.
+// configuration, the pool built from it, and the compiled routing policy that
+// scopes its picks. The Store lives in the pool package because pool already
+// depends on config; the reverse dependency would be an import cycle.
 package pool
 
 import (
 	"sync/atomic"
 
 	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/routing"
 )
 
 // Generation is one immutable runtime snapshot. Handlers load it once at the
@@ -18,6 +19,13 @@ import (
 type Generation struct {
 	Config *config.RuntimeConfig
 	Pool   *Pool
+	// Router is the compiled routing policy from Config.Routing — nil when
+	// the runtime YAML has no routing block. It rides on the generation so a
+	// target's candidate set always comes from the same snapshot as the pool
+	// it narrows: a reload that changes routes and rules together publishes
+	// both as one unit, and in-flight sessions keep matching against their
+	// original policy.
+	Router *routing.Router
 }
 
 // NewGeneration combines validated configuration with its pool snapshot. It
@@ -29,7 +37,7 @@ func NewGeneration(cfg *config.RuntimeConfig, pl *Pool) *Generation {
 	if pl == nil {
 		panic("pool: NewGeneration requires a non-nil Pool")
 	}
-	return &Generation{Config: cfg, Pool: pl}
+	return &Generation{Config: cfg, Pool: pl, Router: cfg.Routing}
 }
 
 // Store atomically publishes Generations. All methods are safe for concurrent
@@ -50,10 +58,17 @@ func (s *Store) Load() *Generation {
 	return s.value.Load()
 }
 
-// Store publishes a fully built generation.
+// Store publishes a fully built generation. It panics unless the router is
+// the one compiled from the generation's own config: config, pool, and
+// routing policy must move as one snapshot, and a hand-assembled triple
+// that pairs a router with someone else's config would serve candidate
+// sets no pool in that generation was validated against.
 func (s *Store) Store(gen *Generation) {
 	if gen == nil || gen.Config == nil || gen.Pool == nil {
 		panic("pool: Store requires a complete Generation")
+	}
+	if gen.Router != gen.Config.Routing {
+		panic("pool: Store requires the generation's router to be its config's routing policy")
 	}
 	s.value.Store(gen)
 }

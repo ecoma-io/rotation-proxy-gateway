@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/routing"
 	"rotation-proxy-gateway/internal/sanitize"
 )
 
@@ -56,6 +57,21 @@ type Proxy struct {
 	// predates the route's next verified egress IP and can never be reused
 	// across a rotation, whatever way the procedure ends.
 	rotationEpoch atomic.Uint64
+
+	// id is the route's operator-facing routing label — the name routing
+	// rules and the default set refer to. It is identity-adjacent but
+	// deliberately not identity: canonical URL+kind+origin stays the reload
+	// and health key, so renaming an id never resets health. The label is
+	// fixed for a Proxy's lifetime: Reconfigure retains the same *Proxy
+	// across an id rename, but the new name is published in the new pool
+	// generation's label view (Pool.ids), never by rewriting this field.
+	// That is what keeps an in-flight request's candidate scope stable —
+	// its picks are resolved to concrete routes once, when the request
+	// starts (Pool.Scope) — so a reload that renames or moves labels can
+	// re-scope only requests that load the new generation, never one that
+	// is already serving. /status reads the live generation's label view
+	// and therefore always shows the current name.
+	id string
 
 	// Pair-scoped cooldown state: (route, target) refusals recorded by
 	// ReportTargetFailure — an upstream that answered CONNECT itself with a
@@ -177,12 +193,22 @@ func relNanos(t time.Time) int64 { return int64(t.Sub(processStart)) }
 
 func newProxy(route config.RouteSpec, anchor uint64) *Proxy {
 	origin := effectiveOrigin(route.Origin)
-	p := &Proxy{URL: route.URL, Kind: route.Kind, Origin: origin}
+	p := &Proxy{URL: route.URL, Kind: route.Kind, Origin: origin, id: route.ID}
 	p.pass.Store(anchor)
 	if origin == config.RouteOriginManual {
 		p.rotationState = RotationIdle
 	}
 	return p
+}
+
+// RouteID returns the route's operator-facing routing label as this Proxy
+// was built under, empty when the route is unnamed. It is immutable, so for
+// a retained route it is the label of every generation that has served it;
+// the live generation's view of a renamed route comes from the pool label
+// map that /status reads. Logs may quote it because the config grammar
+// guarantees it is log-safe.
+func (p *Proxy) RouteID() string {
+	return p.id
 }
 
 // effectiveOrigin treats an unset origin as auto: hand-built RouteSpecs may
@@ -344,6 +370,7 @@ type Status struct {
 	Proxy               string            `json:"proxy"`
 	Kind                config.EgressKind `json:"kind"`
 	Origin              string            `json:"origin"`
+	ID                  string            `json:"id,omitempty"`
 	Available           bool              `json:"available"`
 	InFlight            int               `json:"inFlight"`
 	ConsecutiveFailures int               `json:"consecutiveFailures"`
@@ -381,8 +408,15 @@ type RotationStatus struct {
 type Pool struct {
 	mu      sync.Mutex
 	entries []*Proxy
-	base    time.Duration
-	max     time.Duration
+	// ids is the label view of entries: the routing names this pool
+	// generation answers to, mapped to their routes. It is built once with
+	// the pool and never mutated — an id rename produces a new pool with a
+	// new map rather than rewriting labels under live requests, which is
+	// what lets Scope resolve a candidate set to concrete routes and keep
+	// that resolution valid for the request's whole lifetime.
+	ids  map[*Proxy]string
+	base time.Duration
+	max  time.Duration
 
 	// availScratch is the per-pick available-routes buffer, reused under mu
 	// across picks to keep the pick path allocation-free.
@@ -398,15 +432,33 @@ func NewRoutes(routes []config.RouteSpec, base, max time.Duration) *Pool {
 	for _, route := range routes {
 		entries = append(entries, newProxy(route, 0))
 	}
-	return &Pool{entries: entries, base: base, max: max, Now: time.Now}
+	return &Pool{entries: entries, ids: labelView(entries), base: base, max: max, Now: time.Now}
+}
+
+// labelView maps this generation's routing labels to their routes. Unnamed
+// routes are omitted: a missing key reads as the empty label, which no rule
+// or default set can name — ids are validated non-empty whenever routing is
+// configured.
+func labelView(entries []*Proxy) map[*Proxy]string {
+	ids := make(map[*Proxy]string, len(entries))
+	for _, p := range entries {
+		if p.id != "" {
+			ids[p] = p.id
+		}
+	}
+	return ids
 }
 
 // Reconfigure returns a new immutable route-list snapshot. Route state is
 // retained only for canonical URL+kind+origin matches; moving a route between
 // proxies.auto and proxies.manual rebuilds it because its role changed.
 // Retained entries keep their health state, pair-scoped target cooldowns
-// included, exactly as their route cooldowns. Existing in-flight operations
-// may safely keep using the original pool.
+// included, exactly as their route cooldowns, and an id rename lands on the
+// same retained state too: the new generation's label view carries the new
+// name while the route keeps its identity. This pool's label view is frozen
+// here and never rewritten, so a request already serving on the previous
+// generation keeps the candidate scope it resolved when it started (Scope);
+// existing in-flight operations may safely keep using the original pool.
 func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration) *Pool {
 	pl.mu.Lock()
 	entries := append([]*Proxy(nil), pl.entries...)
@@ -428,15 +480,45 @@ func (pl *Pool) Reconfigure(routes []config.RouteSpec, base, max time.Duration) 
 	for _, entry := range entries {
 		kept[routeKey(entry.URL, entry.Kind, entry.Origin)] = entry
 	}
+	// The label view is built from the incoming specs, not from the entries:
+	// a retained route keeps its birth label (the view in-flight requests
+	// resolved against), while this generation answers to the spec's name —
+	// that distinction is exactly what a rename means.
 	next := make([]*Proxy, 0, len(routes))
+	ids := make(map[*Proxy]string, len(routes))
 	for _, route := range routes {
 		if prior, ok := kept[routeKey(route.URL, route.Kind, route.Origin)]; ok {
 			next = append(next, prior)
 		} else {
 			next = append(next, newProxy(route, minPass))
 		}
+		if route.ID != "" {
+			ids[next[len(next)-1]] = route.ID
+		}
 	}
-	return &Pool{entries: next, base: base, max: max, Now: now}
+	return &Pool{entries: next, ids: ids, base: base, max: max, Now: now}
+}
+
+// Scope resolves a compiled candidate set to the concrete routes of this
+// pool generation: the pointer-identity view the proxy server feeds back
+// into PickFor for the whole life of a request. A nil set resolves to nil —
+// no routing policy applies, and the legacy path allocates nothing here.
+// Resolution reads entries and the label view, both frozen with the pool,
+// so it needs no lock and can never observe a torn rename; and because the
+// result is bound to route identity rather than labels, a reload that
+// renames or moves labels afterwards re-scopes only requests that load the
+// new generation.
+func (pl *Pool) Scope(set *routing.Set) map[*Proxy]struct{} {
+	if set == nil {
+		return nil
+	}
+	scope := make(map[*Proxy]struct{}, set.Size())
+	for _, p := range pl.entries {
+		if set.Allows(pl.ids[p]) {
+			scope[p] = struct{}{}
+		}
+	}
+	return scope
 }
 
 func routeKey(u *url.URL, kind config.EgressKind, origin config.RouteOrigin) string {
@@ -807,6 +889,7 @@ func (pl *Pool) Snapshot() []Status {
 			Proxy:               e.URL.Host,
 			Kind:                e.Kind,
 			Origin:              string(e.Origin),
+			ID:                  pl.ids[e],
 			Available:           !e.authBlocked.Load() && !e.rotating.Load() && !cooling,
 			InFlight:            int(e.inFlight.Load()),
 			ConsecutiveFailures: e.consecutiveFailures,

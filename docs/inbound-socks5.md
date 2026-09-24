@@ -48,11 +48,22 @@ ATYP `0x01`/`0x04`; a `socks5h` client sends the name as ATYP `0x03` and lets
 the far end resolve. Either way, whatever address type arrives on ingress is
 exactly what the selected outbound route receives.
 
+When a [routing block](configuration.md#request-routing-routing-block) is
+configured, only a domain target (`0x03`) can match a rule; the match reads
+the frame's hostname case-insensitively with one trailing DNS dot ignored, and
+the target bytes on egress remain exactly the bytes that arrived — matching
+never rewrites, re-resolves, or re-classifies anything. IPv4 and IPv6 targets
+skip the rules entirely and resolve to `default-routes`; an unmatched target
+without default routes is answered with the ordinary `05 01` general failure.
+See [routing and selection](failure-and-health.md#routing-and-selection) for
+how failures behave inside a candidate set.
+
 ## Replies
 
 - Success: `05 00` with a zero BND.ADDR/BND.PORT. Clients must ignore the
   bound address; the gateway does not bind a local relay endpoint.
-- No eligible route remains (`no_route`), the retry budget spent while
+- No eligible route remains (`no_route` — including a routing policy that
+  admits no candidate for this target), the retry budget spent while
   eligible routes remained (`retry_exhausted`), and local setup errors: `05 01`
   (general failure), followed by a close.
 - Unsupported command: `05 07`, followed by a close.
