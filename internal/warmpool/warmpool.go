@@ -576,10 +576,13 @@ func (wp *Pool) DiscardRoute(p *pool.Proxy) {
 }
 
 // Stop tears the pool down: cancels the context, closes every ready
-// connection, and waits a bounded time for the sweeper and workers to
-// unwind. See the package comment for why the wait is bounded and the wake
+// connection, and waits for the sweeper and workers to unwind. The wait is
+// bounded by ctx (the process's single shared shutdown deadline) as well as
+// the fixed stopWaitLimit tail — whichever is sooner — so warm-pool teardown
+// can never extend shutdown past the same budget every listener drains
+// against. See the package comment for why the wait is bounded and the wake
 // channel is never closed.
-func (wp *Pool) Stop() {
+func (wp *Pool) Stop(ctx context.Context) {
 	wp.cancel()
 	wp.mu.Lock()
 	wp.stopped = true
@@ -595,6 +598,7 @@ func (wp *Pool) Stop() {
 	}()
 	select {
 	case <-done:
+	case <-ctx.Done():
 	case <-time.After(stopWaitLimit):
 	}
 }

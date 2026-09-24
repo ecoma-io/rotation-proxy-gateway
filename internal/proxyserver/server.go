@@ -157,8 +157,11 @@ type Server struct {
 	live sync.WaitGroup
 	// baseCtx is the context every upstream dial runs under. Shutdown
 	// cancels it when the grace budget expires, unblocking dials still in
-	// their TCP connect phase; handshake-phase dials unblock through
-	// CloseConns closing the client side or their own dial deadline.
+	// their TCP connect phase; a handshake-phase dial blocked reading the
+	// upstream greeting is not reachable from this context — only the
+	// dial's own socket deadline ends it, which is why Shutdown bounds the
+	// full wait (and force-closes client conns) against the shared grace
+	// budget instead of relying on the dial to unwind.
 	baseCtx    context.Context
 	cancelBase context.CancelFunc
 

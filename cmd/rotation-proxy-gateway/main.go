@@ -132,6 +132,23 @@ func warnUnavailableKindListeners(log zerolog.Logger, cfg *config.RuntimeConfig,
 }
 
 func run() error {
+	// Install the signal handler before anything can make the process reachable
+	// or healthy. The bootstrap env and config may be invalid, or a listener
+	// bind may fail — in every such startup failure the notify channel stays
+	// armed until the deferred signal.Stop, and a SIGTERM arriving before the
+	// select loop below simply queues on the buffered channel: without this
+	// registration, SIGINT/SIGTERM/SIGHUP keep their default dispositions while
+	// the process is momentarily reachable (listeners up, /healthz answering),
+	// and a process manager that stops a just-started instance could kill it
+	// with no drain.
+	// Two slots, not one: registration precedes the select loop by
+	// milliseconds of startup, and Go drops signals that arrive while a
+	// Notify buffer is full — an ignored SIGHUP landing in that window
+	// must not be able to displace the SIGTERM that follows it.
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigCh)
+
 	bootstrap, err := config.LoadBootstrap()
 	if err != nil {
 		return err
@@ -236,13 +253,6 @@ func run() error {
 	go engine.Run(engineCtx)
 	warm.Start()
 
-	// SIGHUP is registered only so it cannot kill the process with its default
-	// disposition: it is neither a reload trigger (reloads are poller-driven)
-	// nor a stop signal. SIGINT/SIGTERM keep their graceful-stop meaning.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	defer signal.Stop(sigCh)
-
 	// Reloads from the poller arrive on one channel and are handled by this
 	// serialized loop; the source label only records how it was reached.
 	reload := func(source string) {
@@ -291,28 +301,38 @@ func run() error {
 	}
 }
 
-// shutdownAll stops the rotation engine first, then closes every proxy
-// listener socket and drains each one's active SOCKS sessions plus the admin
-// listener against one shared grace budget. A drained listener returns
-// immediately, so an idle process exits at once; once the budget expires the
-// remaining sessions' client connections are force-closed and later listeners
-// stop waiting. Established tunnels are never broken before that deadline.
+// shutdownAll stops the rotation engine and the warm pool first, then closes
+// every proxy listener socket and drains each one's active SOCKS sessions plus
+// the admin listener against one shared grace budget. A drained listener
+// returns immediately, so an idle process exits at once; once the budget
+// expires the remaining sessions' client connections are force-closed and
+// later listeners stop waiting. Established tunnels are never broken before
+// that deadline.
 //
-// Budget invariant: every listener shares the one ctx deadline, so the worst
-// case is grace plus the per-listener force-close tail (proxyserver's
-// forceCloseWait, 1s) times the three listeners, plus the admin shutdown —
-// with the default 55s grace that is ~58s, and the surrounding orchestrator's
-// kill timer (compose stop_grace_period: 60s) must stay above it.
-func shutdownAll(log zerolog.Logger, engineCancel context.CancelFunc, warmStop func(), listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
+// Budget invariant: the one ctx deadline is created here and governs the warm
+// pool teardown, every proxy listener drain, and the admin shutdown alike —
+// pre-drain work (rotation cancel, warm stop) shares the same clock instead of
+// holding its own. The worst case is grace plus the per-listener force-close
+// tail (proxyserver's forceCloseWait, 1s) times the three listeners, plus the
+// admin shutdown — with the default 55s grace that is ~58s, and the
+// surrounding orchestrator's kill timer (compose stop_grace_period: 60s) must
+// stay above it.
+func shutdownAll(log zerolog.Logger, engineCancel context.CancelFunc, warmStop func(context.Context), listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
+	// The deadline governs the whole drain. Creating it before stopping the
+	// rotation engine and the warm pool means their unwinding consumes the
+	// same budget the listeners drain against — a process with a warm worker
+	// stuck in a greeting read against a black-hole upstream is bounded by
+	// grace, not by a separate fixed 1s cap on top of it.
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+
 	engineCancel()
 	log.Debug().Msg("rotation engine canceled")
 	// The warm pool stops next: its parked upstream connections close within
-	// a bounded wait, before listener drain, so its sockets never outlive the
-	// sessions they exist to accelerate.
-	warmStop()
+	// the shared budget, before listener drain, so its sockets never outlive
+	// the sessions they exist to accelerate.
+	warmStop(ctx)
 	log.Debug().Msg("warm pool stopped")
-	ctx, cancel := context.WithTimeout(context.Background(), grace)
-	defer cancel()
 	start := time.Now()
 	drained := 0
 	for _, listener := range listeners {
