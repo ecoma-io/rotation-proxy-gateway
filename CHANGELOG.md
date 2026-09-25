@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0](https://github.com/ecoma-io/rotation-proxy-gateway/compare/v0.4.0...v0.5.0) (2026-09-25)
+
+
+### Features
+
+* **routing:** scope CONNECT targets to candidate route sets ([#74](https://github.com/ecoma-io/rotation-proxy-gateway/issues/74)) ([e33c92e](https://github.com/ecoma-io/rotation-proxy-gateway/commit/e33c92e423bd9562023525b25bfb9ad6f62c22cd))
+
+
+### Bug Fixes
+
+* **cmd:** harden graceful shutdown for stuck-dial session ([#66](https://github.com/ecoma-io/rotation-proxy-gateway/issues/66)) ([#71](https://github.com/ecoma-io/rotation-proxy-gateway/issues/71)) ([c2fd7d2](https://github.com/ecoma-io/rotation-proxy-gateway/commit/c2fd7d27cac888b5391089262ebac0ef0275c64a))
+* **routing:** harden tunnel opacity and hostname matching ([#76](https://github.com/ecoma-io/rotation-proxy-gateway/issues/76)) ([c0cf2d6](https://github.com/ecoma-io/rotation-proxy-gateway/commit/c0cf2d676235f0dd24c953120691e11070ecffec))
+
 ## [0.4.0](https://github.com/ecoma-io/rotation-proxy-gateway/compare/v0.3.1...v0.4.0) (2026-09-23)
 
 
