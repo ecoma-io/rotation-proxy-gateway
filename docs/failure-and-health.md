@@ -94,7 +94,8 @@ into the router.
   configured fail-closed case where the candidate set is empty (an unmatched
   target with no `default-routes`, or an IP target under the same
   configuration). The client sees the ordinary `05 01`; nothing outside the
-  set is ever contacted as a fallback.
+  set is ever contacted as a fallback. A malformed hostname (an empty or
+  invalid label) is likewise an unmatched target, never a wildcard match.
 - Tunnel bytes stay invisible to routing as they are to health: an HTTP 429 or
   any other application response relayed inside an established tunnel mutates
   no state and triggers no failover. Routing decisions happen exactly once per

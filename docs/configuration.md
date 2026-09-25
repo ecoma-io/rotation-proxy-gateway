@@ -185,8 +185,12 @@ routing:
   `api.openai.com`. A pattern is either a hostname or `*.` followed by a
   hostname; `*.openai.com` matches `api.openai.com` and `a.b.openai.com`, never
   `openai.com` itself (that is what the exact pattern is for) and never
-  `evilopenai.com` (the dot is the label boundary). The wire target is never
-  rewritten: whatever bytes arrive travel to the outbound CONNECT untouched.
+  `evilopenai.com` (the dot is the label boundary). Targets obey the same
+  hostname grammar as patterns — labels of letters, digits, and hyphens, no
+  empty labels — so a malformed name such as `a..b.openai.com` is a non-match
+  that falls through to `default-routes`; it can never satisfy a wildcard by
+  slipping through an empty label. The wire target is never rewritten:
+  whatever bytes arrive travel to the outbound CONNECT untouched.
 - **Unmatched targets resolve to `default-routes`.** Omit the key and an
   unmatched target has no candidates at all: it receives the ordinary `05 01`
   general failure and nothing else in the pool is contacted. An explicit empty

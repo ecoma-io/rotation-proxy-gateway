@@ -52,11 +52,14 @@ When a [routing block](configuration.md#request-routing-routing-block) is
 configured, only a domain target (`0x03`) can match a rule; the match reads
 the frame's hostname case-insensitively with one trailing DNS dot ignored, and
 the target bytes on egress remain exactly the bytes that arrived — matching
-never rewrites, re-resolves, or re-classifies anything. IPv4 and IPv6 targets
-skip the rules entirely and resolve to `default-routes`; an unmatched target
-without default routes is answered with the ordinary `05 01` general failure.
-See [routing and selection](failure-and-health.md#routing-and-selection) for
-how failures behave inside a candidate set.
+never rewrites, re-resolves, or re-classifies anything. A hostname that
+violates the routing grammar (an empty label, an invalid byte, an oversized
+label) is a non-match: it falls to `default-routes` like any unmatched name
+and can never satisfy a wildcard across a malformed label. IPv4 and IPv6
+targets skip the rules entirely and resolve to `default-routes`; an unmatched
+target without default routes is answered with the ordinary `05 01` general
+failure. See [routing and selection](failure-and-health.md#routing-and-selection)
+for how failures behave inside a candidate set.
 
 ## Replies
 

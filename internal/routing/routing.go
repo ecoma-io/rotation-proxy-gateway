@@ -46,8 +46,10 @@ type Router struct {
 }
 
 // compiledRule is one rule with its patterns normalized and its candidate set
-// built once. exact holds whole hostnames; wilds holds ".suffix" forms, so a
-// wildcard match is one HasSuffix plus a label-boundary length check.
+// built once. exact holds whole hostnames; wilds holds ".suffix" forms matched
+// with one HasSuffix — safe as a bare suffix test because every compared name
+// has already passed the shared hostname grammar, so the leading dot can only
+// land on a real label boundary.
 type compiledRule struct {
 	exact  map[string]struct{}
 	wilds  []string
@@ -193,20 +195,42 @@ func validateHostname(host string) error {
 	if strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") {
 		return errors.New("hostname must not begin or end with a dot")
 	}
-	for _, label := range strings.Split(host, ".") {
+	// Walk the labels in place: Match runs this on every domain target, so the
+	// validation scan itself must stay allocation-free. A slicing window needs
+	// no Split, and the empty-label case falls out of the two-dot gap naturally.
+	for start := 0; start < len(host); {
+		label := host[start:]
+		if end := strings.IndexByte(label, '.'); end >= 0 {
+			label = label[:end]
+			start += end + 1
+		} else {
+			start = len(host)
+		}
 		if label == "" || len(label) > 63 {
 			return fmt.Errorf("label %q must be 1-63 characters", label)
 		}
 		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
 			return fmt.Errorf("label %q must not begin or end with a hyphen", label)
 		}
-		for _, r := range label {
-			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
 				return fmt.Errorf("label %q contains a character outside letters, digits, and hyphens", label)
 			}
 		}
 	}
 	return nil
+}
+
+// matchHost validates and normalizes a target hostname. Matching and pattern
+// compilation share this one grammar: an invalid target falls through to the
+// default set rather than matching a byte suffix across an empty label.
+func matchHost(host string) (string, bool) {
+	host = normalizeHost(host)
+	if validateHostname(host) != nil {
+		return "", false
+	}
+	return host, true
 }
 
 // normalizeHost renders a hostname in the one form matching compares:
@@ -235,26 +259,29 @@ func (r *Router) Match(target socksdial.Target) *Set {
 	if target.Type != socksdial.AddrDomain {
 		return r.defaults
 	}
-	host := normalizeHost(target.Host)
+	host, valid := matchHost(target.Host)
+	// Target hostnames pass the same authoritative grammar patterns were
+	// compiled under. A malformed name — an empty label anywhere in it, an
+	// invalid byte, a label past RFC length bounds — can never satisfy a
+	// rule, exact or wildcard, and falls through to the default set like any
+	// other non-match.
+	if !valid {
+		return r.defaults
+	}
 	for i := range r.rules {
 		rule := &r.rules[i]
 		if _, ok := rule.exact[host]; ok {
 			return rule.routes
 		}
 		for _, suffix := range rule.wilds {
-			// The boundary check is two-part: the suffix must match, and the
-			// byte before it must exist and not be a dot. The first is the
-			// label boundary — "*.example.com" matches "api.example.com" and
-			// "a.b.example.com", never "example.com" (which does not end
-			// with the dotted suffix) nor "evilexample.com" (whose suffix
-			// match would eat a label). The second demands that extra label
-			// be non-empty, so a client-spelled "a..example.com" or
-			// "..example.com" — an empty label — falls through to the
-			// default set like any other malformed name.
+			// Validation above guarantees the target is a sequence of
+			// non-empty labels. A dotted suffix can therefore only match at a
+			// label boundary: "*.example.com" accepts "api.example.com" and
+			// "a.b.example.com", but not the bare "example.com" (which does
+			// not end with the dotted suffix) or "evilexample.com" (whose
+			// suffix match would eat part of a label).
 			if strings.HasSuffix(host, suffix) {
-				if i := len(host) - len(suffix); i > 0 && host[i-1] != '.' {
-					return rule.routes
-				}
+				return rule.routes
 			}
 		}
 	}

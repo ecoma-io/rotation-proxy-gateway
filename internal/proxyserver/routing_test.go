@@ -77,7 +77,6 @@ func TestRoutingCandidateIsolation(t *testing.T) {
 	addr := startServer(t, srv)
 
 	// The openai pair serves the openai target; round-robin visits both.
-	seen := map[string]int{}
 	for range 4 {
 		conn, code := socksConnectReply(t, addr, "api.openai.com:80", socksCmdConnect)
 		if code != socksReplySuccess {
@@ -95,7 +94,6 @@ func TestRoutingCandidateIsolation(t *testing.T) {
 	if len(openaiA.hits) == 0 || len(openaiB.hits) == 0 {
 		t.Fatalf("openai candidate hits = a:%d b:%d, want both visited", len(openaiA.hits), len(openaiB.hits))
 	}
-	seen["a"], seen["b"] = len(openaiA.hits), len(openaiB.hits)
 	if got := len(kiloC.hits); got != 0 {
 		t.Fatalf("kilo route hit %d times from an openai-scoped target", got)
 	}
@@ -267,16 +265,25 @@ func TestRoutingConnectTargetRetriesInSet(t *testing.T) {
 	_ = conn.Close()
 
 	snap := pl.Snapshot()
-	if snap[0].Available == false {
+	if !snap[0].Available {
 		t.Fatalf("pair refusal must not cool the route itself: %+v", snap[0])
 	}
-	if snap[0].TargetCooldowns != 1 || snap[1].Successes != 1 {
-		t.Fatalf("pool state after in-set connect_target retry = %+v", snap)
+	if snap[0].TargetCooldowns != 1 || snap[0].Failures != 0 {
+		t.Fatalf("refusing candidate state = %+v, want pair cooldown only", snap[0])
+	}
+	if snap[1].Successes != 1 || snap[1].Failures != 0 || snap[1].TargetCooldowns != 0 {
+		t.Fatalf("surviving candidate state = %+v, want success without pair state", snap[1])
 	}
 }
 
 // A 429 inside an established tunnel is application traffic: the gateway
-// relays it opaquely, health stays clean, and no failover happens.
+// relays it opaquely, health stays clean, and no failover happens. Both
+// candidates are live SOCKS upstreams in a real rule's set (no default-set
+// escape hatch), and each request takes the tunnel end to end: A gets the
+// first (first-seen order among equal recency passes), B the second (A's
+// success advanced its pass). If the gateway interpreted the 429 as a
+// retry/failover signal, the other candidate would be hit early, the pair
+// would cool, or Failovers would advance.
 func TestRoutingTunnelHTTP429NeverMutatesHealth(t *testing.T) {
 	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -292,35 +299,70 @@ func TestRoutingTunnelHTTP429NeverMutatesHealth(t *testing.T) {
 		t.Fatalf("split test server address: %v", err)
 	}
 
-	upstream := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes([]config.RouteSpec{labeledRoute("openai-a", upstream.URL)}, 30*time.Second, time.Minute)
+	// Candidate A: healthy SOCKS proxy that tunnels to the 429 target.
+	upstreamA := startSocks5Proxy(t, socksOptions{})
+	// Candidate B: healthy SOCKS proxy that tunnels to the same target.
+	upstreamB := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes([]config.RouteSpec{
+		labeledRoute("openai-a", upstreamA.URL),
+		labeledRoute("openai-b", upstreamB.URL),
+	}, 30*time.Second, time.Minute)
 	rt := defaultRuntime()
+	// The rule names the target host directly and no default routes exist, so
+	// the candidate scope can only come from the rule — a leak outside the set
+	// would fail the request outright.
 	rt.Routing = mustCompileRouter(t, routing.Spec{
-		Rules:         []routing.RuleSpec{{Domains: []string{"*.openai.com"}, Routes: []string{"openai-a"}}},
-		DefaultRoutes: []string{"openai-a"},
+		Rules: []routing.RuleSpec{{Domains: []string{"localhost"}, Routes: []string{"openai-a", "openai-b"}}},
 	})
 	srv, addr := newSocksServer(t, pl, rt, testLogger())
 
-	conn := socksDialVia(t, addr, net.JoinHostPort("localhost", port))
-	req := fmt.Sprintf("GET / HTTP/1.1\r\nHost: localhost:%s\r\nConnection: close\r\n\r\n", port)
-	if _, err := conn.Write([]byte(req)); err != nil {
-		t.Fatalf("write request: %v", err)
-	}
-	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
-	if err != nil {
-		t.Fatalf("read response: %v", err)
-	}
-	_ = conn.Close()
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429 relayed opaquely", resp.StatusCode)
+	getVia := func(wantA, wantB int) {
+		t.Helper()
+		conn := socksDialVia(t, addr, net.JoinHostPort("localhost", port))
+		req := fmt.Sprintf("GET / HTTP/1.1\r\nHost: localhost:%s\r\nConnection: close\r\n\r\n", port)
+		if _, err := conn.Write([]byte(req)); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429 relayed opaquely", resp.StatusCode)
+		}
+		// Drain the body while the client connection is still open: a short
+		// response may not arrive in one segment, and reading after close
+		// would turn a relay hiccup into a test error.
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read response body: %v", err)
+		}
+		_ = resp.Body.Close()
+		_ = conn.Close()
+		if string(body) != "slow down" {
+			t.Fatalf("response body = %q, want %q relayed unchanged", body, "slow down")
+		}
+		if got := len(upstreamA.hits); got != wantA {
+			t.Fatalf("candidate A hits = %d, want %d", got, wantA)
+		}
+		if got := len(upstreamB.hits); got != wantB {
+			t.Fatalf("candidate B hits = %d, want %d", got, wantB)
+		}
 	}
 
-	snap := pl.Snapshot()[0]
-	if snap.Successes != 1 || snap.Failures != 0 || snap.TargetFailures != 0 || snap.TargetCooldowns != 0 || !snap.Available {
-		t.Fatalf("tunnel bytes mutated health: %+v", snap)
+	getVia(1, 0) // A establishes the tunnel and relays the 429; B stays idle.
+	getVia(1, 1) // B takes the next request by plain round-robin, not failover.
+
+	snap := pl.Snapshot()
+	for i, label := range []string{"A", "B"} {
+		s := snap[i]
+		if s.Successes != 1 || s.Failures != 0 || s.TargetFailures != 0 ||
+			s.TargetCooldowns != 0 || !s.Available || s.CooldownFor != "0s" {
+			t.Fatalf("candidate %s health mutated by tunnel bytes: %+v", label, s)
+		}
 	}
-	if status := srv.ListenerStatus(); status.Requests != 1 || status.Failovers != 0 {
-		t.Fatalf("listener status = %+v, want one request and no failover", status)
+	if status := srv.ListenerStatus(); status.Requests != 2 || status.Failovers != 0 {
+		t.Fatalf("listener status = %+v, want two requests and no failover", status)
 	}
 }
 
