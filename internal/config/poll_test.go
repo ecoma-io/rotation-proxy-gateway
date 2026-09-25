@@ -47,8 +47,16 @@ func TestPollerDetectsContentChanges(t *testing.T) {
 	}
 	waitChange("atomic replace")
 
-	// Rewriting identical content is not a change.
-	if err := os.WriteFile(path, []byte("a: 3\n"), 0o600); err != nil {
+	// Rewriting identical content is not a change. The rewrite is atomic
+	// (tmp + rename) like every quiet assertion below: an in-place
+	// truncate+write leaves a readable empty window that a tick landing
+	// inside it correctly reports as a change (the same reader-atomicity
+	// constraint TestPollerReadFailureKeepsBaseline documents).
+	tmp = path + ".tmp"
+	if err := os.WriteFile(tmp, []byte("a: 3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
 		t.Fatal(err)
 	}
 	select {
