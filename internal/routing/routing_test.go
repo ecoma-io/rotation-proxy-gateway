@@ -80,6 +80,71 @@ func TestMatchWildcardRejectsEmptyExtraLabel(t *testing.T) {
 	}
 }
 
+// The full adversarial matrix for wildcard matching against malformed or
+// lookalike target hostnames: every case must fall through to the default
+// set (or unrestricted/empty), never match the wildcard rule. Valid
+// multi-level subdomains still match. This pins the hostname grammar as the
+// single authoritative validation rule.
+func TestMatchWildcardAdversarialMatrix(t *testing.T) {
+	r := mustCompile(t, Spec{
+		Rules:         []RuleSpec{{Domains: []string{"*.openai.com"}, Routes: []string{"wild"}}},
+		DefaultRoutes: []string{"default"},
+	})
+
+	for _, host := range []string{
+		// Empty labels anywhere in the name — deeper than the immediate
+		// boundary label — must never satisfy the suffix test.
+		"a..openai.com",
+		"a..b.openai.com",
+		"foo..bar.openai.com",
+		"x...openai.com",
+		"..openai.com",
+		".openai.com",
+		"openai.com..",
+		// Bare suffix and lookalike suffixes.
+		"openai.com",
+		"evilopenai.com",
+		"fooevilopenai.com",
+		// Empty or whitespace.
+		"",
+		" ",
+		// Invalid characters.
+		"api_openai.com",
+		"*.openai.com",
+		"a*b.openai.com",
+		"api..openai.com.",
+		// Leading/trailing hyphens.
+		"-api.openai.com",
+		"api-.openai.com",
+		// Label too long (64 bytes).
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.openai.com",
+		// Non-ASCII characters.
+		"ãpi.openai.com",
+	} {
+		set := r.Match(domainTarget(host))
+		if set == nil || !set.Allows("default") || set.Size() != 1 {
+			t.Fatalf("Match(%q) = %+v, want the default set (no wildcard match)", host, set)
+		}
+	}
+
+	// Valid targets still match, including deep subdomains, case variants,
+	// and a trailing DNS dot.
+	for _, host := range []string{
+		"api.openai.com",
+		"a.b.openai.com",
+		"deep.sub.api.openai.com",
+		"API.OpenAI.COM",
+		"api.openai.com.",
+		"a-b.openai.com",
+		"a1.openai.com",
+	} {
+		set := r.Match(domainTarget(host))
+		if set == nil || !set.Allows("wild") || set.Size() != 1 {
+			t.Fatalf("Match(%q) = %+v, want the wildcard candidate set", host, set)
+		}
+	}
+}
+
 func TestMatchCaseNormalization(t *testing.T) {
 	r := mustCompile(t, Spec{Rules: []RuleSpec{
 		{Domains: []string{"API.OpenAI.com"}, Routes: []string{"exact"}},
