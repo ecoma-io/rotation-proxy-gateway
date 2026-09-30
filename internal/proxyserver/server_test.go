@@ -612,7 +612,9 @@ func TestWriteHTTPErrorShape(t *testing.T) {
 // there would contradict what the gateway just established.
 func TestConnectSuccessReplyLeavesConnectionUnmodified(t *testing.T) {
 	var wire bytes.Buffer
-	(&connectReplier{conn: &wire}).ok()
+	if err := (&connectReplier{conn: &wire}).ok(); err != nil {
+		t.Fatalf("writeHTTPError-free success reply: %v", err)
+	}
 	want := "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
 	if wire.String() != want {
 		t.Fatalf("CONNECT success wrote %q, want %q", wire.String(), want)

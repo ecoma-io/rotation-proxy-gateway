@@ -571,20 +571,11 @@ func newFamilyPoolServer(t *testing.T, kinds ...config.EgressKind) (*Server, *po
 // cooldownHold keeps a route that failed through the injected dial out of
 // service for the rest of a test. The error states it rather than the test
 // reaching into pool internals, so the scenario reads the way the real thing
-// behaves: a route that is down stays down.
+// behaves: a route that is down stays down. A route-scoped failure class is what
+// makes the hold last — a CONNECT the endpoint itself refuses cools only that
+// (route, target) pair, which the next request for the same target would still
+// be inside of.
 const cooldownHold = time.Hour
-
-// refusingDial fails every attempt as a route-level dial failure, which is an
-// in-band failover: the route cools and the chain continues to another
-// candidate. A route-scoped class is what makes the cooldown hold across
-// requests — a CONNECT the endpoint itself refuses cools only that
-// (route, target) pair, which the next request for the same target would
-// still be inside of.
-func refusingDial(hold time.Duration) func(context.Context, *url.URL, socksdial.Target, time.Duration) (net.Conn, error) {
-	return func(context.Context, *url.URL, socksdial.Target, time.Duration) (net.Conn, error) {
-		return nil, (&socksdial.ProxyDialError{Err: errors.New("connect refused (TEST)")}).WithRetryAfter(hold)
-	}
-}
 
 // The family header is a request-scoped selection constraint, never part of
 // route identity. Two requests for one target that differ only in the header
@@ -754,13 +745,9 @@ func TestRequestIDIsBoundedInTheLog(t *testing.T) {
 // also not the request_id counter: that one must keep counting valid requests
 // that reached selection, which is what the per-listener /status figure is.
 func TestRequestIDSurvivesEveryRetryInOneChain(t *testing.T) {
-	pl := pool.NewRoutes([]config.RouteSpec{
-		{URL: &url.URL{Scheme: "socks5", Host: "127.0.0.1:1"}, Kind: config.EgressV4},
-		{URL: &url.URL{Scheme: "socks5", Host: "127.0.0.1:2"}, Kind: config.EgressV4},
-	}, time.Minute, time.Minute)
 	good := startSocks5Proxy(t, socksOptions{connectRaw: connectSuccessRaw})
 	// One dead route, one live one, so the chain falls back exactly once.
-	pl = pool.NewRoutes([]config.RouteSpec{
+	pl := pool.NewRoutes([]config.RouteSpec{
 		{URL: &url.URL{Scheme: "socks5", Host: "127.0.0.1:1"}, Kind: config.EgressV4},
 		{URL: good.URL, Kind: config.EgressV4},
 	}, time.Minute, time.Minute)

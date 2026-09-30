@@ -308,7 +308,7 @@ func validateHTTPProxyRequest(req *http.Request, suppliedHost string) (socksdial
 		return socksdial.Target{}, false, http.StatusMethodNotAllowed, errors.New("forward proxy does not support this method")
 	}
 	if req.URL.User != nil || (suppliedHost != "" && !sameHTTPAuthority(req.URL.Host, suppliedHost)) {
-		return socksdial.Target{}, false, http.StatusBadRequest, errors.New("Host does not match absolute request target")
+		return socksdial.Target{}, false, http.StatusBadRequest, errors.New("host does not match absolute request target")
 	}
 	target, err := targetFromAuthority(req.URL.Host, false)
 	if err != nil {
