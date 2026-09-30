@@ -133,7 +133,7 @@ func TestListenerSelectsOnlyAllowedEgressKind(t *testing.T) {
 		{name: "v6", addr: v6Addr, expect: v6, other: v4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			conn := socksDialVia(t, tc.addr, target)
+			conn := httpDialVia(t, tc.addr, target)
 			readBanner(t, conn)
 			_ = conn.Close()
 
@@ -159,7 +159,7 @@ func TestListenerLogsItsNameAndAdminAggregatesStatus(t *testing.T) {
 	srv := NewRuntime(runtime, captureLogger(&logs), "test", "v4", config.EgressV4)
 	addr := startServer(t, srv)
 
-	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	conn := httpDialVia(t, addr, startRawEchoTarget(t))
 	readBanner(t, conn)
 	_ = conn.Close()
 	if got := waitForRecord(t, &logs, map[string]string{"msg": "tunnel", "listener": "v4"}); got == "" {
@@ -186,8 +186,9 @@ func TestListenerLogsItsNameAndAdminAggregatesStatus(t *testing.T) {
 }
 
 // A dedicated listener without a matching route stays live and answers the
-// ordinary no-route failure without touching the other kind's routes.
-func TestListenerNoEligibleRouteRepliesGeneralFailure(t *testing.T) {
+// ordinary no-route failure — 503 on the HTTP ingress — without touching the
+// other kind's routes.
+func TestListenerNoEligibleRouteRepliesServiceUnavailable(t *testing.T) {
 	u, err := url.Parse("socks5://v4.test:1080")
 	if err != nil {
 		t.Fatal(err)
@@ -197,10 +198,8 @@ func TestListenerNoEligibleRouteRepliesGeneralFailure(t *testing.T) {
 	srv := NewRuntime(runtime, testLogger(), "test", "v6", config.EgressV6)
 	addr := startServer(t, srv)
 
-	conn, code := socksConnectReply(t, addr, "example.test:80", socksCmdConnect)
-	_ = conn.Close()
-	if code != socksReplyGeneral {
-		t.Fatalf("reply = 0x%02x, want general failure 0x01", code)
+	if status := httpConnectStatus(t, addr, "example.test:80"); status != http.StatusServiceUnavailable {
+		t.Fatalf("CONNECT status = %d, want 503", status)
 	}
 	if snap := pl.Snapshot()[0]; snap.Failures != 0 || snap.Successes != 0 {
 		t.Fatalf("no-route changed health: %+v", snap)

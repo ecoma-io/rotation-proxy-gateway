@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -169,71 +168,21 @@ func startServer(t *testing.T, srv *Server) string {
 	return ln.Addr().String()
 }
 
-func newSocksServer(t *testing.T, pl *pool.Pool, runtime *config.RuntimeConfig, log zerolog.Logger, allowed ...config.EgressKind) (*Server, string) {
+// newProxyServer is the common "serve on a live loopback listener" shorthand
+// every end-to-end unit test starts from.
+func newProxyServer(t *testing.T, pl *pool.Pool, runtime *config.RuntimeConfig, log zerolog.Logger, allowed ...config.EgressKind) (*Server, string) {
 	t.Helper()
 	srv := newRuntimeServer(pl, runtime, log, allowed...)
 	return srv, startServer(t, srv)
 }
 
-// --- SOCKS5 client helpers -------------------------------------------------
+// --- HTTP ingress client helpers -------------------------------------------
+//
+// The data plane speaks HTTP forward proxy: one CONNECT or one absolute-form
+// request per connection, each answered with a bodyless status line. These
+// helpers replace the former SOCKS greeting and frame builders.
 
-// socksGreetingFrame encodes VER NMETHODS METHODS...
-func socksGreetingFrame(methods ...byte) []byte {
-	return append([]byte{socksVersion, byte(len(methods))}, methods...)
-}
-
-// socksRequestFrame encodes one request for host:port. IPv4 and IPv6 literals
-// are binary encoded; anything else becomes a domain name, so a test can send
-// a textual name without resolving it.
-func socksRequestFrame(cmd byte, target string) ([]byte, error) {
-	host, portText, err := net.SplitHostPort(target)
-	if err != nil {
-		return nil, fmt.Errorf("split target %q: %w", target, err)
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil || port < 1 || port > 65535 {
-		return nil, fmt.Errorf("target %q has no usable port", target)
-	}
-	var atyp byte
-	var addr []byte
-	switch {
-	case len(host) > 255:
-		return nil, fmt.Errorf("target host %q is too long for a domain name", host)
-	default:
-		if ip := net.ParseIP(host); ip != nil {
-			if v4 := ip.To4(); v4 != nil {
-				atyp, addr = socksAtypIPv4, v4
-			} else {
-				atyp, addr = socksAtypIPv6, ip.To16()
-			}
-		} else {
-			atyp = socksAtypDomain
-			addr = append([]byte{byte(len(host))}, host...)
-		}
-	}
-	frame := make([]byte, 0, len(addr)+6)
-	frame = append(frame, socksVersion, cmd, 0x00, atyp)
-	frame = append(frame, addr...)
-	return append(frame, byte(port>>8), byte(port)), nil
-}
-
-// socksConnectReply performs the RFC 1928 greeting plus one request against
-// the gateway and returns the connection with its reply code. It never judges
-// the code: callers decide what a test expects.
-func socksConnectReply(t *testing.T, gatewayAddr, target string, cmd byte) (net.Conn, byte) {
-	t.Helper()
-	frame, err := socksRequestFrame(cmd, target)
-	if err != nil {
-		t.Fatalf("encode request for %s: %v", target, err)
-	}
-	return socksConnectReplyFrame(t, gatewayAddr, frame)
-}
-
-// socksConnectReplyFrame performs the greeting exchange, sends frame verbatim
-// as the CONNECT request, and returns the tunnel plus the reply code. Tests
-// that must control the frame's address type exactly (a frame whose ATYP
-// disagrees with the host string's apparent family) go through here.
-func socksConnectReplyFrame(t *testing.T, gatewayAddr string, frame []byte) (net.Conn, byte) {
+func dialGateway(t *testing.T, gatewayAddr string) net.Conn {
 	t.Helper()
 	conn, err := net.Dial("tcp", gatewayAddr)
 	if err != nil {
@@ -241,77 +190,130 @@ func socksConnectReplyFrame(t *testing.T, gatewayAddr string, frame []byte) (net
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := conn.Write(socksGreetingFrame(socksAuthNone)); err != nil {
-		t.Fatalf("write greeting: %v", err)
-	}
-	method := make([]byte, 2)
-	if _, err := io.ReadFull(conn, method); err != nil {
-		t.Fatalf("read method selection: %v", err)
-	}
-	if method[0] != socksVersion || method[1] != socksAuthNone {
-		t.Fatalf("method selection = %#02x %#02x, want 05 00", method[0], method[1])
-	}
-	if _, err := conn.Write(frame); err != nil {
-		t.Fatalf("write request: %v", err)
-	}
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		t.Fatalf("read SOCKS reply: %v", err)
-	}
-	if reply[0] != socksVersion {
-		t.Fatalf("reply version = %#02x, want 05", reply[0])
-	}
-	// Established tunnels carry no timeouts.
-	_ = conn.SetDeadline(time.Time{})
-	return conn, reply[1]
-}
-
-// socksRequestFrameWithATYP renders a CONNECT request carrying exactly atyp,
-// whatever the host string looks like — the ingress-side twin of the e2e
-// suite's socksConnectFrameWithATYP.
-func socksRequestFrameWithATYP(cmd byte, host string, port uint16, atyp byte) ([]byte, error) {
-	var addr []byte
-	switch atyp {
-	case socksAtypIPv4:
-		ip := net.ParseIP(host)
-		if ip == nil || ip.To4() == nil {
-			return nil, fmt.Errorf("host %q does not encode as IPv4", host)
-		}
-		addr = ip.To4()
-	case socksAtypDomain:
-		if len(host) == 0 || len(host) > 255 {
-			return nil, fmt.Errorf("target hostname length %d is invalid", len(host))
-		}
-		addr = append([]byte{byte(len(host))}, host...)
-	case socksAtypIPv6:
-		ip := net.ParseIP(host)
-		if ip == nil {
-			return nil, fmt.Errorf("host %q does not encode as IPv6", host)
-		}
-		addr = ip.To16()
-	default:
-		return nil, fmt.Errorf("unsupported ATYP %#02x", atyp)
-	}
-	frame := make([]byte, 0, len(addr)+6)
-	frame = append(frame, socksVersion, cmd, 0x00, atyp)
-	frame = append(frame, addr...)
-	return append(frame, byte(port>>8), byte(port)), nil
-}
-
-// socksDialVia connects through the gateway to target and returns the tunnel
-// after checking the success reply.
-func socksDialVia(t *testing.T, gatewayAddr, target string) net.Conn {
-	t.Helper()
-	conn, code := socksConnectReply(t, gatewayAddr, target, socksCmdConnect)
-	if code != socksReplySuccess {
-		t.Fatalf("CONNECT reply = 0x%02x, want success 0x00", code)
-	}
 	return conn
 }
 
+// httpConnectRequest renders a conforming CONNECT request line and headers for
+// an authority-form target ("host:port"). The Host header repeats the tunnel
+// authority, so a well-behaved client never disagrees with its own request
+// line; tests that need a disagreement build the frame themselves.
+func httpConnectRequest(target string) []byte {
+	return []byte("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n")
+}
+
+// httpForwardRequest renders one absolute-form forward-proxy request. Every
+// header is passed verbatim — including a disagreeing Host, or none at all —
+// so a test controls the authority it wants the gateway to see.
+func httpForwardRequest(method, rawURL string, headers ...string) []byte {
+	var frame strings.Builder
+	frame.WriteString(method + " " + rawURL + " HTTP/1.1\r\n")
+	for _, header := range headers {
+		frame.WriteString(header + "\r\n")
+	}
+	frame.WriteString("\r\n")
+	return []byte(frame.String())
+}
+
+// requestMethodOf recovers the request method from a rendered request frame so
+// the response is parsed in the same conversation it belongs to.
+func requestMethodOf(frame []byte) string {
+	method, _, _ := bytes.Cut(frame, []byte(" "))
+	return string(method)
+}
+
+// readIngressResponse parses one response header block. Every response the
+// gateway itself writes is bodyless, so the caller may immediately reuse the
+// connection as a raw tunnel byte stream; a relayed absolute-form response
+// carries a real body, which the caller reads through the returned response.
+func readIngressResponse(t *testing.T, br *bufio.Reader, method string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, "http://ingress.invalid/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		t.Fatalf("read ingress response: %v", err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	return resp
+}
+
+// httpTunnel is a CONNECT tunnel the gateway already answered 200 for. Reads go
+// through br because the HTTP parser may have pulled the client's first tunnel
+// bytes into its own buffer while framing headers; writes and closes go
+// straight to the socket, which is what the server relays over.
+type httpTunnel struct {
+	net.Conn
+	br *bufio.Reader
+}
+
+func (tun *httpTunnel) Read(p []byte) (int, error) { return tun.br.Read(p) }
+
+// httpConnectReply sends one CONNECT request and returns the connection, the
+// reader that still owns any bytes the header parser read ahead, and the
+// status the gateway answered. It never judges the status: callers decide what
+// a test expects.
+func httpConnectReply(t *testing.T, gatewayAddr, target string) (net.Conn, *bufio.Reader, int) {
+	t.Helper()
+	conn := dialGateway(t, gatewayAddr)
+	if _, err := conn.Write(httpConnectRequest(target)); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	br := bufio.NewReader(conn)
+	return conn, br, readIngressResponse(t, br, http.MethodConnect).StatusCode
+}
+
+// httpConnectStatus sends one CONNECT and returns only the status it drew.
+func httpConnectStatus(t *testing.T, gatewayAddr, target string) int {
+	t.Helper()
+	_, _, status := httpConnectReply(t, gatewayAddr, target)
+	return status
+}
+
+// httpDialVia opens a CONNECT tunnel and fails the test unless the gateway
+// answered 200.
+func httpDialVia(t *testing.T, gatewayAddr, target string) *httpTunnel {
+	t.Helper()
+	conn, br, status := httpConnectReply(t, gatewayAddr, target)
+	if status != http.StatusOK {
+		t.Fatalf("CONNECT %s = %d, want 200", target, status)
+	}
+	// Established tunnels carry no timeouts.
+	_ = conn.SetDeadline(time.Time{})
+	return &httpTunnel{Conn: conn, br: br}
+}
+
+// parkClient sends one CONNECT and returns without reading a reply: the session
+// is now parked wherever the server's dial seam puts it. The caller owns
+// closing, and reads the parked session's answer through the returned reader.
+func parkClient(t *testing.T, gatewayAddr, target string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	conn := dialGateway(t, gatewayAddr)
+	if _, err := conn.Write(httpConnectRequest(target)); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	return conn, bufio.NewReader(conn)
+}
+
+// httpForward sends one absolute-form request through the gateway and returns
+// the response exactly as the client received it — the origin's own status,
+// body, and headers.
+func httpForward(t *testing.T, gatewayAddr string, frame []byte, method string) *http.Response {
+	t.Helper()
+	conn := dialGateway(t, gatewayAddr)
+	if _, err := conn.Write(frame); err != nil {
+		t.Fatalf("write forward request: %v", err)
+	}
+	return readIngressResponse(t, bufio.NewReader(conn), method)
+}
+
 // readBanner consumes the echo target's greeting bytes, proving the tunnel
-// carries data from the upstream to the client before the client writes.
-func readBanner(t *testing.T, conn net.Conn) string {
+// carries data from the upstream to the client before the client writes. It
+// takes an io.Reader rather than a net.Conn because the HTTP header parser may
+// have read the client's first tunnel bytes ahead: a test that already holds a
+// *bufio.Reader must read through it or it would drop those bytes.
+func readBanner(t *testing.T, conn io.Reader) string {
 	t.Helper()
 	banner := make([]byte, len("banner\n"))
 	if _, err := io.ReadFull(conn, banner); err != nil {
@@ -322,67 +324,68 @@ func readBanner(t *testing.T, conn net.Conn) string {
 
 // --- raw protocol helpers --------------------------------------------------
 
-// socksRejectCase is one inbound conversation the server must reject.
-type socksRejectCase struct {
-	name        string
-	greeting    []byte
-	methodReply bool   // consume the 2-byte method selection reply first
-	request     []byte // sent after the method selection reply
-	wantReply   []byte // bytes the server writes before closing; nil = silent close
-	// truncated marks an incomplete frame: the server cannot know its length,
-	// so the only correct behavior is to keep waiting (its handshake deadline
-	// closes the session later) rather than to reply.
+// httpRejectCase is one inbound request the gateway must answer before route
+// selection ever happens.
+type httpRejectCase struct {
+	name    string
+	request []byte
+	// wantStatus is the protocol status the gateway answers.
+	wantStatus int
+	// truncated marks an incomplete header block: the gateway cannot know the
+	// request has ended, so the only correct behavior is to keep waiting for
+	// the rest rather than to answer (its handshake deadline closes the session
+	// later).
 	truncated bool
 }
 
-// socksRejectExchange runs one reject conversation and returns the reply bytes
-// the server wrote before closing (nothing for a silent parse rejection).
-func socksRejectExchange(t *testing.T, addr string, tc socksRejectCase) []byte {
+// httpRejectExchange runs one reject conversation and returns the status the
+// gateway answered.
+func httpRejectExchange(t *testing.T, addr string, tc httpRejectCase) int {
 	t.Helper()
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial gateway: %v", err)
+	conn := dialGateway(t, addr)
+	if _, err := conn.Write(tc.request); err != nil {
+		t.Fatalf("write request: %v", err)
 	}
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	if _, err := conn.Write(tc.greeting); err != nil {
-		t.Fatalf("write greeting: %v", err)
-	}
-	if tc.methodReply {
-		method := make([]byte, 2)
-		if _, err := io.ReadFull(conn, method); err != nil {
-			t.Fatalf("read method selection: %v", err)
-		}
-		if method[0] != socksVersion || method[1] != socksAuthNone {
-			t.Fatalf("method selection = %#02x %#02x, want 05 00", method[0], method[1])
-		}
-	}
-	if len(tc.request) > 0 {
-		if _, err := conn.Write(tc.request); err != nil {
-			t.Fatalf("write request: %v", err)
-		}
-	}
-	if len(tc.wantReply) > 0 {
-		got := make([]byte, len(tc.wantReply))
-		if _, err := io.ReadFull(conn, got); err != nil {
-			t.Fatalf("read reject reply: %v", err)
-		}
-		return got
-	}
-	// A rejected conversation must never write a reply: a complete but invalid
-	// frame closes silently, an incomplete frame keeps waiting for the rest.
-	// The exact read error is OS dependent (EOF, reset, or the test's own
-	// deadline), so only silence is pinned here.
+	// An incomplete block is never answered, so that silence is what is pinned:
+	// the exact read error (EOF, reset, or the test's own deadline) is OS
+	// dependent. Every other reject is asserted by its status.
 	window := 2 * time.Second
 	if tc.truncated {
 		window = 200 * time.Millisecond
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(window))
-	var one [1]byte
-	if n, _ := conn.Read(one[:]); n != 0 {
-		t.Fatalf("silent reject wrote % x", one[:n])
+	status, err := tryReadIngressStatus(bufio.NewReader(conn), requestMethodOf(tc.request))
+	if tc.truncated {
+		if err == nil {
+			t.Fatal("an incomplete header block must not be answered")
+		}
+		return 0
 	}
-	return nil
+	if err != nil {
+		t.Fatalf("read reject reply: %v", err)
+	}
+	return status
+}
+
+// tryReadIngressStatus parses one response header block without failing the
+// test, for the conversation shapes where no reply is the correct outcome.
+//
+// Every protocol reject the gateway writes is a bodyless, header-only response,
+// so the method attached to the synthetic request is irrelevant to parsing. It
+// is deliberately not taken from the request frame: a malformed request line
+// ("NOT-A-REQUEST") is not a legal method, and http.NewRequest would reject the
+// probe itself before the gateway's own status could be read.
+func tryReadIngressStatus(br *bufio.Reader, _ string) (int, error) {
+	req, err := http.NewRequest(http.MethodGet, "http://ingress.invalid/", nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		return 0, err
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode, nil
 }
 
 // --- test targets ----------------------------------------------------------
@@ -507,9 +510,9 @@ func startAbortTarget(t *testing.T) string {
 			go func(conn net.Conn) {
 				defer func() { _ = conn.Close() }()
 				_, _ = conn.Write([]byte("partial"))
-				// Let the SOCKS success reply reach the gateway before the
-				// reset: a too-early RST can destroy the unread reply in
-				// flight, which would be a handshake failure instead.
+				// Let the gateway's SOCKS success reply reach the dialer
+				// before the reset: a too-early RST can destroy the unread
+				// reply in flight, which would be a handshake failure instead.
 				time.Sleep(100 * time.Millisecond)
 				if tc, ok := conn.(*net.TCPConn); ok {
 					_ = tc.SetLinger(0) // reset instead of a clean close
@@ -520,322 +523,144 @@ func startAbortTarget(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// --- protocol surface ------------------------------------------------------
+// --- target classification -------------------------------------------------
 
-// ingressRequestFromFrame feeds frame to readSocksRequest through a complete
-// greeting exchange and returns the parsed request.
-func ingressRequestFromFrame(t *testing.T, frame []byte) socksRequest {
-	t.Helper()
-	serverSide, clientSide := net.Pipe()
-	defer func() { _ = serverSide.Close(); _ = clientSide.Close() }()
-	type outcome struct {
-		req socksRequest
-		err error
-	}
-	results := make(chan outcome, 1)
-	go func() {
-		req, err := readSocksRequest(bufio.NewReader(serverSide), serverSide, nil)
-		results <- outcome{req: req, err: err}
-	}()
-	if _, err := clientSide.Write(socksGreetingFrame(socksAuthNone)); err != nil {
-		t.Fatal(err)
-	}
-	method := make([]byte, 2)
-	if _, err := io.ReadFull(clientSide, method); err != nil {
-		t.Fatalf("read method selection: %v", err)
-	}
-	if method[0] != socksVersion || method[1] != socksAuthNone {
-		t.Fatalf("method selection = %#02x %#02x, want 05 00", method[0], method[1])
-	}
-	if _, err := clientSide.Write(frame); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case got := <-results:
-		if got.err != nil {
-			t.Fatalf("readSocksRequest: %v", got.err)
-		}
-		return got.req
-	case <-time.After(time.Second):
-		t.Fatal("readSocksRequest did not finish")
-	}
-	return socksRequest{}
-}
-
-func TestReadSocksRequestAcceptsConnectTargets(t *testing.T) {
-	// The parsed request must carry the frame's own address type — the type
-	// the outbound CONNECT will reproduce, never re-inferred from the host.
+// The ingress never resolves a name: an IP literal stays its literal address
+// type and everything else stays a domain, so the outbound SOCKS5H hop is the
+// only place DNS happens. targetFromAuthority is the one place that decides,
+// from HTTP authority syntax alone.
+func TestTargetFromAuthorityClassifiesWithoutResolving(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		target   string
-		wantType socksdial.AddrType
+		name      string
+		authority string
+		// omitPortAllowed marks an absolute-form authority, which inherits
+		// the scheme's default port 80. CONNECT may never omit it.
+		omitPortAllowed bool
+		wantAddr        string
+		wantType        socksdial.AddrType
 	}{
-		{"ipv4", "127.0.0.1:8080", socksdial.AddrIPv4},
-		{"domain", "example.test:443", socksdial.AddrDomain},
-		{"ipv6", "[2001:db8::1]:443", socksdial.AddrIPv6},
+		{name: "ipv4 literal", authority: "127.0.0.1:8080", wantAddr: "127.0.0.1:8080", wantType: socksdial.AddrIPv4},
+		{name: "domain name", authority: "example.test:443", wantAddr: "example.test:443", wantType: socksdial.AddrDomain},
+		{name: "ipv6 literal", authority: "[2001:db8::1]:443", wantAddr: "[2001:db8::1]:443", wantType: socksdial.AddrIPv6},
+		{name: "dotted quad is a literal", authority: "1.2.3.4:443", wantAddr: "1.2.3.4:443", wantType: socksdial.AddrIPv4},
+		{name: "absolute form inherits port 80", authority: "example.test", omitPortAllowed: true,
+			wantAddr: "example.test:80", wantType: socksdial.AddrDomain},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			frame, err := socksRequestFrame(socksCmdConnect, tc.target)
+			got, err := targetFromAuthority(tc.authority, !tc.omitPortAllowed)
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("targetFromAuthority(%q): %v", tc.authority, err)
 			}
-			req := ingressRequestFromFrame(t, frame)
-			if req.target.Addr() != tc.target || req.cmd != socksCmdConnect {
-				t.Fatalf("request = %+v, want target %q cmd CONNECT", req, tc.target)
-			}
-			if req.target.Type != tc.wantType {
-				t.Fatalf("target type = %d, want %d", req.target.Type, tc.wantType)
+			if got.Addr() != tc.wantAddr || got.Type != tc.wantType {
+				t.Fatalf("targetFromAuthority(%q) = %+v, want %q of type %d", tc.authority, got, tc.wantAddr, tc.wantType)
 			}
 		})
 	}
 }
 
-// The parser must keep the frame's own address type even when the host
-// string's apparent family disagrees — a domain frame whose name is a dotted
-// quad, and an IPv6 frame carrying v4-mapped bytes. These are the only
-// discriminating inputs: for agreeing frames, a type re-derived from the
-// string is byte-for-byte indistinguishable from the carried one, so a
-// regression to string-shape re-inference would pass every agreeing case.
-func TestReadSocksRequestKeepsFrameTypeOverHostShape(t *testing.T) {
-	t.Run("dotted-quad name stays a domain", func(t *testing.T) {
-		frame, err := socksRequestFrameWithATYP(socksCmdConnect, "1.2.3.4", 443, socksAtypDomain)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req := ingressRequestFromFrame(t, frame)
-		if req.target.Type != socksdial.AddrDomain || req.target.Host != "1.2.3.4" || req.target.Addr() != "1.2.3.4:443" {
-			t.Fatalf("request = %+v, want 1.2.3.4:443 kept as a domain target", req.target)
-		}
-	})
-	t.Run("v4-mapped bytes stay ipv6", func(t *testing.T) {
-		frame, err := socksRequestFrameWithATYP(socksCmdConnect, "::ffff:127.0.0.1", 443, socksAtypIPv6)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req := ingressRequestFromFrame(t, frame)
-		if req.target.Type != socksdial.AddrIPv6 || req.target.Addr() != "127.0.0.1:443" {
-			t.Fatalf("request = %+v, want the v4-mapped bytes kept as an IPv6 target", req.target)
-		}
-	})
-}
-
-// A client may pipeline payload behind the CONNECT frame in one write. The
-// framing reader captures those bytes, so they must reach the upstream relay
-// rather than being dropped with the handshake buffers.
-func TestPipelinedBytesAfterConnectReachRelay(t *testing.T) {
-	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute)
-	_, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
-	target := startRawEchoTarget(t)
-
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	frame, err := socksRequestFrame(socksCmdConnect, target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload := []byte("pipelined-payload")
-	// One write: greeting, CONNECT frame, and payload together — a single
-	// socket segment is exactly the case a field-by-field reader would break.
-	burst := append(socksGreetingFrame(socksAuthNone), frame...)
-	burst = append(burst, payload...)
-	if _, err := conn.Write(burst); err != nil {
-		t.Fatalf("write burst: %v", err)
-	}
-	method := make([]byte, 2)
-	if _, err := io.ReadFull(conn, method); err != nil {
-		t.Fatalf("read method selection: %v", err)
-	}
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		t.Fatalf("read SOCKS reply: %v", err)
-	}
-	if reply[1] != socksReplySuccess {
-		t.Fatalf("CONNECT reply = 0x%02x, want success", reply[1])
-	}
-	// The echo target's banner crosses the tunnel first; the payload follows.
-	banner := make([]byte, len("banner\n"))
-	if _, err := io.ReadFull(conn, banner); err != nil {
-		t.Fatalf("read banner: %v", err)
-	}
-	echo := make([]byte, len(payload))
-	if _, err := io.ReadFull(conn, echo); err != nil {
-		t.Fatalf("read echoed payload: %v", err)
-	}
-	if !bytes.Equal(echo, payload) {
-		t.Fatalf("echoed payload = %q, want %q", echo, payload)
+// The port rules are strict in both directions: CONNECT names a TCP tunnel and
+// must carry a port, an empty or out-of-range port is never a target, and no
+// authority may smuggle userinfo, a path, a query, or a fragment.
+func TestTargetFromAuthorityRejectsUnusableAuthorities(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		authority string
+	}{
+		{name: "connect without a port", authority: "example.test"},
+		{name: "empty port", authority: "example.test:"},
+		{name: "zero port", authority: "example.test:0"},
+		{name: "port above the range", authority: "example.test:65536"},
+		{name: "non-numeric port", authority: "example.test:https"},
+		{name: "userinfo", authority: "user:pass@example.test:443"},
+		{name: "path", authority: "example.test:443/tunnel"},
+		{name: "query", authority: "example.test:443?a=1"},
+		{name: "fragment", authority: "example.test:443#f"},
+		{name: "embedded space", authority: "example.test 443"},
+		{name: "empty authority", authority: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := targetFromAuthority(tc.authority, true); err == nil {
+				t.Fatalf("targetFromAuthority(%q) accepted an unusable authority", tc.authority)
+			}
+		})
 	}
 }
 
-// countingConn counts how many reads the server's framing performed on the
-// client socket.
-type countingConn struct {
-	net.Conn
-	reads atomic.Int64
-}
-
-func (c *countingConn) Read(b []byte) (int, error) {
-	c.reads.Add(1)
-	return c.Conn.Read(b)
-}
-
-// A complete greeting+CONNECT burst must be framed with at most two client
-// reads: the buffered framing reader captures the whole exchange in one fill,
-// and one extra read is the split-burst allowance for real TCP fragmentation.
-// The field-by-field framing this replaced needed four reads (greeting head,
-// methods, request head, target) for the same burst.
-func TestInboundFramingReadBudget(t *testing.T) {
-	pl := pool.NewRoutes(nil, 30*time.Second, time.Minute)
-	s := newRuntimeServer(pl, defaultRuntime(), testLogger())
-
-	// A real TCP socket, not net.Pipe: the pipe is synchronous, so a burst
-	// write would deadlock against the server's method-selection reply. TCP
-	// buffers decouple the directions and keep the server-side read count
-	// exact — each framing read is one syscall however the segments land.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = ln.Close() }()
-	accepted := make(chan *countingConn, 1)
-	go func() {
-		c, err := ln.Accept()
-		if err != nil {
-			return
+// A protocol response is deliberately bodyless: the status is the useful
+// information to a proxy client, and echoing parser, credential, or target
+// detail would only risk disclosing what the client itself supplied.
+func TestWriteHTTPErrorShape(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusProxyAuthRequired, http.StatusNotImplemented,
+		http.StatusHTTPVersionNotSupported, http.StatusBadGateway, http.StatusServiceUnavailable} {
+		var wire bytes.Buffer
+		if err := writeHTTPError(&wire, status); err != nil {
+			t.Fatalf("writeHTTPError(%d): %v", status, err)
 		}
-		cc := &countingConn{Conn: c}
-		if s.beginSession(cc) {
-			s.serveConn(cc)
+		// Connection: close is set inside WriteHeader, so the header block is
+		// written through http.Header.Write and its fields come out in
+		// canonical (alphabetical) order: Connection before Content-Length.
+		want := fmt.Sprintf("HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+			status, http.StatusText(status))
+		if wire.String() != want {
+			t.Fatalf("writeHTTPError(%d) wrote %q, want %q", status, wire.String(), want)
 		}
-		accepted <- cc
-	}()
-
-	conn, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	frame, err := socksRequestFrame(socksCmdConnect, "127.0.0.1:1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	burst := append(socksGreetingFrame(socksAuthNone), frame...)
-	if _, err := conn.Write(burst); err != nil {
-		t.Fatalf("write burst: %v", err)
-	}
-	// No routes exist, so the framing ends in the no_route reply.
-	method := make([]byte, 2)
-	if _, err := io.ReadFull(conn, method); err != nil {
-		t.Fatalf("read method selection: %v", err)
-	}
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		t.Fatalf("read no_route reply: %v", err)
-	}
-	if reply[1] != socksReplyGeneral {
-		t.Fatalf("reply code = 0x%02x, want general failure", reply[1])
-	}
-	cc := <-accepted
-	if n := cc.reads.Load(); n == 0 || n > 2 {
-		t.Fatalf("framing used %d reads for one burst, want 1-2", n)
 	}
 }
 
-func TestSocksTargetBuild(t *testing.T) {
-	t.Run("domain keeps the hostname", func(t *testing.T) {
-		got, err := socksTarget(socksdial.AddrDomain, []byte("example.test"), []byte{0x01, 0xbb})
-		if err != nil {
-			t.Fatalf("socksTarget: %v", err)
-		}
-		if got.Addr() != "example.test:443" || got.Host != "example.test" || got.Type != socksdial.AddrDomain {
-			t.Fatalf("socksTarget = %+v, want the example.test:443 domain target", got)
-		}
-	})
-	t.Run("ipv4 renders the frame bytes", func(t *testing.T) {
-		got, err := socksTarget(socksdial.AddrIPv4, []byte{127, 0, 0, 1}, []byte{0x1f, 0x90})
-		if err != nil {
-			t.Fatalf("socksTarget: %v", err)
-		}
-		if got.Addr() != "127.0.0.1:8080" || got.Type != socksdial.AddrIPv4 {
-			t.Fatalf("socksTarget = %+v, want the 127.0.0.1:8080 IPv4 target", got)
-		}
-	})
-	t.Run("ipv6 renders the frame bytes", func(t *testing.T) {
-		addr := append([]byte{0x20, 0x01, 0x0d, 0xb8}, append(make([]byte, 11), 0x01)...) // 2001:db8::1
-		got, err := socksTarget(socksdial.AddrIPv6, addr, []byte{0x00, 0x35})
-		if err != nil {
-			t.Fatalf("socksTarget: %v", err)
-		}
-		if got.Addr() != "[2001:db8::1]:53" || got.Type != socksdial.AddrIPv6 {
-			t.Fatalf("socksTarget = %+v, want the [2001:db8::1]:53 IPv6 target", got)
-		}
-	})
-	t.Run("zero port", func(t *testing.T) {
-		if _, err := socksTarget(socksdial.AddrDomain, []byte("example.test"), []byte{0x00, 0x00}); err == nil || !strings.Contains(err.Error(), "zero target port") {
-			t.Fatalf("zero port error = %v, want a zero-target-port failure", err)
-		}
-	})
-}
-
-func TestWriteSocksReplyShape(t *testing.T) {
+// A CONNECT success reply must leave Connection unmodified: the tunnel's
+// arbitrary bytes follow immediately on the same socket, so advertising close
+// there would contradict what the gateway just established.
+func TestConnectSuccessReplyLeavesConnectionUnmodified(t *testing.T) {
 	var wire bytes.Buffer
-	if err := writeSocksReply(&wire, socksReplyCmdUnsupported); err != nil {
-		t.Fatalf("writeSocksReply: %v", err)
+	(&connectReplier{conn: &wire}).ok()
+	want := "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+	if wire.String() != want {
+		t.Fatalf("CONNECT success wrote %q, want %q", wire.String(), want)
 	}
-	want := []byte{socksVersion, socksReplyCmdUnsupported, 0x00, socksAtypIPv4, 0, 0, 0, 0, 0, 0}
-	if !bytes.Equal(wire.Bytes(), want) {
-		t.Fatalf("reply = % x, want % x", wire.Bytes(), want)
+}
+
+// An absolute-form success writes nothing at all: the ReverseProxy starts the
+// sole client response only after the origin answers, so an invented 200 here
+// would turn one request into two responses.
+func TestForwardSuccessReplyStaysSilent(t *testing.T) {
+	var wire bytes.Buffer
+	if err := (&forwardReplier{conn: &wire}).ok(); err != nil {
+		t.Fatalf("forwardReplier.ok(): %v", err)
+	}
+	if wire.Len() != 0 {
+		t.Fatalf("forward success wrote %q, want nothing", wire.String())
 	}
 }
 
 // --- relaying --------------------------------------------------------------
 
-// A CONNECT tunnel must carry bytes both ways for every address type the
-// client may name: IPv4, a domain name, and IPv6.
-func TestSocksConnectRelaysBothDirections(t *testing.T) {
+// A CONNECT tunnel must carry bytes both ways for every authority shape a
+// client may name: an IPv4 literal, a domain name, and an IPv6 literal.
+func TestHTTPConnectRelaysBothDirections(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute)
-	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
+	s, addr := newProxyServer(t, pl, defaultRuntime(), testLogger())
 
 	t.Run("ipv4", func(t *testing.T) {
-		testRelayRoundTrip(t, addr, startRawEchoTarget(t))
+		relayRoundTrip(t, addr, startRawEchoTarget(t))
 	})
 	t.Run("domain", func(t *testing.T) {
-		// A genuine ATYP 0x03 frame: the relay round trip must succeed with
-		// domain framing end to end, not just on refusal paths. The echo
-		// target's dotted-quad address rides as the domain name; the fake
-		// upstream dials that literal, so nothing resolves.
-		target := startRawEchoTarget(t)
-		host, portText, err := net.SplitHostPort(target)
+		// "localhost" is the one name that resolves locally and it is not an
+		// IP literal, so the ingress forwards it as a domain target while the
+		// fake upstream dials it for real. This proves domain framing end to
+		// end, not just on refusal paths.
+		_, port, err := net.SplitHostPort(startRawEchoTarget(t))
 		if err != nil {
 			t.Fatal(err)
 		}
-		port, err := strconv.Atoi(portText)
-		if err != nil {
-			t.Fatal(err)
-		}
-		frame, err := socksRequestFrameWithATYP(socksCmdConnect, host, uint16(port), socksAtypDomain)
-		if err != nil {
-			t.Fatal(err)
-		}
-		conn, code := socksConnectReplyFrame(t, addr, frame)
-		if code != socksReplySuccess {
-			t.Fatalf("CONNECT reply = 0x%02x, want success 0x00", code)
-		}
-		relayRoundTripOnConn(t, conn)
+		relayRoundTrip(t, addr, net.JoinHostPort("localhost", port))
 	})
 	t.Run("ipv6", func(t *testing.T) {
 		ln, err := net.Listen("tcp6", "[::1]:0")
 		if err != nil {
 			t.Skipf("loopback IPv6 unavailable: %v", err)
 		}
-		testRelayRoundTrip(t, addr, serveEchoTarget(t, ln))
+		relayRoundTrip(t, addr, serveEchoTarget(t, ln))
 	})
 
 	snap := pl.Snapshot()[0]
@@ -847,9 +672,9 @@ func TestSocksConnectRelaysBothDirections(t *testing.T) {
 	}
 }
 
-func testRelayRoundTrip(t *testing.T, gatewayAddr, target string) {
+func relayRoundTrip(t *testing.T, gatewayAddr, target string) {
 	t.Helper()
-	relayRoundTripOnConn(t, socksDialVia(t, gatewayAddr, target))
+	relayRoundTripOnConn(t, httpDialVia(t, gatewayAddr, target))
 }
 
 // relayRoundTripOnConn proves an established tunnel carries bytes both ways.
@@ -878,9 +703,9 @@ func TestTunnelCarriesHTTPTraffic(t *testing.T) {
 	target := startEchoTarget(t)
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute)
-	_, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
+	_, addr := newProxyServer(t, pl, defaultRuntime(), testLogger())
 
-	conn := socksDialVia(t, addr, target)
+	conn := httpDialVia(t, addr, target)
 	if _, err := fmt.Fprintf(conn, "GET / HTTP/1.0\r\nHost: %s\r\n\r\n", target); err != nil {
 		t.Fatalf("write request: %v", err)
 	}
@@ -896,112 +721,149 @@ func TestTunnelCarriesHTTPTraffic(t *testing.T) {
 	}
 }
 
-// The server reads exact frame lengths: payload bytes a client pipelines in
-// the same write as its CONNECT must reach the target untouched.
-func TestPipelinedClientBytesReachTarget(t *testing.T) {
+// A client may pipeline payload behind its CONNECT headers in one write. The
+// framing reader captures those bytes, so they must reach the upstream relay
+// rather than being dropped with the handshake buffers.
+func TestPipelinedBytesAfterConnectReachRelay(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
-	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute)
+	_, addr := newProxyServer(t, pl, defaultRuntime(), testLogger())
 	target := startRawEchoTarget(t)
 
-	conn, err := net.Dial("tcp", addr)
+	conn := dialGateway(t, addr)
+	payload := []byte("pipelined-payload")
+	// One write: the CONNECT request and the first tunnel bytes together — a
+	// single socket segment is exactly the case a header-only reader breaks.
+	if _, err := conn.Write(append(httpConnectRequest(target), payload...)); err != nil {
+		t.Fatalf("write burst: %v", err)
+	}
+	br := bufio.NewReader(conn)
+	if status := readIngressResponse(t, br, http.MethodConnect).StatusCode; status != http.StatusOK {
+		t.Fatalf("CONNECT = %d, want 200", status)
+	}
+	// The echo target's banner crosses the tunnel first; the payload follows.
+	if got := readBanner(t, br); got != "banner\n" {
+		t.Fatalf("banner = %q", got)
+	}
+	echo := make([]byte, len(payload))
+	if _, err := io.ReadFull(br, echo); err != nil {
+		t.Fatalf("read echoed payload: %v", err)
+	}
+	if !bytes.Equal(echo, payload) {
+		t.Fatalf("echoed payload = %q, want %q", echo, payload)
+	}
+}
+
+// countingConn counts how many reads the server's framing performed on the
+// client socket.
+type countingConn struct {
+	net.Conn
+	reads atomic.Int64
+}
+
+func (c *countingConn) Read(b []byte) (int, error) {
+	c.reads.Add(1)
+	return c.Conn.Read(b)
+}
+
+// A complete CONNECT request must be framed with at most two client reads: the
+// buffered header reader captures the whole exchange in one fill, and one extra
+// read is the split-burst allowance for real TCP fragmentation.
+func TestInboundFramingReadBudget(t *testing.T) {
+	pl := pool.NewRoutes(nil, 30*time.Second, time.Minute)
+	s := newRuntimeServer(pl, defaultRuntime(), testLogger())
+
+	// A real TCP socket, not net.Pipe: the pipe is synchronous, so a burst
+	// write would deadlock against the server's own reply. TCP buffers decouple
+	// the directions and keep the server-side read count exact — each framing
+	// read is one syscall however the segments land.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	accepted := make(chan *countingConn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		cc := &countingConn{Conn: c}
+		if s.beginSession(cc) {
+			s.serveConn(cc)
+		}
+		accepted <- cc
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	frame, err := socksRequestFrame(socksCmdConnect, target)
-	if err != nil {
-		t.Fatal(err)
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(httpConnectRequest("127.0.0.1:1")); err != nil {
+		t.Fatalf("write burst: %v", err)
 	}
-	payload := []byte("TEST-prefix")
-	blob := append(socksGreetingFrame(socksAuthNone), frame...)
-	blob = append(blob, payload...)
-	if _, err := conn.Write(blob); err != nil {
-		t.Fatal(err)
+	// No routes exist, so the request ends in the no_route reply.
+	br := bufio.NewReader(conn)
+	if status := readIngressResponse(t, br, http.MethodConnect).StatusCode; status != http.StatusServiceUnavailable {
+		t.Fatalf("CONNECT with no routes = %d, want 503", status)
 	}
-
-	method := make([]byte, 2)
-	if _, err := io.ReadFull(conn, method); err != nil {
-		t.Fatalf("read method selection: %v", err)
-	}
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		t.Fatalf("read reply: %v", err)
-	}
-	if reply[1] != socksReplySuccess {
-		t.Fatalf("reply code = %#02x, want success", reply[1])
-	}
-	if got := readBanner(t, conn); got != "banner\n" {
-		t.Fatalf("banner = %q", got)
-	}
-	echo := make([]byte, len(payload))
-	if _, err := io.ReadFull(conn, echo); err != nil {
-		t.Fatalf("read echo: %v", err)
-	}
-	if !bytes.Equal(echo, payload) {
-		t.Fatalf("pipelined bytes arrived as %q, want %q", echo, payload)
-	}
-	if status := s.ListenerStatus(); status.Requests != 1 {
-		t.Fatalf("requests = %d, want 1", status.Requests)
+	cc := <-accepted
+	if n := cc.reads.Load(); n == 0 || n > 2 {
+		t.Fatalf("framing used %d reads for one burst, want 1-2", n)
 	}
 }
 
 // --- protocol rejects ------------------------------------------------------
 
-// Every malformed or unsupported inbound conversation must close without
-// dialing anything: pool health and the request counter stay untouched, and
-// the server logs exactly one bad_request line per reject.
+// Every malformed or unsupported inbound request must be answered before the
+// request counter and before pool selection: route health and counters stay
+// untouched, no upstream is contacted, and each reject logs one bad_request
+// line that reflects no request detail back.
 func TestProtocolRejectsNeverTouchPoolOrCounters(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
-	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
+	s, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
-	greeting := socksGreetingFrame(socksAuthNone)
-	cases := []socksRejectCase{
-		{name: "bad greeting version", greeting: []byte{0x04, 0x01, 0x00}},
-		{name: "empty method list", greeting: []byte{0x05, 0x00}},
-		{name: "no acceptable method", greeting: []byte{0x05, 0x02, 0x01, 0x02},
-			wantReply: []byte{socksVersion, socksAuthUnaccepted}},
-		{name: "truncated method list", greeting: []byte{0x05, 0x02, 0x00}, truncated: true},
-		{name: "bad request version", greeting: greeting, methodReply: true,
-			request: []byte{0x04, socksCmdConnect, 0x00, socksAtypIPv4, 127, 0, 0, 1, 0, 80}},
-		{name: "non-zero reserved byte", greeting: greeting, methodReply: true,
-			request: []byte{socksVersion, socksCmdConnect, 0x01, socksAtypIPv4, 127, 0, 0, 1, 0, 80}},
-		{name: "unknown address type", greeting: greeting, methodReply: true,
-			request: []byte{socksVersion, socksCmdConnect, 0x00, 0x80, 1, 2, 3, 4}},
-		{name: "truncated ipv4 target", greeting: greeting, methodReply: true, truncated: true,
-			request: []byte{socksVersion, socksCmdConnect, 0x00, socksAtypIPv4, 127, 0}},
-		{name: "zero target port", greeting: greeting, methodReply: true,
-			request: []byte{socksVersion, socksCmdConnect, 0x00, socksAtypIPv4, 127, 0, 0, 1, 0, 0}},
-		{name: "empty domain name", greeting: greeting, methodReply: true,
-			request: []byte{socksVersion, socksCmdConnect, 0x00, socksAtypDomain, 0x00, 0, 0}},
-		{name: "truncated domain name", greeting: greeting, methodReply: true, truncated: true,
-			request: []byte{socksVersion, socksCmdConnect, 0x00, socksAtypDomain, 0x05, 'a'}},
-		{name: "truncated domain port", greeting: greeting, methodReply: true, truncated: true,
-			request: []byte{socksVersion, socksCmdConnect, 0x00, socksAtypDomain, 0x03, 'a', 'b', 'c', 0x01}},
-	}
-	cmdUnsupportedReply := []byte{socksVersion, socksReplyCmdUnsupported, 0x00, socksAtypIPv4, 0, 0, 0, 0, 0, 0}
-	for _, command := range []struct {
-		name string
-		cmd  byte
-	}{{"bind command", socksCmdBind}, {"udp associate command", socksCmdUDPAssociate}} {
-		frame, err := socksRequestFrame(command.cmd, "example.test:443")
-		if err != nil {
-			t.Fatal(err)
-		}
-		cases = append(cases, socksRejectCase{
-			name: command.name, greeting: greeting, methodReply: true,
-			request: frame, wantReply: cmdUnsupportedReply,
-		})
+	host := "Host: example.test"
+	cases := []httpRejectCase{
+		{name: "unparsable request line", request: []byte("NOT-A-REQUEST\r\n\r\n"), wantStatus: http.StatusBadRequest},
+		{name: "malformed header syntax", request: []byte("GET http://example.test/ HTTP/1.1\r\n" + host + "\r\nBad Header\r\n\r\n"),
+			wantStatus: http.StatusBadRequest},
+		{name: "duplicate host headers", request: []byte("GET http://example.test/ HTTP/1.1\r\n" + host + "\r\nHost: other.test\r\n\r\n"),
+			wantStatus: http.StatusBadRequest},
+		{name: "http/1.0 version", request: []byte("GET http://example.test/ HTTP/1.0\r\n" + host + "\r\n\r\n"),
+			wantStatus: http.StatusHTTPVersionNotSupported},
+		{name: "origin-form target", request: []byte("GET / HTTP/1.1\r\n" + host + "\r\n\r\n"),
+			wantStatus: http.StatusBadRequest},
+		{name: "asterisk-form target", request: []byte("OPTIONS * HTTP/1.1\r\n" + host + "\r\n\r\n"),
+			wantStatus: http.StatusNotImplemented},
+		{name: "https scheme", request: []byte("GET https://example.test/ HTTP/1.1\r\n" + host + "\r\n\r\n"),
+			wantStatus: http.StatusNotImplemented},
+		{name: "connect target with a path", request: []byte("CONNECT example.test:443/tunnel HTTP/1.1\r\nHost: example.test:443\r\n\r\n"),
+			wantStatus: http.StatusBadRequest},
+		{name: "connect without a port", request: []byte("CONNECT example.test HTTP/1.1\r\nHost: example.test\r\n\r\n"),
+			wantStatus: http.StatusBadRequest},
+		{name: "connect host mismatch", request: []byte("CONNECT example.test:443 HTTP/1.1\r\nHost: other.test:443\r\n\r\n"),
+			wantStatus: http.StatusBadRequest},
+		{name: "connect host port mismatch", request: []byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:8443\r\n\r\n"),
+			wantStatus: http.StatusBadRequest},
+		{name: "connect host carrying userinfo", request: []byte("CONNECT example.test:443 HTTP/1.1\r\nHost: TESTUSER:TESTPASS@example.test:443\r\n\r\n"),
+			wantStatus: http.StatusBadRequest},
+		{name: "connect zero port", request: []byte("CONNECT example.test:0 HTTP/1.1\r\nHost: example.test:0\r\n\r\n"),
+			wantStatus: http.StatusBadRequest},
+		{name: "absolute host mismatch", request: []byte("GET http://example.test/ HTTP/1.1\r\nHost: other.test\r\n\r\n"),
+			wantStatus: http.StatusBadRequest},
+		{name: "absolute url carrying userinfo", request: []byte("GET http://TESTUSER:TESTPASS@example.test/ HTTP/1.1\r\n" + host + "\r\n\r\n"),
+			wantStatus: http.StatusBadRequest},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := socksRejectExchange(t, addr, tc)
-			if !bytes.Equal(got, tc.wantReply) {
-				t.Fatalf("reject reply = % x, want % x", got, tc.wantReply)
+			if got := httpRejectExchange(t, addr, tc); got != tc.wantStatus {
+				t.Fatalf("reject status = %d, want %d", got, tc.wantStatus)
 			}
 			snap := pl.Snapshot()[0]
 			if snap.Successes != 0 || snap.Failures != 0 || snap.AuthFailures != 0 || !snap.Available {
@@ -1016,8 +878,8 @@ func TestProtocolRejectsNeverTouchPoolOrCounters(t *testing.T) {
 		})
 	}
 
-	// Rejects are handled in per-connection goroutines, so the final record
-	// can land after the last client exchange returns; poll for the full set.
+	// Rejects are handled in per-connection goroutines, so the final record can
+	// land after the last client exchange returns; poll for the full set.
 	var output string
 	deadline := time.Now().Add(time.Second)
 	for {
@@ -1031,11 +893,254 @@ func TestProtocolRejectsNeverTouchPoolOrCounters(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if _, ok := findRecord(output, map[string]string{"msg": "socks request rejected", "error_kind": "bad_request"}); !ok {
-		t.Fatalf("parse rejects were not logged as rejections:\n%s", output)
+	if _, ok := findRecord(output, map[string]string{"msg": "HTTP proxy request rejected", "error_kind": "bad_request"}); !ok {
+		t.Fatalf("rejects were not logged as rejections:\n%s", output)
 	}
-	if _, ok := findRecord(output, map[string]string{"msg": "socks command not supported", "error_kind": "bad_request"}); !ok {
-		t.Fatalf("BIND/UDP rejects were not logged as unsupported commands:\n%s", output)
+	// A reject states only the stable protocol outcome: reflecting parser,
+	// credential, or target text would repeat data the client already holds.
+	for _, rec := range decodeRecords(output) {
+		if !recordMatches(rec, map[string]string{"error_kind": "bad_request"}) {
+			continue
+		}
+		if _, has := rec["error"]; has {
+			t.Errorf("bad_request record reflected a request detail: %v", rec)
+		}
+	}
+	for _, secret := range []string{"TESTUSER", "TESTPASS"} {
+		if strings.Contains(output, secret) {
+			t.Errorf("logs leaked the planted credential %q:\n%s", secret, output)
+		}
+	}
+
+	// An incomplete header block is not a rejected request: the gateway cannot
+	// know the request has ended, so answering would invent a verdict.
+	t.Run("incomplete header block is not answered", func(t *testing.T) {
+		got := httpRejectExchange(t, addr, httpRejectCase{
+			request:   []byte("GET http://example.test/ HTTP/1.1\r\n" + host + "\r\n"),
+			truncated: true,
+		})
+		if got != 0 {
+			t.Fatalf("incomplete header block drew status %d, want silence", got)
+		}
+		if status := s.ListenerStatus(); status.Requests != 0 || status.Failovers != 0 {
+			t.Fatalf("incomplete header block advanced listener counters: %+v", status)
+		}
+	})
+}
+
+// An inbound header block larger than the ingress bound must never become a
+// serving request: the gateway cannot hold unbounded header storage for a peer
+// that keeps writing, so it stops reading and rejects. The status is asserted
+// only through the log, because answering and closing while the oversized
+// block is still in flight can reset the client before it reads the reply.
+func TestOversizedRequestHeaderNeverReachesRouteSelection(t *testing.T) {
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
+	var logs safeLogBuffer
+	s, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
+
+	conn := dialGateway(t, addr)
+	oversized := append([]byte("GET http://example.test/ HTTP/1.1\r\nHost: example.test\r\nX-Fill: "),
+		bytes.Repeat([]byte("a"), maxInboundHeaderBytes)...)
+	oversized = append(oversized, []byte("\r\n\r\n")...)
+	// A write error is expected: the gateway answers and closes while the
+	// oversized block is still going out.
+	_, _ = conn.Write(oversized)
+	_, _ = io.Copy(io.Discard, conn)
+
+	if snap := pl.Snapshot()[0]; snap.Successes != 0 || snap.Failures != 0 || !snap.Available {
+		t.Fatalf("oversized header changed route health: %+v", snap)
+	}
+	if got := len(fs.hits); got != 0 {
+		t.Fatalf("oversized header dialed the upstream %d times", got)
+	}
+	if status := s.ListenerStatus(); status.Requests != 0 || status.Failovers != 0 {
+		t.Fatalf("oversized header advanced listener counters: %+v", status)
+	}
+	waitForRecord(t, &logs, map[string]string{"msg": "HTTP proxy request rejected", "error_kind": "bad_request"})
+}
+
+// The second accepted shape: an absolute-form request is relayed as one HTTP
+// exchange over one tunnel, and the client receives the origin's own status,
+// body, and headers. The gateway's own control material — the consumed client
+// credential and the reserved x-ecoma- namespace — must never reach the origin.
+func TestAbsoluteFormRelaysOriginStatusAndStripsControlHeaders(t *testing.T) {
+	var seen http.Header
+	var seenRequestURI string
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		seenRequestURI = r.RequestURI
+		w.Header().Set("X-Origin", "yes")
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = io.WriteString(w, "origin-body")
+	}))
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute)
+	_, addr := newProxyServer(t, pl, defaultRuntime(), testLogger())
+
+	resp := httpForward(t, addr, httpForwardRequest(http.MethodGet, origin.URL+"/probe",
+		"Host: "+originURL.Host,
+		"Proxy-Authorization: Basic Z3ctdXNlcjpnd3ctcGFzcw==",
+		"X-Ecoma-Probe: control-secret",
+	), http.MethodGet)
+	if resp.StatusCode != http.StatusTeapot {
+		t.Fatalf("relayed status = %d, want the origin's own 418", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Origin"); got != "yes" {
+		t.Fatalf("origin header = %q, want it relayed", got)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read relayed body: %v", err)
+	}
+	if string(body) != "origin-body" {
+		t.Fatalf("relayed body = %q, want the origin body unchanged", body)
+	}
+
+	if got := seen.Get("Proxy-Authorization"); got != "" {
+		t.Errorf("origin saw Proxy-Authorization %q; the client credential crossed the credential boundary", got)
+	}
+	if got := seen.Get("X-Ecoma-Probe"); got != "" {
+		t.Errorf("origin saw the reserved control header %q", got)
+	}
+	// The gateway rewrites the absolute target into origin form for the origin
+	// while still naming the right authority and path.
+	if seenRequestURI != "/probe" {
+		t.Errorf("origin RequestURI = %q, want the origin form %q", seenRequestURI, "/probe")
+	}
+	if got := seen.Get("Host"); got != "" && got != originURL.Host {
+		t.Errorf("origin Host = %q, want %q", got, originURL.Host)
+	}
+	snap := pl.Snapshot()[0]
+	if snap.Successes != 1 || snap.Failures != 0 {
+		t.Fatalf("relayed exchange changed route health: %+v", snap)
+	}
+}
+
+// An absolute-form request whose authority is a domain is forwarded as a name,
+// never resolved at the gateway: the origin sees a name, and the SOCKS5H hop is
+// where DNS happens.
+func TestAbsoluteFormTargetStaysADomainName(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "named")
+	}))
+	t.Cleanup(origin.Close)
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(origin.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fs := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute)
+	var logs safeLogBuffer
+	_, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
+
+	resp := httpForward(t, addr,
+		httpForwardRequest(http.MethodGet, "http://localhost:"+port+"/named", "Host: localhost:"+port),
+		http.MethodGet)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read relayed body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || string(body) != "named" {
+		t.Fatalf("relayed %d %q, want the origin's own 200 named", resp.StatusCode, body)
+	}
+	// A domain target is never reclassified into an IP literal: the log names
+	// the authority the client asked for.
+	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel"})
+	if !strings.Contains(output, "localhost:"+port) {
+		t.Errorf("logs did not record the domain target:\n%s", output)
+	}
+	snap := pl.Snapshot()[0]
+	if snap.Successes != 1 || snap.Failures != 0 {
+		t.Fatalf("relayed exchange changed route health: %+v", snap)
+	}
+}
+
+// The absolute-form failure statuses are the same wire contract as CONNECT's:
+// the split follows the route chain, not the request shape. A chain that never
+// obtains a usable route — empty, or every route cooling on another kind — ends
+// in 503 no_route. A chain that DID pick a route and then hit a gateway-side
+// local setup failure ends in 502, answers immediately, and retries nothing.
+func TestAbsoluteFormTerminalFailureStatuses(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// routes builds the pool; setup optionally replaces the dial seam.
+		routes func(t *testing.T) *pool.Pool
+		setup  func(t *testing.T, s *Server)
+		// allowed is the listener's egress-kind view. An empty slice means the
+		// mixed listener that can serve every route kind.
+		allowed  []config.EgressKind
+		wantKind string
+		want     int
+	}{
+		{
+			name: "no eligible route is 503",
+			routes: func(t *testing.T) *pool.Pool {
+				u, err := url.Parse("socks5://v4.test:1080")
+				if err != nil {
+					t.Fatal(err)
+				}
+				// A v6-only listener can never serve the only v4 route.
+				return pool.NewRoutes([]config.RouteSpec{{URL: u, Kind: config.EgressV4}}, time.Second, time.Minute)
+			},
+			allowed:  []config.EgressKind{config.EgressV6},
+			want:     http.StatusServiceUnavailable,
+			wantKind: errorKindNoRoute,
+		},
+		{
+			// A selected route that fails at the gateway rather than at the
+			// endpoint — here an unencodable configured route credential — is
+			// ours, not the client's, and never becomes route health.
+			name: "gateway-side setup failure after a pick is 502",
+			routes: func(t *testing.T) *pool.Pool {
+				u, err := url.Parse("socks5://u.test:1080")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return pool.NewRoutes(mixedRoutes(u), time.Second, time.Minute)
+			},
+			setup: func(_ *testing.T, s *Server) {
+				s.dial = func(context.Context, *url.URL, socksdial.Target, time.Duration) (net.Conn, error) {
+					return nil, &SocksProtocolError{Op: "encode target", Err: errors.New("oversized configured credentials")}
+				}
+			},
+			want:     http.StatusBadGateway,
+			wantKind: errorKindSetup,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pl := tc.routes(t)
+			var logs safeLogBuffer
+			s, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs), tc.allowed...)
+			if tc.setup != nil {
+				tc.setup(t, s)
+			}
+			resp := httpForward(t, addr,
+				httpForwardRequest(http.MethodGet, "http://example.test/thing", "Host: example.test"),
+				http.MethodGet)
+			if resp.StatusCode != tc.want {
+				t.Fatalf("absolute-form terminal status = %d, want %d", resp.StatusCode, tc.want)
+			}
+			// The failure is terminal and bodyless: the gateway never invents a
+			// client response beyond the status it owes.
+			if got := resp.Header.Get("Content-Length"); got != "0" {
+				t.Errorf("terminal Content-Length = %q, want 0", got)
+			}
+			if status := s.ListenerStatus(); status.Requests != 1 {
+				t.Errorf("listener status = %+v, want exactly the one valid request", status)
+			}
+			// The 503 case ends the chain with no route; the 502 case is the
+			// immediate gateway-side setup failure. Neither may be logged as
+			// the other: that split is the whole point of the two statuses.
+			waitForRecord(t, &logs, map[string]string{"error_kind": tc.wantKind})
+		})
 	}
 }
 
@@ -1057,7 +1162,7 @@ func TestDialFailureCooldownsRouteExcludedAndFallsBack(t *testing.T) {
 	}
 	addr := startServer(t, s)
 
-	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	conn := httpDialVia(t, addr, startRawEchoTarget(t))
 	readBanner(t, conn)
 	_ = conn.Close()
 
@@ -1088,19 +1193,19 @@ func TestDialFailureCooldownsRouteExcludedAndFallsBack(t *testing.T) {
 	}
 }
 
-// A SOCKS handshake failure before the tunnel exists is socks_connect: the
-// same cooldown-and-fallback treatment as an endpoint dial failure. The
-// route-scoped flavor needs a failure the endpoint did not answer with a
-// clean refusal — a malformed CONNECT reply (unsupported bound-address type)
-// — because an explicit refusal is the target-scoped connect_target case.
+// An upstream SOCKS handshake failure before the tunnel exists is socks_connect:
+// the same cooldown-and-fallback treatment as an endpoint dial failure. The
+// route-scoped flavor needs a failure the endpoint did not answer with a clean
+// refusal — a malformed CONNECT reply — because an explicit refusal is the
+// target-scoped connect_target case.
 func TestHandshakeFailureFallsBackWithSocksConnectKind(t *testing.T) {
 	reject := startSocks5Proxy(t, socksOptions{connectRaw: []byte{0x05, 0x00, 0x00, 0x06}})
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(reject.URL, good.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
-	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
+	_, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
-	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	conn := httpDialVia(t, addr, startRawEchoTarget(t))
 	readBanner(t, conn)
 	_ = conn.Close()
 
@@ -1120,16 +1225,16 @@ func TestHandshakeFailureFallsBackWithSocksConnectKind(t *testing.T) {
 	}
 }
 
-// An authentication failure blocks the route for auth and allows a fallback,
-// but never creates dial cooldown.
+// An upstream authentication failure blocks the route for auth and allows a
+// fallback, but never creates dial cooldown.
 func TestAuthFailureFallsBackWithoutDialCooldown(t *testing.T) {
 	bad := startSocks5Proxy(t, socksOptions{user: "TEST-user", pass: "TEST-pass"})
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(bad.URL, good.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
-	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
+	_, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
-	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	conn := httpDialVia(t, addr, startRawEchoTarget(t))
 	readBanner(t, conn)
 	_ = conn.Close()
 
@@ -1165,19 +1270,16 @@ func TestAuthFailureFallsBackWithoutDialCooldown(t *testing.T) {
 }
 
 // With one route that refuses CONNECT to the requested target, the request
-// exhausts the pool: the client gets the general-failure reply and the log
-// names no_route. The refusal is target-scoped: the pair cools, the route
-// itself stays available.
-func TestSingleRejectingRouteExhaustsToGeneralFailure(t *testing.T) {
+// exhausts the pool: the client gets 503 and the log names no_route. The
+// refusal is target-scoped: the pair cools, the route itself stays available.
+func TestSingleRejectingRouteExhaustsToServiceUnavailable(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
-	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
+	s, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
-	conn, code := socksConnectReply(t, addr, "example.test:443", socksCmdConnect)
-	_ = conn.Close()
-	if code != socksReplyGeneral {
-		t.Fatalf("reply = 0x%02x, want general failure 0x01", code)
+	if status := httpConnectStatus(t, addr, "example.test:443"); status != http.StatusServiceUnavailable {
+		t.Fatalf("CONNECT status = %d, want 503", status)
 	}
 
 	snap := pl.Snapshot()[0]
@@ -1207,28 +1309,23 @@ func TestSingleRejectingRouteExhaustsToGeneralFailure(t *testing.T) {
 }
 
 // The issue #5 scenario in miniature: one route that serves every target
-// except one. The refusal cools only the (route, target) pair — the same
-// route immediately serves a different target, and the pair's cooldown never
-// touches route-level health.
+// except one. The refusal cools only the (route, target) pair — the same route
+// immediately serves a different target, and the pair's cooldown never touches
+// route-level health.
 func TestConnectTargetRefusalKeepsRouteForOtherTargets(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{connectRep: 0x05, refuseHost: "blocked.test"})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
-	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
+	s, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
 	// First request: the refused target exhausts the single-route pool.
-	conn, code := socksConnectReply(t, addr, "blocked.test:443", socksCmdConnect)
-	_ = conn.Close()
-	if code != socksReplyGeneral {
-		t.Fatalf("blocked target reply = 0x%02x, want general failure 0x01", code)
+	if status := httpConnectStatus(t, addr, "blocked.test:443"); status != http.StatusServiceUnavailable {
+		t.Fatalf("blocked target status = %d, want 503", status)
 	}
 
 	// The route never cooled: an unrelated target is served by the same route
 	// without touching the all-cooling fallback.
-	conn, code = socksConnectReply(t, addr, startRawEchoTarget(t), socksCmdConnect)
-	if code != socksReplySuccess {
-		t.Fatalf("unrelated target reply = 0x%02x, want success 0x00", code)
-	}
+	conn := httpDialVia(t, addr, startRawEchoTarget(t))
 	_ = conn.Close()
 
 	snap := pl.Snapshot()[0]
@@ -1250,9 +1347,11 @@ func TestConnectTargetRefusalKeepsRouteForOtherTargets(t *testing.T) {
 	}
 }
 
-// A local setup failure replies once, retries nothing, and mutates no health:
+// A local setup failure answers once, retries nothing, and mutates no health:
 // every route would fail identically, so cooldown would only poison the pool.
-func TestSetupErrorRepliesFailureWithoutPoolMutation(t *testing.T) {
+// It is still a gateway-side failure of an already-valid request, so the client
+// gets 502 rather than the 503 an empty chain would produce.
+func TestSetupErrorRepliesBadGatewayWithoutPoolMutation(t *testing.T) {
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(good.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
@@ -1264,10 +1363,8 @@ func TestSetupErrorRepliesFailureWithoutPoolMutation(t *testing.T) {
 	}
 	addr := startServer(t, s)
 
-	conn, code := socksConnectReply(t, addr, "example.test:443", socksCmdConnect)
-	_ = conn.Close()
-	if code != socksReplyGeneral {
-		t.Fatalf("reply = 0x%02x, want general failure 0x01", code)
+	if status := httpConnectStatus(t, addr, "example.test:443"); status != http.StatusBadGateway {
+		t.Fatalf("CONNECT status = %d, want 502 for a gateway-side setup failure", status)
 	}
 	if dials != 1 {
 		t.Fatalf("dial attempts = %d, want 1 (setup errors never retry)", dials)
@@ -1285,332 +1382,5 @@ func TestSetupErrorRepliesFailureWithoutPoolMutation(t *testing.T) {
 		"error_kind": "setup", "upstream": good.URL.Host,
 	}); !ok {
 		t.Errorf("logs missing the setup-failure record:\n%s", output)
-	}
-}
-
-// --- relay teardown and close records --------------------------------------
-
-// A client that ends the stream first produces a routine close record at
-// debug with both byte counts, and never touches route health.
-func TestCloseRecordAfterClientCloses(t *testing.T) {
-	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
-	var logs safeLogBuffer
-	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
-
-	conn := socksDialVia(t, addr, startRawEchoTarget(t))
-	if got := readBanner(t, conn); got != "banner\n" {
-		t.Fatalf("banner = %q", got)
-	}
-	if _, err := conn.Write([]byte("abcd")); err != nil {
-		t.Fatalf("write payload: %v", err)
-	}
-	echo := make([]byte, 4)
-	if _, err := io.ReadFull(conn, echo); err != nil {
-		t.Fatalf("read echo: %v", err)
-	}
-	_ = conn.Close()
-
-	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel closed"})
-	rec, ok := findRecord(output, map[string]string{
-		"msg":                      "tunnel closed",
-		"close_reason":             "client_closed",
-		"client_to_upstream_bytes": "4",
-		"upstream_to_client_bytes": "11", // banner plus echo
-	})
-	if !ok {
-		t.Errorf("close record missing expected fields:\n%s", output)
-	} else if _, has := rec["duration"]; !has {
-		t.Errorf("close record missing duration: %v", rec)
-	}
-	snap := pl.Snapshot()[0]
-	if snap.Successes != 1 || snap.Failures != 0 || snap.AuthFailures != 0 {
-		t.Fatalf("closing the tunnel mutated route health: %+v", snap)
-	}
-	if status := s.ListenerStatus(); status.Requests != 1 {
-		t.Fatalf("listener status = %+v", status)
-	}
-}
-
-// An upstream that ends the tunnel abnormally logs a broken-tunnel close at
-// warn and resets the client side, so a truncated stream stays truncated.
-func TestUpstreamBreakLogsBrokenCloseAndResetsClient(t *testing.T) {
-	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
-	var logs safeLogBuffer
-	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
-
-	conn := socksDialVia(t, addr, startAbortTarget(t))
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if _, err := io.Copy(io.Discard, conn); err == nil {
-		t.Fatal("tunnel stayed open after the target aborted the stream")
-	}
-
-	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel broken"})
-	rec, ok := findRecord(output, map[string]string{
-		"msg": "tunnel broken", "close_reason": "upstream_broken",
-	})
-	if _, ok := findRecord(output, map[string]string{
-		"msg": "upstream broke the tunnel; client side set to reset on close",
-	}); !ok {
-		t.Errorf("logs missing the SetLinger debug record:\n%s", output)
-	}
-	if !ok {
-		t.Errorf("logs missing the broken close record:\n%s", output)
-	} else {
-		for _, key := range []string{"client_to_upstream_bytes", "upstream_to_client_bytes", "duration", "error"} {
-			if _, has := rec[key]; !has {
-				t.Errorf("broken close record missing %q: %v", key, rec)
-			}
-		}
-	}
-	snap := pl.Snapshot()[0]
-	if snap.Successes != 1 || snap.Failures != 0 || snap.AuthFailures != 0 {
-		t.Fatalf("broken tunnel mutated route health: %+v", snap)
-	}
-}
-
-// --- connection tracking and shutdown --------------------------------------
-
-// waitTrackedConns waits until the server has accepted and started tracking
-// want client sessions. Only pre-greeting sessions need this: a tunnel is
-// tracked before its success reply reaches the client.
-func waitTrackedConns(t *testing.T, s *Server, want int) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for {
-		s.cmu.Lock()
-		got := len(s.conns)
-		s.cmu.Unlock()
-		if got >= want {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("tracked sessions = %d, want %d", got, want)
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
-// CloseConns must close both established tunnels and sessions still inside
-// their handshake.
-func TestCloseConnsClosesTunnelsAndHandshakes(t *testing.T) {
-	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
-	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
-
-	tunnel := socksDialVia(t, addr, startParkedTarget(t))
-	parked, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial gateway: %v", err)
-	}
-	defer func() { _ = parked.Close() }()
-	waitTrackedConns(t, s, 2)
-
-	s.CloseConns()
-	for name, conn := range map[string]net.Conn{"tunnel": tunnel, "handshake": parked} {
-		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
-		if _, err := conn.Read(make([]byte, 1)); err == nil {
-			t.Errorf("%s connection stayed open after CloseConns", name)
-		}
-	}
-}
-
-// blockingCloseConn delays Close until released, so a test can observe
-// whether the connection map stays locked while a Close blocks.
-type blockingCloseConn struct {
-	net.Conn
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (c *blockingCloseConn) Close() error {
-	c.once.Do(func() { close(c.started) })
-	<-c.release
-	return c.Conn.Close()
-}
-
-func TestCloseConnsDoesNotHoldConnectionMapLockWhileClosing(t *testing.T) {
-	serverSide, clientSide := net.Pipe()
-	defer func() { _ = clientSide.Close() }()
-	conn := &blockingCloseConn{
-		Conn:    serverSide,
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute), defaultRuntime(), testLogger())
-	if !s.beginSession(conn) {
-		t.Fatal("beginSession refused a connection on a live server")
-	}
-
-	closed := make(chan struct{})
-	go func() {
-		s.CloseConns()
-		close(closed)
-	}()
-	select {
-	case <-conn.started:
-	case <-time.After(time.Second):
-		t.Fatal("CloseConns did not call connection Close")
-	}
-
-	untracked := make(chan struct{})
-	go func() {
-		s.untrackConn(conn)
-		close(untracked)
-	}()
-	select {
-	case <-untracked:
-	case <-time.After(time.Second):
-		t.Fatal("connection map lock remained held while Close blocked")
-	}
-
-	close(conn.release)
-	select {
-	case <-closed:
-	case <-time.After(time.Second):
-		t.Fatal("CloseConns did not return after Close unblocked")
-	}
-}
-
-func TestShutdownWithNoSessionsReturnsNil(t *testing.T) {
-	s := newRuntimeServer(pool.NewRoutes(nil, time.Second, time.Minute), defaultRuntime(), testLogger())
-	done := make(chan error, 1)
-	go func() { done <- s.Shutdown(context.Background()) }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Shutdown = %v, want nil", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Shutdown blocked with no live sessions")
-	}
-}
-
-// Shutdown waits for a live session instead of tearing it down early. The
-// target ends only when the client does (a pure parked target would now hold
-// the half-closed relay open indefinitely, which is the relay contract, not a
-// drain defect).
-func TestShutdownWaitsForActiveSession(t *testing.T) {
-	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
-	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
-
-	tunnel := socksDialVia(t, addr, startHalfCloseTarget(t, 0, ""))
-	done := make(chan error, 1)
-	go func() { done <- s.Shutdown(context.Background()) }()
-	select {
-	case err := <-done:
-		t.Fatalf("Shutdown returned %v while a session was live", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	_ = tunnel.Close()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Shutdown = %v, want nil after the session drained", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Shutdown did not return after the session closed")
-	}
-}
-
-// A drain that outlives its budget force-closes the tracked client conns and
-// reports the deadline.
-func TestShutdownDeadlineForceClosesActiveSession(t *testing.T) {
-	fs := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
-	s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
-
-	tunnel := socksDialVia(t, addr, startParkedTarget(t))
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	if err := s.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Shutdown = %v, want the context deadline", err)
-	}
-	_ = tunnel.SetReadDeadline(time.Now().Add(time.Second))
-	if _, err := tunnel.Read(make([]byte, 1)); err == nil {
-		t.Fatal("tunnel stayed open after the shutdown deadline force-closed it")
-	}
-}
-
-// --- admin -----------------------------------------------------------------
-
-// requests counts only valid CONNECTs (protocol rejects never advance it) and
-// failovers counts in-band route fallbacks.
-func TestAdminStatusCountsConnectsAndFallbacks(t *testing.T) {
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dead := &url.URL{Scheme: "socks5", Host: closed.Addr().String()}
-	_ = closed.Close()
-	good := startSocks5Proxy(t, socksOptions{})
-	pl := pool.NewRoutes(mixedRoutes(dead, good.URL), 30*time.Second, time.Minute)
-	s := NewRuntime(pool.NewStore(defaultRuntime(), pl), testLogger(), "9.9.9-test", "mixed", config.EgressV4, config.EgressV6)
-	addr := startServer(t, s)
-	admin := httptest.NewServer(s.AdminMux())
-	defer admin.Close()
-
-	// A protocol reject must not move any counter.
-	if got := socksRejectExchange(t, addr, socksRejectCase{greeting: []byte{0x04, 0x01, 0x00}}); len(got) != 0 {
-		t.Fatalf("reject reply = % x, want silence", got)
-	}
-	conn := socksDialVia(t, addr, startRawEchoTarget(t))
-	readBanner(t, conn)
-	_ = conn.Close()
-
-	hresp, err := http.Get(admin.URL + "/healthz")
-	if err != nil {
-		t.Fatalf("healthz: %v", err)
-	}
-	hbody, _ := io.ReadAll(hresp.Body)
-	_ = hresp.Body.Close()
-	if hresp.StatusCode != http.StatusOK || strings.TrimSpace(string(hbody)) != "ok" {
-		t.Fatalf("healthz status=%d body=%q", hresp.StatusCode, hbody)
-	}
-
-	sresp, err := http.Get(admin.URL + "/status")
-	if err != nil {
-		t.Fatalf("status: %v", err)
-	}
-	defer func() { _ = sresp.Body.Close() }()
-	if sresp.StatusCode != http.StatusOK {
-		t.Fatalf("status code=%d", sresp.StatusCode)
-	}
-	var got struct {
-		Version   string                    `json:"version"`
-		Requests  uint64                    `json:"requests"`
-		Failovers uint64                    `json:"failovers"`
-		Listeners map[string]ListenerStatus `json:"listeners"`
-		Pool      []pool.Status             `json:"pool"`
-	}
-	if err := json.NewDecoder(sresp.Body).Decode(&got); err != nil {
-		t.Fatalf("decode status: %v", err)
-	}
-	if got.Version != "9.9.9-test" {
-		t.Errorf("version = %q", got.Version)
-	}
-	if got.Requests != 1 || got.Failovers != 1 {
-		t.Errorf("totals = %+v, want one request and one fallback", got)
-	}
-	if want := (ListenerStatus{Requests: 1, Failovers: 1}); got.Listeners["mixed"] != want {
-		t.Errorf("listeners = %+v, want %+v", got.Listeners, want)
-	}
-	if len(got.Pool) != 2 {
-		t.Fatalf("pool len = %d, want 2", len(got.Pool))
-	}
-	if got.Pool[0].Failures != 1 || got.Pool[1].Successes != 1 {
-		t.Errorf("pool health = %+v", got.Pool)
-	}
-}
-
-func TestDialTCPCancellationIsNotEndpointFailure(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := dialTCP(ctx, "127.0.0.1:1", time.Second)
-	if !errors.Is(err, context.Canceled) || isProxyDialError(err) {
-		t.Fatalf("dialTCP cancellation = %T %v, want plain context cancellation", err, err)
 	}
 }

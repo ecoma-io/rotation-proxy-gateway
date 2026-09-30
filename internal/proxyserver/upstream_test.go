@@ -488,8 +488,10 @@ func TestDialViaBufferedPrefixDelivered(t *testing.T) {
 }
 
 // Connect-framing failures are handshake failures: with a single route the
-// request exhausts to the gateway's general-failure reply while recording dial
-// health against the route.
+// request exhausts to the gateway's 503 while recording dial health against the
+// route. The former SOCKS general-failure reply byte is gone from the wire —
+// the client now sees an HTTP status — but the exhaustion, the health record,
+// and the single upstream attempt are the same contract.
 func TestConnectFramingFailuresExhaustToNoRoute(t *testing.T) {
 	rawCases := []struct {
 		name string
@@ -502,11 +504,9 @@ func TestConnectFramingFailuresExhaustToNoRoute(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := startSocks5Proxy(t, socksOptions{connectRaw: tc.raw})
 			pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
-			s, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
-			conn, code := socksConnectReply(t, addr, "example.com:80", socksCmdConnect)
-			_ = conn.Close()
-			if code != socksReplyGeneral {
-				t.Fatalf("reply = 0x%02x, want general failure 0x01", code)
+			s, addr := newProxyServer(t, pl, defaultRuntime(), testLogger())
+			if status := httpConnectStatus(t, addr, "example.com:80"); status != http.StatusServiceUnavailable {
+				t.Fatalf("CONNECT status = %d, want 503 for an exhausted handshake chain", status)
 			}
 			snap := pl.Snapshot()[0]
 			if snap.Successes != 0 || snap.AuthFailures != 0 || snap.Failures != 1 || snap.Available {

@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"testing"
 	"time"
@@ -22,9 +22,9 @@ func TestRouteSelectedDebugCarriesAttemptShape(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
-	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
+	_, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
-	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	conn := httpDialVia(t, addr, startRawEchoTarget(t))
 	_ = conn.Close()
 
 	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel"})
@@ -47,7 +47,7 @@ func TestRouteSelectedDebugMarksCoolingFallback(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), 30*time.Second, time.Minute)
 	var logs safeLogBuffer
-	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
+	_, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
 	p := pl.PickFor(nil, nil, "t:443")
 	if p == nil {
@@ -55,7 +55,7 @@ func TestRouteSelectedDebugMarksCoolingFallback(t *testing.T) {
 	}
 	pl.ReportFailure(p, errors.New("dial refused (TEST)"))
 
-	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	conn := httpDialVia(t, addr, startRawEchoTarget(t))
 	_ = conn.Close()
 
 	output := waitForRecord(t, &logs, map[string]string{"msg": "route selected", "attempt": "1"})
@@ -72,8 +72,8 @@ func TestRouteSelectedDebugMarksCoolingFallback(t *testing.T) {
 }
 
 // The no_route record must show whether the miss was the whole pool or just
-// the listener's kind view: pool_size counts everything, kind_routes only
-// what this listener could ever serve.
+// the listener's kind view: pool_size counts everything, kind_routes only what
+// this listener could ever serve.
 func TestNoRouteRecordShowsPoolAndKindView(t *testing.T) {
 	u4, err := url.Parse("socks5://v4.test:1080")
 	if err != nil {
@@ -88,10 +88,10 @@ func TestNoRouteRecordShowsPoolAndKindView(t *testing.T) {
 		{URL: u6, Kind: config.EgressV6},
 	}, time.Second, time.Minute)
 	runtime := defaultRuntime()
-	// The cap outlives the pickable routes: the v4 route fails and is
-	// excluded, and the v6 route can never serve the v4-only listener, so the
-	// chain ends with a nil pick -- true route exhaustion, logged no_route
-	// with the retry budget still unspent.
+	// The cap outlives the pickable routes: the v4 route fails and is excluded,
+	// and the v6 route can never serve the v4-only listener, so the chain ends
+	// with a nil pick — true route exhaustion, logged no_route with the retry
+	// budget still unspent.
 	runtime.MaxRetries = 2
 	var logs safeLogBuffer
 	s := newRuntimeServer(pl, runtime, captureLogger(&logs), config.EgressV4)
@@ -100,11 +100,8 @@ func TestNoRouteRecordShowsPoolAndKindView(t *testing.T) {
 	}
 	addr := startServer(t, s)
 
-	conn := parkClient(t, addr, "example.test:80")
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		t.Fatalf("read reply: %v", err)
+	if status := httpConnectStatus(t, addr, "example.test:80"); status != http.StatusServiceUnavailable {
+		t.Fatalf("CONNECT status = %d, want 503", status)
 	}
 
 	output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel failed", "error_kind": "no_route"})
@@ -116,10 +113,10 @@ func TestNoRouteRecordShowsPoolAndKindView(t *testing.T) {
 	}
 }
 
-// When the retry budget ends the chain while eligible routes remain untried,
-// the terminal record must say retry_exhausted, not no_route: no_route is
-// reserved for the case where no eligible untried route remained. The client
-// still receives the ordinary 05 01 general failure either way.
+// When the retry budget ends the chain while eligible routes remain untried, the
+// terminal record must say retry_exhausted, not no_route: no_route is reserved
+// for the case where no eligible untried route remained. The client still
+// receives the same 503 either way — the split is observability, not wire.
 func TestRetryCapExhaustionLogsDistinctKind(t *testing.T) {
 	// Three always-failing routes; the pool can supply a fresh one on every
 	// attempt, so only the cap can stop the chain.
@@ -143,14 +140,8 @@ func TestRetryCapExhaustionLogsDistinctKind(t *testing.T) {
 	}
 	addr := startServer(t, s)
 
-	conn := parkClient(t, addr, "example.test:80")
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		t.Fatalf("read reply: %v", err)
-	}
-	if reply[1] != socksReplyGeneral {
-		t.Fatalf("reply = 0x%02x, want general failure 0x01", reply[1])
+	if status := httpConnectStatus(t, addr, "example.test:80"); status != http.StatusServiceUnavailable {
+		t.Fatalf("retry-cap status = %d, want 503", status)
 	}
 	if dials != runtime.MaxRetries {
 		t.Fatalf("dials = %d, want the retry cap %d", dials, runtime.MaxRetries)
@@ -169,8 +160,8 @@ func TestRetryCapExhaustionLogsDistinctKind(t *testing.T) {
 	}
 
 	// Pool size equal to the cap: every route is tried, the cap ends the
-	// chain — still retry_exhausted, never no_route, because the budget, not
-	// a nil pick, stopped it.
+	// chain — still retry_exhausted, never no_route, because the budget, not a
+	// nil pick, stopped it.
 	plEqual := pool.NewRoutes(routes[:2], time.Second, time.Minute)
 	var logsEqual safeLogBuffer
 	sEqual := newRuntimeServer(plEqual, runtime, captureLogger(&logsEqual), config.EgressV4)
@@ -178,14 +169,8 @@ func TestRetryCapExhaustionLogsDistinctKind(t *testing.T) {
 		return nil, &socksdial.ProxyDialError{Err: errors.New("connect refused (TEST)")}
 	}
 	addrEqual := startServer(t, sEqual)
-	connEqual := parkClient(t, addrEqual, "example.test:80")
-	_ = connEqual.SetDeadline(time.Now().Add(5 * time.Second))
-	replyEqual := make([]byte, 10)
-	if _, err := io.ReadFull(connEqual, replyEqual); err != nil {
-		t.Fatalf("read reply: %v", err)
-	}
-	if replyEqual[1] != socksReplyGeneral {
-		t.Fatalf("replyEqual = 0x%02x, want general failure 0x01", replyEqual[1])
+	if status := httpConnectStatus(t, addrEqual, "example.test:80"); status != http.StatusServiceUnavailable {
+		t.Fatalf("pool==cap status = %d, want 503", status)
 	}
 	outputEqual := waitForRecord(t, &logsEqual, map[string]string{"msg": "tunnel failed", "error_kind": "retry_exhausted"})
 	if _, ok := findRecord(outputEqual, map[string]string{
@@ -195,7 +180,7 @@ func TestRetryCapExhaustionLogsDistinctKind(t *testing.T) {
 		t.Fatalf("pool==cap record missing retry_exhausted view:\n%s", outputEqual)
 	}
 
-	// True route exhaustion -- no eligible untried route remains -- still logs
+	// True route exhaustion — no eligible untried route remains — still logs
 	// no_route. One route, tried once and excluded: the second pick has nothing
 	// left and ends the chain, with the cap (2) never reached.
 	pl2 := pool.NewRoutes(routes[:1], time.Second, time.Minute)
@@ -205,14 +190,8 @@ func TestRetryCapExhaustionLogsDistinctKind(t *testing.T) {
 		return nil, &socksdial.ProxyDialError{Err: errors.New("connect refused (TEST)")}
 	}
 	addr2 := startServer(t, s2)
-	conn2 := parkClient(t, addr2, "example.test:80")
-	_ = conn2.SetDeadline(time.Now().Add(5 * time.Second))
-	reply2 := make([]byte, 10)
-	if _, err := io.ReadFull(conn2, reply2); err != nil {
-		t.Fatalf("read reply: %v", err)
-	}
-	if reply2[1] != socksReplyGeneral {
-		t.Fatalf("reply2 = 0x%02x, want general failure 0x01", reply2[1])
+	if status := httpConnectStatus(t, addr2, "example.test:80"); status != http.StatusServiceUnavailable {
+		t.Fatalf("true-exhaustion status = %d, want 503", status)
 	}
 	output2 := waitForRecord(t, &logs2, map[string]string{"msg": "tunnel failed", "error_kind": "no_route"})
 	if _, ok := findRecord(output2, map[string]string{
@@ -289,7 +268,7 @@ func TestShutdownLogsForceCloseMilestone(t *testing.T) {
 		return nil, ctx.Err()
 	}
 	addr := startServer(t, s)
-	conn := parkClient(t, addr, "example.test:80")
+	conn, _ := parkClient(t, addr, "example.test:80")
 
 	select {
 	case <-dialStarted:

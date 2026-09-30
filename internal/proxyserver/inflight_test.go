@@ -1,10 +1,11 @@
 package proxyserver
 
 import (
+	"bufio"
 	"context"
 	"errors"
-	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"sync"
 	"testing"
@@ -56,49 +57,11 @@ func hangDial(t *testing.T, parked *url.URL) (func(context.Context, *url.URL, so
 	return seam, release
 }
 
-// socksRequestNoReply performs the greeting and sends one CONNECT without
-// reading the reply, for tests that must inspect the gateway while the retry
-// chain is still running.
-func socksRequestNoReply(t *testing.T, gatewayAddr, target string) net.Conn {
+// readParkedReply consumes the status the gateway answers a parked request
+// with, once the caller has released whatever the dial seam was blocked on.
+func readParkedReply(t *testing.T, br *bufio.Reader) int {
 	t.Helper()
-	frame, err := socksRequestFrame(socksCmdConnect, target)
-	if err != nil {
-		t.Fatalf("encode request for %s: %v", target, err)
-	}
-	conn, err := net.Dial("tcp", gatewayAddr)
-	if err != nil {
-		t.Fatalf("dial gateway %s: %v", gatewayAddr, err)
-	}
-	t.Cleanup(func() { _ = conn.Close() })
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := conn.Write(socksGreetingFrame(socksAuthNone)); err != nil {
-		t.Fatalf("write greeting: %v", err)
-	}
-	method := make([]byte, 2)
-	if _, err := io.ReadFull(conn, method); err != nil {
-		t.Fatalf("read method selection: %v", err)
-	}
-	if method[0] != socksVersion || method[1] != socksAuthNone {
-		t.Fatalf("method selection = %#02x %#02x, want 05 00", method[0], method[1])
-	}
-	if _, err := conn.Write(frame); err != nil {
-		t.Fatalf("write request: %v", err)
-	}
-	return conn
-}
-
-// readSocksReplyCode consumes the gateway's 10-byte CONNECT reply and returns
-// its reply code.
-func readSocksReplyCode(t *testing.T, conn net.Conn) byte {
-	t.Helper()
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		t.Fatalf("read SOCKS reply: %v", err)
-	}
-	if reply[0] != socksVersion {
-		t.Fatalf("reply version = %#02x, want 05", reply[0])
-	}
-	return reply[1]
+	return readIngressResponse(t, br, http.MethodConnect).StatusCode
 }
 
 // waitInFlight polls until p reports exactly want in-flight holds: establishing
@@ -129,7 +92,7 @@ func TestFailedAttemptReleasesInFlightHoldBeforeAnyTunnelExists(t *testing.T) {
 	addr := startServer(t, s)
 	failed, held := pl.RoutePointers()[0], pl.RoutePointers()[1]
 
-	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	conn := httpDialVia(t, addr, startRawEchoTarget(t))
 	if got := readBanner(t, conn); got != "banner\n" {
 		t.Fatalf("banner = %q", got)
 	}
@@ -157,8 +120,8 @@ func TestFailedAttemptReleasesInFlightHoldBeforeAnyTunnelExists(t *testing.T) {
 }
 
 // Every route failing is terminal: the chain ends on the empty pick, each
-// attempted route has already released its own hold, and the client's
-// general-failure reply is written after those releases.
+// attempted route has already released its own hold, and the client's 503 is
+// written after those releases.
 func TestEveryRouteFailingReleasesEachHold(t *testing.T) {
 	first, second := deadRoute("dead-one.test:1080"), deadRoute("dead-two.test:1080")
 	pl := pool.NewRoutes(mixedRoutes(first, second), time.Second, time.Minute)
@@ -168,10 +131,8 @@ func TestEveryRouteFailingReleasesEachHold(t *testing.T) {
 	}
 	addr := startServer(t, s)
 
-	conn, code := socksConnectReply(t, addr, "example.test:443", socksCmdConnect)
-	_ = conn.Close()
-	if code != socksReplyGeneral {
-		t.Fatalf("reply = 0x%02x, want general failure 0x01", code)
+	if status := httpConnectStatus(t, addr, "example.test:443"); status != http.StatusServiceUnavailable {
+		t.Fatalf("CONNECT status = %d, want 503", status)
 	}
 	for _, route := range pl.RoutePointers() {
 		if got := route.InFlight(); got != 0 {
@@ -203,7 +164,8 @@ func TestConnectTargetRefusalReleasesTheHold(t *testing.T) {
 	addr := startServer(t, s)
 	route := pl.RoutePointers()[0]
 
-	conn := socksRequestNoReply(t, addr, "blocked.test:443")
+	conn, br := parkClient(t, addr, "blocked.test:443")
+	t.Cleanup(func() { _ = conn.Close() })
 	waitForRecord(t, &logs, map[string]string{"msg": "upstream refused connect target"})
 
 	if got := route.InFlight(); got != 0 {
@@ -215,8 +177,8 @@ func TestConnectTargetRefusalReleasesTheHold(t *testing.T) {
 	}
 
 	release()
-	if code := readSocksReplyCode(t, conn); code != socksReplyGeneral {
-		t.Fatalf("reply = 0x%02x, want general failure 0x01", code)
+	if status := readParkedReply(t, br); status != http.StatusServiceUnavailable {
+		t.Fatalf("reply = %d, want 503", status)
 	}
 	if got := route.InFlight(); got != 0 {
 		t.Fatalf("refusing route in-flight after the chain ended = %d, want 0", got)
@@ -240,7 +202,8 @@ func TestSocksHandshakeFailureReleasesTheHold(t *testing.T) {
 	addr := startServer(t, s)
 	route := pl.RoutePointers()[0]
 
-	conn := socksRequestNoReply(t, addr, "example.test:443")
+	conn, br := parkClient(t, addr, "example.test:443")
+	t.Cleanup(func() { _ = conn.Close() })
 	waitForRecord(t, &logs, map[string]string{"msg": "upstream handshake failed"})
 
 	if got := route.InFlight(); got != 0 {
@@ -252,8 +215,8 @@ func TestSocksHandshakeFailureReleasesTheHold(t *testing.T) {
 	}
 
 	release()
-	if code := readSocksReplyCode(t, conn); code != socksReplyGeneral {
-		t.Fatalf("reply = 0x%02x, want general failure 0x01", code)
+	if status := readParkedReply(t, br); status != http.StatusServiceUnavailable {
+		t.Fatalf("reply = %d, want 503", status)
 	}
 	if got := route.InFlight(); got != 0 {
 		t.Fatalf("handshake-failing route in-flight after the chain ended = %d, want 0", got)
@@ -266,10 +229,10 @@ func TestAuthRouteFailureReleasesTheHold(t *testing.T) {
 	bad := startSocks5Proxy(t, socksOptions{user: "TEST-user", pass: "TEST-pass"})
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(bad.URL, good.URL), time.Second, time.Minute)
-	_, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
+	_, addr := newProxyServer(t, pl, defaultRuntime(), testLogger())
 	blocked, held := pl.RoutePointers()[0], pl.RoutePointers()[1]
 
-	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	conn := httpDialVia(t, addr, startRawEchoTarget(t))
 	readBanner(t, conn)
 
 	if got := blocked.InFlight(); got != 0 {
@@ -302,7 +265,7 @@ func TestDeadWarmBorrowKeepsOneHoldForTheTunnelLifetime(t *testing.T) {
 	addr := startServer(t, s)
 	route := pl.RoutePointers()[0]
 
-	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	conn := httpDialVia(t, addr, startRawEchoTarget(t))
 	readBanner(t, conn)
 
 	if got := route.InFlight(); got != 1 {
@@ -322,13 +285,13 @@ func TestConcurrentTunnelsHoldOneEach(t *testing.T) {
 	good := startSocks5Proxy(t, socksOptions{})
 	target := startRawEchoTarget(t)
 	pl := pool.NewRoutes(mixedRoutes(good.URL), time.Second, time.Minute)
-	_, addr := newSocksServer(t, pl, defaultRuntime(), testLogger())
+	_, addr := newProxyServer(t, pl, defaultRuntime(), testLogger())
 	route := pl.RoutePointers()[0]
 
 	const tunnels = 3
 	conns := make([]net.Conn, 0, tunnels)
 	for range tunnels {
-		conn := socksDialVia(t, addr, target)
+		conn := httpDialVia(t, addr, target)
 		if got := readBanner(t, conn); got != "banner\n" {
 			t.Fatalf("banner = %q", got)
 		}
@@ -353,10 +316,10 @@ func TestFirstPickHoldsUntilTheHandlerExits(t *testing.T) {
 	good := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(good.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
-	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
+	_, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
 	route := pl.RoutePointers()[0]
 
-	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	conn := httpDialVia(t, addr, startRawEchoTarget(t))
 	readBanner(t, conn)
 	if got := route.InFlight(); got != 1 {
 		t.Fatalf("in-flight on the serving route = %d, want 1", got)

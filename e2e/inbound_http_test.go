@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -277,6 +278,57 @@ func TestE2E_XEcomaHeadersNotForwardedToTarget(t *testing.T) {
 		if strings.HasPrefix(strings.ToLower(name), "x-ecoma-") {
 			t.Fatalf("origin saw %s: %v", name, values)
 		}
+	}
+}
+
+// A client that sends its CONNECT request head and its first payload in one
+// write is the normal TLS-client shape, and the gateway must not lose the
+// payload. net/http's parser buffers past the header block; the ingress has to
+// hand the socket's own reader to the relay, or the first bytes of every
+// pipelined tunnel are discarded and the tunnel stalls on its first read.
+func TestE2E_PipelinedBytesAfterConnectReachTheTunnel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e")
+	}
+	socks := NewSocksSim(t, SocksOK, "", "")
+	target := NewPipelinedEchoTarget(t)
+	g := NewGateway(t, defaultGatewayConfig([]RouteConfig{
+		{Proxy: socks.RouteValue(), Kind: "v4"},
+	}))
+
+	conn, err := net.DialTimeout("tcp", g.MixedAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial gateway: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// One write: request head immediately followed by payload.
+	payload := "pipelined-payload"
+	head := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target.Host, target.Host)
+	if _, err := fmt.Fprintf(conn, "%s%s", head, payload); err != nil {
+		t.Fatalf("write pipelined CONNECT: %v", err)
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status = %d, want 200", resp.StatusCode)
+	}
+
+	// Read through the same reader: the reply head and the echoed payload may
+	// have arrived in one segment, and skipping buffered bytes here would
+	// reproduce the bug this test exists to catch.
+	echoed := make([]byte, len(payload))
+	if _, err := io.ReadFull(br, echoed); err != nil {
+		t.Fatalf("read echoed payload: %v", err)
+	}
+	if string(echoed) != payload {
+		t.Fatalf("echoed %q, want %q", echoed, payload)
 	}
 }
 

@@ -162,6 +162,15 @@ func (r *forwardReplier) setFailureStatus(status int) { r.failureStatus = status
 // would hide an absolute-form target whose explicit Host header disagreed. The
 // small capture exists only to enforce forward-proxy authority integrity; the
 // body remains on the socket reader and is never buffered by this layer.
+//
+// It returns the socket's own framing reader, not the parser's. net/http parses
+// the header block out of a view that replays the captured bytes and then
+// drains it, so whatever that view buffered beyond the header block is gone by
+// the time parsing returns; a client that pipelines bytes behind its CONNECT
+// headers — which every TLS client does — would have its first tunnel payload
+// discarded. The framing reader is the only place those bytes still live, and
+// CONNECT hands it straight to the relay. The absolute-form path does not need
+// it, because that path consumes the body through req.Body.
 func readInboundRequest(conn net.Conn) (*http.Request, *bufio.Reader, string, error) {
 	framing := bufio.NewReaderSize(conn, inboundBufSize)
 	header, err := readHTTPHeader(framing)
@@ -180,7 +189,7 @@ func readInboundRequest(conn net.Conn) (*http.Request, *bufio.Reader, string, er
 	if err != nil {
 		return nil, nil, "", err
 	}
-	return req, parsed, host, nil
+	return req, framing, host, nil
 }
 
 // readHTTPHeader returns exactly the bytes through the empty line. ReadSlice

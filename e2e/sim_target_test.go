@@ -121,6 +121,32 @@ func NewRequestLineEchoTarget(t testing.TB) (*TargetSim, <-chan ObservedRequest)
 	return &TargetSim{Host: ln.Addr().String(), URL: "http://" + ln.Addr().String()}, seen
 }
 
+// NewPipelinedEchoTarget starts a raw origin that echoes whatever bytes it
+// receives. It exists for the CONNECT-pipelining regression: a client that
+// writes its request head and its first payload in one syscall needs those
+// payload bytes to survive the gateway's header parsing intact.
+func NewPipelinedEchoTarget(t testing.TB) *TargetSim {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+	return &TargetSim{Host: ln.Addr().String(), URL: "http://" + ln.Addr().String()}
+}
+
 // ReadObservedRequest returns the next raw-origin observation, failing the
 // test when no request arrives inside timeout.
 func ReadObservedRequest(t testing.TB, seen <-chan ObservedRequest, timeout time.Duration) ObservedRequest {
