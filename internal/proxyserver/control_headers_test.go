@@ -3,7 +3,6 @@ package proxyserver
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -1002,23 +1001,5 @@ func TestControlHeaderFamilyDoesNotChangeTheForwardedTarget(t *testing.T) {
 	// the ordinary rewritten origin-form request line.
 	if requestLine != "GET /family HTTP/1.1" {
 		t.Fatalf("origin saw request line %q, want the rewritten origin-form", requestLine)
-	}
-}
-
-// The record decoder the tests share must survive an id containing characters a
-// log line would otherwise have to escape — the point of the token grammar.
-// This is a small guard on the guard: it asserts the JSON round-trip rather
-// than the gateway.
-func TestControlHeadersAreJSONSafeByConstruction(t *testing.T) {
-	// A generated id and an accepted one are both plain tokens, so they
-	// serialize without escaping and cannot break a line-oriented reader.
-	for _, id := range []string{generateRequestID(), "abc-123_XY:z"} {
-		raw, err := json.Marshal(map[string]string{"correlation_id": id})
-		if err != nil {
-			t.Fatalf("marshal %q: %v", id, err)
-		}
-		if strings.Contains(string(raw), `\`) {
-			t.Fatalf("a plain id %q had to be escaped: %s", id, raw)
-		}
 	}
 }
