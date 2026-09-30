@@ -74,6 +74,9 @@ bootstrap variable carries the `RPGW_` prefix;
 
 ## Documentation
 
+- [Architecture](docs/architecture.md) — how the request path, generation
+  publication, rotation, and warm pool fit together, and the safety
+  properties each layer must preserve.
 - [Configuration](docs/configuration.md) — bootstrap environment variables
   (`RPGW_*`), the runtime YAML (routes and their ids, cooldown, rotation, warm
   pool, the domain-routing block) and its validation rules, and hot-reload

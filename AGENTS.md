@@ -11,6 +11,8 @@ SOCKS5 proxy listener views over one shared route-health pool:
 The always-on admin listener defaults to `0.0.0.0:30120`; operators control
 network exposure through Docker port publishing, network policy, and firewalls.
 The authoritative behavior contract lives under [`docs/`](docs/);
+[`docs/architecture.md`](docs/architecture.md) is the cross-cutting map of the
+request path, generation publication, rotation, and warm pool; and
 [`README.md`](README.md) is the entry point.
 
 ## Build and test
