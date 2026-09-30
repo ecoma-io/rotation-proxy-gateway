@@ -458,6 +458,11 @@ func TestControlHeaderFamilyIntersectsTheRoutingPolicy(t *testing.T) {
 // their own family, dialed while cooling — and the selected-route records carry
 // a remaining cooldown, which is what proves the fallback rather than the
 // ordinary path served them.
+//
+// The cooldown is the production backoff curve, not a stated one: the pool is
+// built with an hour of base and an hour of max, which saturates the curve at
+// its cap on the first failure. That keeps this test a statement about the pool
+// as it is, with no seam in internal/pool to hold the scenario open.
 func TestControlHeaderFamilyDoesNotLeakOnTheAllCoolingFallback(t *testing.T) {
 	srv, pl, logs := newFamilyPoolServer(t, config.EgressV4, config.EgressV6)
 	addr := startServer(t, srv)
@@ -470,7 +475,7 @@ func TestControlHeaderFamilyDoesNotLeakOnTheAllCoolingFallback(t *testing.T) {
 		mu.Lock()
 		dialed[pu.Host]++
 		mu.Unlock()
-		return nil, (&socksdial.ProxyDialError{Err: errors.New("connect refused (TEST)")}).WithRetryAfter(cooldownHold)
+		return nil, &socksdial.ProxyDialError{Err: errors.New("connect refused (TEST)")}
 	}
 
 	// One request per family is enough to put both routes into route-scoped
@@ -567,15 +572,6 @@ func newFamilyPoolServer(t *testing.T, kinds ...config.EgressKind) (*Server, *po
 	logs := &safeLogBuffer{}
 	return newRuntimeServer(pl, rt, captureLogger(logs)), pl, logs
 }
-
-// cooldownHold keeps a route that failed through the injected dial out of
-// service for the rest of a test. The error states it rather than the test
-// reaching into pool internals, so the scenario reads the way the real thing
-// behaves: a route that is down stays down. A route-scoped failure class is what
-// makes the hold last — a CONNECT the endpoint itself refuses cools only that
-// (route, target) pair, which the next request for the same target would still
-// be inside of.
-const cooldownHold = time.Hour
 
 // The family header is a request-scoped selection constraint, never part of
 // route identity. Two requests for one target that differ only in the header
