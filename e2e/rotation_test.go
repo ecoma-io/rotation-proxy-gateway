@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"rotation-proxy-gateway/internal/proxyserver"
 )
 
 func skipShort(t *testing.T) {
@@ -635,19 +637,48 @@ func TestRotationShutdownDuringProcedureExitsCleanly(t *testing.T) {
 	}
 
 	start := time.Now()
-	if err := g.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatalf("signal gateway: %v", err)
+	g.Signal(syscall.SIGTERM)
+
+	// The engine cancel sits behind the readiness head start, so the process is
+	// expected to still be up a few seconds after the signal: that window is
+	// exactly when every listener must stay accepting. Assert the transition
+	// first, then wait the head start out and measure the exit behind it.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if code, _ := g.AdminPath("/readyz"); code == http.StatusServiceUnavailable {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
 	}
-	done := make(chan error, 1)
-	go func() { done <- g.cmd.Wait() }()
+	if code, _ := g.AdminPath("/readyz"); code != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz = %d during a parked-rotation drain, want 503", code)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if exited := g.cmd.ProcessState != nil && g.cmd.ProcessState.Exited(); exited {
+		t.Fatalf("gateway exited inside the readiness head start (%s), which must hold every listener accepting\nlogs:\n%s",
+			time.Since(start), g.Logs())
+	}
+
+	headStart := proxyserver.ReadinessPropagation
+	wait := headStart + 4*time.Second
+	done := make(chan struct{})
+	var waitErr error
+	go func() { waitErr = g.cmd.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(4 * time.Second):
+	case <-time.After(wait):
 		_ = g.cmd.Process.Kill()
-		t.Fatalf("gateway ignored SIGTERM during a parked rotation\nlogs:\n%s", g.Logs())
+		<-done
+		t.Fatalf("gateway ignored SIGTERM during a parked rotation (%s budget after the %s head start)\nlogs:\n%s",
+			wait, headStart, g.Logs())
 	}
-	if elapsed := time.Since(start); elapsed > 4*time.Second {
-		t.Fatalf("shutdown took %s, want promptly after the engine cancel", elapsed)
+	if waitErr != nil {
+		t.Fatalf("wait: %v", waitErr)
+	}
+	// Behind the head start the parked rotation must still be cancelled at its
+	// next checkpoint rather than waiting out the API call.
+	if elapsed := time.Since(start) - headStart; elapsed > 4*time.Second {
+		t.Fatalf("shutdown took %s behind the head start, want promptly after the engine cancel", elapsed)
 	}
 	if logs := g.Logs(); strings.Contains(logs, "panic") {
 		t.Fatalf("shutdown produced a panic:\n%s", logs)

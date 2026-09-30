@@ -23,12 +23,12 @@ cooldowns, and selection order.
 
 The process starts one admin listener and up to three proxy listeners:
 
-| Endpoint     |         Default | Protocol | Purpose                                                      |
-| ------------ | --------------: | -------- | ------------------------------------------------------------ |
-| Admin        | `0.0.0.0:30120` | HTTP     | `/healthz` and `/status`; operator controls network exposure |
-| Mixed SOCKS5 |        `:30121` | SOCKS5   | Selects both v4- and v6-egress routes                        |
-| IPv4 SOCKS5  |        `:30122` | SOCKS5   | Selects only `kind: v4` routes                               |
-| IPv6 SOCKS5  |        `:30123` | SOCKS5   | Selects only `kind: v6` routes                               |
+| Endpoint     |         Default | Protocol | Purpose                                                              |
+| ------------ | --------------: | -------- | -------------------------------------------------------------------- |
+| Admin        | `0.0.0.0:30120` | HTTP     | `/healthz`, `/readyz`, `/status`; operator controls network exposure |
+| Mixed SOCKS5 |        `:30121` | SOCKS5   | Selects both v4- and v6-egress routes                                |
+| IPv4 SOCKS5  |        `:30122` | SOCKS5   | Selects only `kind: v4` routes                                       |
+| IPv6 SOCKS5  |        `:30123` | SOCKS5   | Selects only `kind: v6` routes                                       |
 
 `kind` is the public egress IP family supplied by a proxy provider. It is not
 the SOCKS endpoint address family and it does not impose an IPv4/IPv6 policy on

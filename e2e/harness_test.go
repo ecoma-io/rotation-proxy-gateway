@@ -3,6 +3,7 @@ package e2e_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -535,6 +536,68 @@ func (g *Gateway) Status() (*Status, error) {
 
 // Logs returns captured gateway stdout/stderr.
 func (g *Gateway) Logs() string { return g.output.String() }
+
+// Signal sends sig to the running gateway. Callers own waiting: the shutdown
+// tests need to observe the process while it is draining, which a combined
+// signal-and-wait helper would hide.
+func (g *Gateway) Signal(sig os.Signal) {
+	g.t.Helper()
+	if g.cmd == nil || (g.cmd.ProcessState != nil && g.cmd.ProcessState.Exited()) {
+		g.t.Fatal("gateway already exited")
+	}
+	if err := g.cmd.Process.Signal(sig); err != nil {
+		g.t.Fatalf("signal %v: %v", sig, err)
+	}
+}
+
+// Wait blocks until the process exits and returns its exit code.
+func (g *Gateway) Wait() int {
+	g.t.Helper()
+	err := g.cmd.Wait()
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	g.t.Fatalf("wait: %v", err)
+	return -1
+}
+
+// AdminPath issues a GET against one admin path and returns the status code and
+// body. A transport error is reported as status 0 rather than a failure: a
+// probe aimed at a socket the process has already closed is observing the end
+// of the drain, which several readiness tests assert about.
+func (g *Gateway) AdminPath(path string) (int, string) {
+	g.t.Helper()
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{}}
+	resp, err := client.Get("http://" + g.AdminAddr + path)
+	if err != nil {
+		return 0, ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	return resp.StatusCode, string(body)
+}
+
+// Healthcheck runs the binary\'s own probe against the running gateway and
+// returns its exit code. It is the shipped container health check, exercised
+// against the real process rather than a stand-in.
+func (g *Gateway) Healthcheck() int {
+	g.t.Helper()
+	cmd := exec.Command(testBinaryPath, "healthcheck")
+	cmd.Env = append(os.Environ(), "RPGW_ADMIN_ADDR="+g.AdminAddr)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return ee.ExitCode()
+		}
+		g.t.Fatalf("healthcheck subcommand: %v\n%s", err, out)
+	}
+	return 0
+}
 
 func (g *Gateway) stop() {
 	if g.cmd == nil || (g.cmd.ProcessState != nil && g.cmd.ProcessState.Exited()) {

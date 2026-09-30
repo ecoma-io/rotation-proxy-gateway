@@ -30,12 +30,12 @@ func TestHealthcheckURL(t *testing.T) {
 		addr string
 		want string
 	}{
-		{name: "empty host defaults to loopback", addr: ":30120", want: "http://127.0.0.1:30120/healthz"},
-		{name: "IPv4 wildcard defaults to loopback", addr: "0.0.0.0:30120", want: "http://127.0.0.1:30120/healthz"},
-		{name: "IPv6 wildcard defaults to loopback", addr: "[::]:30120", want: "http://[::1]:30120/healthz"},
-		{name: "loopback host", addr: "127.0.0.1:30120", want: "http://127.0.0.1:30120/healthz"},
-		{name: "ipv6 loopback", addr: "[::1]:30120", want: "http://[::1]:30120/healthz"},
-		{name: "named host with port passes through", addr: "localhost:30120", want: "http://localhost:30120/healthz"},
+		{name: "empty host defaults to loopback", addr: ":30120", want: "http://127.0.0.1:30120/readyz"},
+		{name: "IPv4 wildcard defaults to loopback", addr: "0.0.0.0:30120", want: "http://127.0.0.1:30120/readyz"},
+		{name: "IPv6 wildcard defaults to loopback", addr: "[::]:30120", want: "http://[::1]:30120/readyz"},
+		{name: "loopback host", addr: "127.0.0.1:30120", want: "http://127.0.0.1:30120/readyz"},
+		{name: "ipv6 loopback", addr: "[::1]:30120", want: "http://[::1]:30120/readyz"},
+		{name: "named host with port passes through", addr: "localhost:30120", want: "http://localhost:30120/readyz"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -72,6 +72,42 @@ func TestHealthcheck(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		isolateHealthcheckEnv(t)
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The probe targets readiness, not liveness: a 200 from /healthz
+			// must not satisfy it, or a draining process would keep reporting
+			// healthy until its listener closed.
+			if r.URL.Path != proxyserver.ReadyPath {
+				http.NotFound(w, r)
+				return
+			}
+			w.Write([]byte(proxyserver.ReadyBody)) //nolint:errcheck
+		}))
+		defer srv.Close()
+		t.Setenv("RPGW_ADMIN_ADDR", adminAddrFor(t, srv))
+		if got := healthcheck(); got != 0 {
+			t.Fatalf("healthcheck() = %d, want 0", got)
+		}
+	})
+
+	t.Run("draining 503 fails", func(t *testing.T) {
+		isolateHealthcheckEnv(t)
+		lc := proxyserver.NewLifecycle()
+		lc.MarkReady()
+		srv := httptest.NewServer(proxyserver.AdminMux("test", time.Now(), newTestStore(), nil, nil, nil, nil, lc))
+		lc.BeginDraining()
+		defer srv.Close()
+		t.Setenv("RPGW_ADMIN_ADDR", adminAddrFor(t, srv))
+		if got := healthcheck(); got != 1 {
+			t.Fatalf("healthcheck() = %d, want 1 for a draining process", got)
+		}
+	})
+
+	t.Run("liveness 200 does not satisfy the probe", func(t *testing.T) {
+		// The quiet failure this guards: a process answering 200 "ok\n" on
+		// /healthz for its whole life, drain window included. Probing liveness
+		// would report that process as healthy for exactly as long as its
+		// sockets are the wrong thing to send traffic to.
+		isolateHealthcheckEnv(t)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/healthz" {
 				http.NotFound(w, r)
 				return
@@ -80,8 +116,8 @@ func TestHealthcheck(t *testing.T) {
 		}))
 		defer srv.Close()
 		t.Setenv("RPGW_ADMIN_ADDR", adminAddrFor(t, srv))
-		if got := healthcheck(); got != 0 {
-			t.Fatalf("healthcheck() = %d, want 0", got)
+		if got := healthcheck(); got != 1 {
+			t.Fatalf("healthcheck() = %d, want 1: /healthz must not pass the readiness probe", got)
 		}
 	})
 
@@ -219,11 +255,11 @@ func TestRunArgsHealthcheckKeepsExitContract(t *testing.T) {
 	t.Run("healthy admin exits 0", func(t *testing.T) {
 		isolateServerEnv(t)
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/healthz" {
+			if r.URL.Path != proxyserver.ReadyPath {
 				http.NotFound(w, r)
 				return
 			}
-			w.Write([]byte("ok\n")) //nolint:errcheck
+			w.Write([]byte(proxyserver.ReadyBody)) //nolint:errcheck
 		}))
 		defer srv.Close()
 		t.Setenv("RPGW_ADMIN_ADDR", adminAddrFor(t, srv))
@@ -471,22 +507,26 @@ func TestShutdownAllClosesProxyListenersThenAdmin(t *testing.T) {
 
 	lnA := serveSocksListener(t, srvA)
 	lnB := serveSocksListener(t, srvB)
-	lnAdmin, adminSrv := serveAdminListener(t, proxyserver.AdminMux("test", time.Now(), store, map[string]*proxyserver.Server{"mixed": srvA}, nil, nil, nil))
+	lnAdmin, adminSrv := serveAdminListener(t, proxyserver.AdminMux("test", time.Now(), store, map[string]*proxyserver.Server{"mixed": srvA}, nil, nil, nil, proxyserver.NewLifecycle()))
 
 	listeners := []runningListener{
 		{name: "mixed", server: srvA, ln: lnA},
 		{name: "v4", server: srvB, ln: lnB},
 	}
 
+	// A 12s grace: the readiness head start is capped at grace/2, so this one
+	// takes the full 5s while the drain itself returns at once, and the two
+	// halves stay separable.
+	const grace = 12 * time.Second
 	done := make(chan struct{})
 	go func() {
-		shutdownAll(logging.Nop(), func() {}, func(context.Context) {}, listeners, adminSrv, 5*time.Second)
+		shutdownAll(logging.Nop(), proxyserver.NewLifecycle(), func() {}, func(context.Context) {}, listeners, adminSrv, grace)
 		close(done)
 	}()
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("shutdownAll on a process with no live sessions did not return within 2s, well under the 5s grace")
+	case <-time.After(grace/2 + 3*time.Second):
+		t.Fatalf("shutdownAll on a process with no live sessions did not return in head+drain time, well under the %s grace", grace)
 	}
 
 	// Each listener was bound to an ephemeral port; after shutdownAll the
@@ -534,7 +574,7 @@ func TestShutdownAllSharedBudget(t *testing.T) {
 	start := time.Now()
 	done := make(chan struct{})
 	go func() {
-		shutdownAll(logging.Nop(), func() {}, func(context.Context) {}, listeners, adminSrv, grace)
+		shutdownAll(logging.Nop(), proxyserver.NewLifecycle(), func() {}, func(context.Context) {}, listeners, adminSrv, grace)
 		close(done)
 	}()
 	select {
@@ -588,15 +628,18 @@ func TestShutdownAllDrainsCompletedSessionsImmediately(t *testing.T) {
 	_ = parked.Close()
 
 	listeners := []runningListener{{name: "mixed", server: srv, ln: ln}}
+	// A 12s grace, for the reason above: the head start is capped at grace/2,
+	// so this process waits 5s to unready and then drains nothing at all.
+	const grace = 12 * time.Second
 	done := make(chan struct{})
 	go func() {
-		shutdownAll(logging.Nop(), func() {}, func(context.Context) {}, listeners, adminSrv, 5*time.Second)
+		shutdownAll(logging.Nop(), proxyserver.NewLifecycle(), func() {}, func(context.Context) {}, listeners, adminSrv, grace)
 		close(done)
 	}()
 	select {
 	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("shutdownAll did not return within 1s although the only session had already ended (grace 5s)")
+	case <-time.After(grace/2 + 3*time.Second):
+		t.Fatalf("shutdownAll did not return in head+drain time although the only session had already ended (grace %s)", grace)
 	}
 }
 
@@ -618,5 +661,231 @@ func TestParseZerologLevel(t *testing.T) {
 				t.Errorf("parseZerologLevel(%q) = %v, want %v", tc.level, got, tc.want)
 			}
 		})
+	}
+}
+
+// The ordering the whole readiness feature exists for: /readyz goes 503 the
+// instant the drain starts, while every proxy listener and the admin listener
+// are still accepting. Asserting the two states separately would prove nothing —
+// a probe that only ever sees "503" after the sockets are gone would pass too.
+func TestShutdownAllUnreadsBeforeAnyListenerCloses(t *testing.T) {
+	log := newTestLogger()
+	store := newTestStore()
+	lc := proxyserver.NewLifecycle()
+	lc.MarkReady()
+
+	srvA := proxyserver.NewRuntime(store, log, "test", "mixed", config.EgressV4, config.EgressV6)
+	srvB := proxyserver.NewRuntime(store, log, "test", "v4", config.EgressV4)
+	srvC := proxyserver.NewRuntime(store, log, "test", "v6", config.EgressV6)
+	lnA := serveSocksListener(t, srvA)
+	lnB := serveSocksListener(t, srvB)
+	lnC := serveSocksListener(t, srvC)
+	lnAdmin, adminSrv := serveAdminListener(t, proxyserver.AdminMux("test", time.Now(), store, nil, nil, nil, nil, lc))
+
+	listeners := []runningListener{
+		{name: "mixed", server: srvA, ln: lnA},
+		{name: "v4", server: srvB, ln: lnB},
+		{name: "v6", server: srvC, ln: lnC},
+	}
+
+	// A 12s grace: the head start is capped at grace/2, so this one takes the
+	// full 5s — long enough to sample the window repeatedly, and the drain
+	// itself has nothing to wait for.
+	const grace = 12 * time.Second
+	// reachability is sampled at the moment it is asked for, so the answer
+	// belongs to that instant rather than to whenever the goroutine got
+	// scheduled.
+	reachable := func(ln net.Listener) bool {
+		conn, err := net.DialTimeout("tcp", ln.Addr().String(), 200*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
+	}
+	// A refused connection is 0, not a failure: the admin socket closing is
+	// what the end of the drain looks like from outside. What must never
+	// happen is a 200 once the drain has begun.
+	readyz := func() int {
+		client := &http.Client{Timeout: time.Second}
+		resp, err := client.Get("http://" + lnAdmin.Addr().String() + proxyserver.ReadyPath)
+		if err != nil {
+			return 0
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Sampled before the goroutine exists, so the "before" answer belongs to
+	// the serving phase and not to a race with the drain.
+	if got := readyz(); got != http.StatusOK {
+		t.Fatalf("before the signal /readyz = %d, want 200", got)
+	}
+	done := make(chan struct{})
+	go func() {
+		shutdownAll(logging.Nop(), lc, func() {}, func(context.Context) {}, listeners, adminSrv, grace)
+		close(done)
+	}()
+
+	// The window between the two transitions is exactly the head start, so
+	// sampling faster than it is what proves the listeners stayed open across
+	// it.
+	deadline := time.Now().Add(grace/2 + 2*time.Second)
+	samples, unready := 0, 0
+	for time.Now().Before(deadline) {
+		got := readyz()
+		if got == http.StatusOK {
+			t.Fatal("the process advertised readiness after the drain began; /readyz is what evicts it from the load balancer")
+		}
+		if got == http.StatusServiceUnavailable {
+			unready++
+		}
+		// Sampled only while the admin listener is still answering: after the
+		// drain its socket is gone, and a refused connection is not evidence
+		// about reachability.
+		if got != 0 {
+			for _, ln := range []net.Listener{lnA, lnB, lnC, lnAdmin} {
+				if !reachable(ln) {
+					t.Fatalf("listener %s stopped accepting before the head start ended; the readiness window is the feature", ln.Addr())
+				}
+			}
+		}
+		samples++
+		time.Sleep(100 * time.Millisecond)
+	}
+	if samples < 10 || unready < 10 {
+		t.Fatalf("%d samples of which %d answered 503, want the %s head start sampled throughout", samples, unready, proxyserver.ReadinessPropagation)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(grace/2 + 5*time.Second):
+		t.Fatal("shutdownAll did not return after the head start and an empty drain")
+	}
+	// Terminal: the process no longer advertises readiness even if something
+	// answers the admin socket late.
+	if got := lc.Ready(); got {
+		t.Fatal("lifecycle still reports ready after shutdownAll returned")
+	}
+	for _, ln := range []net.Listener{lnA, lnB, lnC, lnAdmin} {
+		if reachable(ln) {
+			t.Fatalf("listener %s still reachable after shutdownAll", ln.Addr())
+		}
+	}
+}
+
+// Every listen socket closes before any of them drains. The old sequence
+// closed and drained one listener at a time in construction order, which kept
+// the later listeners accepting — and, because each Server only sets its own
+// shuttingDown flag inside its own Shutdown, let them admit brand-new sessions
+// that the already-expired deadline then force-closed.
+//
+// The fixture is a listener whose sessions can never finish: the mixed listener
+// holds one for the whole budget. If the close were interleaved with the
+// drains, the v4 listener's own Shutdown would not have started when the
+// budget expired, so its parked session would be released by the wait rather
+// than by the force-close sweep — the two are told apart by the fact that only
+// the force-close closes a session parked in its greeting read.
+func TestShutdownAllClosesEveryListenerBeforeDraining(t *testing.T) {
+	log := newTestLogger()
+	store := newTestStore()
+	srvA := proxyserver.NewRuntime(store, log, "test", "mixed", config.EgressV4, config.EgressV6)
+	srvB := proxyserver.NewRuntime(store, log, "test", "v4", config.EgressV4)
+	lnA := serveSocksListener(t, srvA)
+	lnB := serveSocksListener(t, srvB)
+	_, adminSrv := serveAdminListener(t, http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+
+	parkedMixed := parkConn(t, lnA.Addr().String())
+	parkedV4 := parkConn(t, lnB.Addr().String())
+	// One beat so both accept loops really start the parked sessions, for the
+	// reason spelled out on TestShutdownAllSharedBudget.
+	time.Sleep(250 * time.Millisecond)
+
+	listeners := []runningListener{
+		{name: "mixed", server: srvA, ln: lnA},
+		{name: "v4", server: srvB, ln: lnB},
+	}
+
+	// A long grace, so the head start is the full 5s and the shared budget that
+	// follows is long enough that the drain is what ends the sessions.
+	const grace = 30 * time.Second
+	done := make(chan struct{})
+	go func() {
+		shutdownAll(logging.Nop(), proxyserver.NewLifecycle(), func() {}, func(context.Context) {}, listeners, adminSrv, grace)
+		close(done)
+	}()
+
+	// Part-way through the head start both sockets are still open — that is the
+	// property this test is about, checked without depending on a specific
+	// close ordering being observable from outside.
+	time.Sleep(proxyserver.ReadinessPropagation / 2)
+	for _, ln := range []net.Listener{lnA, lnB} {
+		conn, err := net.DialTimeout("tcp", ln.Addr().String(), 200*time.Millisecond)
+		if err != nil {
+			t.Fatalf("listener %s stopped accepting %s into a %s head start", ln.Addr(), proxyserver.ReadinessPropagation/2, proxyserver.ReadinessPropagation)
+		}
+		_ = conn.Close()
+	}
+
+	select {
+	case <-done:
+	case <-time.After(grace + 10*time.Second):
+		t.Fatal("shutdownAll did not return within grace + 10s")
+	}
+	// Both parked sessions were force-closed by the sweep, which is what proves
+	// the v4 listener's Shutdown had begun before the budget expired.
+	assertForceClosed(t, parkedMixed)
+	assertForceClosed(t, parkedV4)
+}
+
+// The head start is a pause, not a floor: a process whose listeners have
+// already failed on their own has nothing left to unready for anyone, and
+// burning the full window on it would delay every real shutdown for nothing.
+func TestShutdownAllHeadStartIsBoundedByTheBudget(t *testing.T) {
+	log := newTestLogger()
+	store := newTestStore()
+	lc := proxyserver.NewLifecycle()
+	lc.MarkReady()
+	srv := proxyserver.NewRuntime(store, log, "test", "mixed", config.EgressV4, config.EgressV6)
+	ln := serveSocksListener(t, srv)
+	_, adminSrv := serveAdminListener(t, http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+	listeners := []runningListener{{name: "mixed", server: srv, ln: ln}}
+
+	// A grace too short to carry the head start: the cap hands back grace/2
+	// instead, and total signal→exit still stays inside the budget.
+	const grace = 200 * time.Millisecond
+	start := time.Now()
+	shutdownAll(logging.Nop(), lc, func() {}, func(context.Context) {}, listeners, adminSrv, grace)
+	elapsed := time.Since(start)
+	if elapsed > grace+2*time.Second {
+		t.Fatalf("shutdownAll took %s for a %s grace; the head start escaped the budget", elapsed, grace)
+	}
+	if lc.Ready() {
+		t.Fatal("lifecycle still reports ready after shutdownAll returned")
+	}
+}
+
+// A zero or negative grace is not a configuration this process produces, but it
+// must not hang the head start: the previous behavior (no pause at all) is the
+// correct one for a budget that cannot carry a pause.
+func TestShutdownAllNoHeadStartWithoutABudget(t *testing.T) {
+	for _, grace := range []time.Duration{0, -time.Second} {
+		log := newTestLogger()
+		store := newTestStore()
+		lc := proxyserver.NewLifecycle()
+		lc.MarkReady()
+		srv := proxyserver.NewRuntime(store, log, "test", "mixed", config.EgressV4, config.EgressV6)
+		ln := serveSocksListener(t, srv)
+		_, adminSrv := serveAdminListener(t, http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+		listeners := []runningListener{{name: "mixed", server: srv, ln: ln}}
+
+		start := time.Now()
+		shutdownAll(logging.Nop(), lc, func() {}, func(context.Context) {}, listeners, adminSrv, grace)
+		if elapsed := time.Since(start); elapsed > 3*time.Second {
+			t.Fatalf("grace %s: shutdownAll took %s, want it to return at once", grace, elapsed)
+		}
+		if lc.Ready() {
+			t.Fatalf("grace %s: lifecycle still reports ready after shutdownAll", grace)
+		}
 	}
 }

@@ -1086,9 +1086,11 @@ func (s *Server) CloseConns() int {
 	return len(conns)
 }
 
-// AdminMux serves the health and status endpoints for the admin listener.
+// AdminMux serves the health and status endpoints for one proxy listener, for
+// tests and for any single-listener embedding. A process serves one AdminMux
+// for all of its views; the process owns the lifecycle that mux reports.
 func (s *Server) AdminMux() *http.ServeMux {
-	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s}, nil, nil, nil)
+	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s}, nil, nil, nil, NewLifecycle())
 }
 
 // AdminMux serves aggregate health/status for all proxy listener views sharing
@@ -1101,13 +1103,26 @@ func (s *Server) AdminMux() *http.ServeMux {
 // process-lifetime aggregates: completed rotations, and the subset of them
 // that committed an address the same route had already verified. warm, when
 // non-nil, reports the warm-pool view (bounds, gauges, lifecycle counters); it
-// is omitted entirely when no warm pool backs the process.
-func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64, ipRevisits func() uint64, warm func() warmpool.Status) *http.ServeMux {
+// is omitted entirely when no warm pool backs the process. lc is the process
+// lifecycle /readyz reports; a nil lc is answered as ready, which is correct
+// for a single-listener embedding that owns no drain sequence.
+func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64, ipRevisits func() uint64, warm func() warmpool.Status, lc *Lifecycle) *http.ServeMux {
 	mux := http.NewServeMux()
+	// Liveness, unconditionally. It never reports the drain: see lifecycle.go
+	// for why a liveness probe that fails while a process is stopping
+	// correctly is worse than no probe at all.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = io.WriteString(w, "ok\n")
 	})
+	// Readiness, the mirror image: 503 from the instant the drain starts, while
+	// every listener is still accepting.
+	ready := lc
+	if ready == nil {
+		ready = &Lifecycle{}
+		ready.MarkReady()
+	}
+	mux.HandleFunc(ReadyPath, ready.serveReadyz)
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		perListener := make(map[string]ListenerStatus, len(listeners))

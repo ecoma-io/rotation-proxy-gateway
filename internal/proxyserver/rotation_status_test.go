@@ -46,7 +46,7 @@ func TestAdminStatusExposesRotationCounters(t *testing.T) {
 
 	rotations, ipRevisits := uint64(2), uint64(1)
 	admin := httptest.NewServer(AdminMux("test", time.Now(), store, nil,
-		func() uint64 { return rotations }, func() uint64 { return ipRevisits }, nil))
+		func() uint64 { return rotations }, func() uint64 { return ipRevisits }, nil, NewLifecycle()))
 	defer admin.Close()
 
 	resp, err := http.Get(admin.URL + "/status")

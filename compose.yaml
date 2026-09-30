@@ -14,7 +14,7 @@ services:
       - "30121:30121" # mixed IPv4/IPv6 egress SOCKS5 listener
       - "30122:30122" # IPv4-egress SOCKS5 listener
       - "30123:30123" # IPv6-egress SOCKS5 listener
-      - "30120:30120" # admin (HTTP): healthz and status
+      - "30120:30120" # admin (HTTP): healthz, readyz, status
     environment:
       # Bootstrap-only settings: changes require a container restart.
       RPGW_CONFIG_FILE: /app/config.yaml
@@ -27,6 +27,10 @@ services:
       # RPGW_ACCOUNT=user:pass
     # docker stop sends SIGTERM and waits this long before SIGKILL. Keep it
     # above the gateway's RPGW_SHUTDOWN_GRACE (default 55s) plus a little margin.
+    # Raising it does not buy availability: the gateway's listeners are closed
+    # for the whole drain, so with a single replica a longer grace is a longer
+    # refusal of new connections. It bounds the drain; the outage window is
+    # fixed by running more than one replica behind a load balancer.
     stop_grace_period: 60s
     logging:
       driver: json-file
@@ -35,6 +39,12 @@ services:
         max-file: "3"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
+    # The healthcheck subcommand probes the admin /readyz, so this goes
+    # unhealthy ~5s into a drain. That is correct, not a fault: Docker records
+    # the status and does not kill on it, and killing mid-drain would cut live
+    # tunnels. The 30s interval is deliberately the Docker cadence and not a
+    # rollout signal — anything steering traffic needs a ~2s probe of
+    # /readyz, which is what the 5s readiness head start is sized for.
     healthcheck:
       test: ["CMD", "/app/rotation-proxy-gateway", "healthcheck"]
       interval: 30s

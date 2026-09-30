@@ -72,27 +72,55 @@ func runArgs(args []string) int {
 // healthcheck probes the bootstrap-configured admin listener. It deliberately
 // does not parse runtime YAML: a bad reload must not make a healthy, already
 // running process fail Docker's health probe.
+//
+// It probes /readyz, not /healthz, and that choice is the point. A container
+// health check asks "should this instance still receive traffic?", and the
+// answer has to go false while the sockets are still up — which is exactly what
+// /readyz does and what /healthz deliberately does not. Probing /healthz would
+// keep reporting a draining process as fine until its listener finally closed,
+// and Docker would then be told to kill a process that is stopping correctly,
+// mid-drain, with live tunnels on it.
+//
+// The body is checked as well as the status: /readyz answers "ok\n" only while
+// the process is ready, so a 200 from anything else listening on that port
+// fails the probe. The body is never logged — a probe aimed at the wrong port
+// can hit anything, and its answer is not ours to quote — only its length.
 func healthcheck() int {
 	cfg, err := config.LoadBootstrap()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "bootstrap config:", sanitize.ErrorString(err))
+		fmt.Fprintln(os.Stderr, "healthcheck:", sanitize.ErrorString(err))
 		return 1
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
+	// An empty Transport ignores HTTP_PROXY and friends: the probe must reach
+	// this process directly, never detour through a proxy that happens to be
+	// configured in the environment.
+	client := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{}}
 	resp, err := client.Get(healthcheckURL(cfg.AdminAddr))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "healthcheck:", sanitize.ErrorString(err))
 		return 1
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
-	if resp.StatusCode != http.StatusOK || string(body) != "ok\n" {
-		fmt.Fprintf(os.Stderr, "healthcheck: status %d, body %q\n", resp.StatusCode, body)
+	// Bounded read: /readyz answers "ok\n" (and at most a state token), but a
+	// probe pointed at the wrong port can be answered by anything at all.
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if readErr != nil {
+		fmt.Fprintln(os.Stderr, "healthcheck: reading the probe response:", sanitize.ErrorString(readErr))
+		return 1
+	}
+	if resp.StatusCode != http.StatusOK || string(body) != proxyserver.ReadyBody {
+		// The failure body is the readiness state token — a fixed vocabulary the
+		// process owns, never anything a route or an upstream said — and even so
+		// only its length is reported.
+		fmt.Fprintf(os.Stderr, "healthcheck: status %d, response length %d\n", resp.StatusCode, len(body))
 		return 1
 	}
 	return 0
 }
 
+// healthcheckURL builds the probe URL against the bootstrap admin address. A
+// wildcard or hostless bind addresses all interfaces, so the probe goes to the
+// loopback equivalent instead.
 func healthcheckURL(addr string) string {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -104,7 +132,7 @@ func healthcheckURL(addr string) string {
 	case "::":
 		host = "::1"
 	}
-	return (&url.URL{Scheme: "http", Host: net.JoinHostPort(host, port), Path: "/healthz"}).String()
+	return (&url.URL{Scheme: "http", Host: net.JoinHostPort(host, port), Path: proxyserver.ReadyPath}).String()
 }
 
 type runningListener struct {
@@ -210,8 +238,12 @@ func run() error {
 	}
 
 	started := time.Now()
+	// The lifecycle is the process's own readiness statement, read by /readyz
+	// and written only by the shutdown path. It is created before the admin mux
+	// so the handler closure and shutdownAll share one machine.
+	lc := proxyserver.NewLifecycle()
 	adminSrv := &http.Server{
-		Handler:           proxyserver.AdminMux(version, started, store, listenerViews, engine.Rotations, engine.IPRevisits, warm.Snapshot),
+		Handler:           proxyserver.AdminMux(version, started, store, listenerViews, engine.Rotations, engine.IPRevisits, warm.Snapshot, lc),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
@@ -253,6 +285,15 @@ func run() error {
 	go engine.Run(engineCtx)
 	warm.Start()
 
+	// Ready once every proxy listener and the admin listener are bound and
+	// their serve goroutines are running: from this instant a probe that reaches
+	// /readyz is answered by a process that is certainly serving every listener.
+	// The signal handler was armed before any of it, so a SIGTERM that arrived
+	// during startup already took the graceful path and the deferred
+	// cancelPoll/engineCancel above have already unwound — this transition can
+	// only move forward from here.
+	lc.MarkReady()
+
 	// Reloads from the poller arrive on one channel and are handled by this
 	// serialized loop; the source label only records how it was reached.
 	reload := func(source string) {
@@ -276,7 +317,7 @@ func run() error {
 	for {
 		select {
 		case err := <-errCh:
-			shutdownAll(log, engineCancel, warm.Stop, listeners, adminSrv, bootstrap.ShutdownGrace)
+			shutdownAll(log, lc, engineCancel, warm.Stop, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return err
 		case sig := <-sigCh:
 			// SIGHUP is deliberately ignored — never a reload, never a drain.
@@ -291,7 +332,7 @@ func run() error {
 				continue
 			}
 			log.Info().Str("signal", sig.String()).Str("grace", bootstrap.ShutdownGrace.String()).Msg("shutting down")
-			shutdownAll(log, engineCancel, warm.Stop, listeners, adminSrv, bootstrap.ShutdownGrace)
+			shutdownAll(log, lc, engineCancel, warm.Stop, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return nil
 		case <-poller.Changes():
 			// The poller hash-gates on applied content, so one signal means one
@@ -302,22 +343,48 @@ func run() error {
 }
 
 // shutdownAll stops the rotation engine and the warm pool first, then closes
-// every proxy listener socket and drains each one's active SOCKS sessions plus
-// the admin listener against one shared grace budget. A drained listener
-// returns immediately, so an idle process exits at once; once the budget
-// expires the remaining sessions' client connections are force-closed and
-// later listeners stop waiting. Established tunnels are never broken before
-// that deadline.
+// every proxy listener socket at once and drains each one's active SOCKS
+// sessions plus the admin listener concurrently, against one shared grace
+// budget. A drained listener returns immediately, so an idle process exits at
+// once; once the budget expires the remaining sessions' client connections are
+// force-closed. Established tunnels are never broken before that deadline.
+//
+// Ordering, and why each step is where it is:
+//
+//  1. Unready FIRST, before a single socket is touched. From this instant
+//     /readyz answers 503 while /healthz keeps answering 200 and every
+//     listener keeps accepting — the window a load balancer needs. Only then
+//     does the head start run, so a probe scheduled before the signal still
+//     lands on a live socket rather than a closed port.
+//  2. The rotation engine, then the warm pool, inside the same budget. The
+//     order between them is deliberate: reversing it would let parked warm
+//     sockets outlive the sessions they exist to accelerate.
+//  3. Every listen socket closed, then every drain started — never interleaved.
+//     Closing them one at a time and draining in between kept the not-yet-closed
+//     listeners serving, and each Server only sets its own shuttingDown flag
+//     inside its own Shutdown, so those listeners went on admitting brand-new
+//     sessions that the already-expired deadline then force-closed. Draining
+//     concurrently also stops one long-lived tunnel on the mixed listener from
+//     consuming the whole budget and leaving the v4 and v6 listeners none.
+//
+// The trade-off is real: one long tunnel on ANY listener now ends the accept
+// phase for all of them, where before only the listeners reached later in the
+// sequence stopped early. That is the correct shape for a draining gateway —
+// it should be accepting nothing — but it changes the failure profile from
+// "some listeners still serve" to "none do, promptly".
 //
 // Budget invariant: the one ctx deadline is created here and governs the warm
 // pool teardown, every proxy listener drain, and the admin shutdown alike —
 // pre-drain work (rotation cancel, warm stop) shares the same clock instead of
-// holding its own. The worst case is grace plus the per-listener force-close
-// tail (proxyserver's forceCloseWait, 1s) times the three listeners, plus the
-// admin shutdown — with the default 55s grace that is ~58s, and the
-// surrounding orchestrator's kill timer (compose stop_grace_period: 60s) must
-// stay above it.
-func shutdownAll(log zerolog.Logger, engineCancel context.CancelFunc, warmStop func(context.Context), listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
+// holding its own. The head start is DRAWN from that budget rather than added
+// to it, so total signal→exit stays within grace. The worst case is grace plus
+// the per-listener force-close tail (proxyserver's forceCloseWait, 1s) — one
+// per proxy listener that was still draining when the budget expired, and the
+// drains now run concurrently, so at worst that is a single 1s tail rather
+// than one per listener in sequence. With the default 55s grace that is ~56s,
+// and the surrounding orchestrator's kill timer (compose stop_grace_period:
+// 60s) must stay above it.
+func shutdownAll(log zerolog.Logger, lc *proxyserver.Lifecycle, engineCancel context.CancelFunc, warmStop func(context.Context), listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
 	// The deadline governs the whole drain. Creating it before stopping the
 	// rotation engine and the warm pool means their unwinding consumes the
 	// same budget the listeners drain against — a process with a warm worker
@@ -325,6 +392,25 @@ func shutdownAll(log zerolog.Logger, engineCancel context.CancelFunc, warmStop f
 	// grace, not by a separate fixed 1s cap on top of it.
 	ctx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
+
+	// Step 1: stop advertising readiness while every socket is still open.
+	// The head start is capped at grace/2 and drawn from the budget above, so
+	// this pause can never push the process past its own grace.
+	head := proxyserver.Propagation(grace)
+	lc.BeginDraining()
+	log.Info().Dur("grace", grace).Dur("propagation", head).Msg("readiness unready; listeners still accepting")
+	if head > 0 {
+		timer := time.NewTimer(head)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			// The grace budget cannot carry the head start after all (only
+			// reachable if a caller passed a grace shorter than the cap, which
+			// propagation() already guards — kept so the wait can never outlive
+			// the process's own budget).
+			timer.Stop()
+		}
+	}
 
 	engineCancel()
 	log.Debug().Msg("rotation engine canceled")
@@ -334,22 +420,55 @@ func shutdownAll(log zerolog.Logger, engineCancel context.CancelFunc, warmStop f
 	warmStop(ctx)
 	log.Debug().Msg("warm pool stopped")
 	start := time.Now()
-	drained := 0
+
+	// Step 3a: close every listen socket before draining any of them. Each
+	// Server then refuses new sessions from its own Shutdown, and none of them
+	// is still accepting while another drains.
 	for _, listener := range listeners {
 		listener.ln.Close() //nolint:errcheck // stop accepting immediately
-		if err := listener.server.Shutdown(ctx); err != nil {
-			log.Warn().Str("listener", listener.name).Str("error", sanitize.ErrorString(err)).
+	}
+
+	// Step 3b: drain all proxy listeners concurrently under the one shared
+	// budget. The admin drain joins the same wait: it has no sessions beyond
+	// its own probe requests, so serializing it would only add its share of the
+	// budget to the total instead of overlapping it.
+	type drainedListener struct {
+		name string
+		err  error
+	}
+	results := make(chan drainedListener, len(listeners))
+	for _, listener := range listeners {
+		listener := listener
+		go func() {
+			results <- drainedListener{name: listener.name, err: listener.server.Shutdown(ctx)}
+		}()
+	}
+	adminErr := make(chan error, 1)
+	go func() { adminErr <- shutdownServer(adminSrv, ctx) }()
+
+	drained := 0
+	for range listeners {
+		result := <-results
+		if result.err != nil {
+			log.Warn().Str("listener", result.name).Str("error", sanitize.ErrorString(result.err)).
 				Msg("proxy listener closed; grace expired and sessions were force-closed")
 			continue
 		}
 		drained++
-		log.Info().Str("listener", listener.name).Msg("proxy listener drained")
+		log.Info().Str("listener", result.name).Msg("proxy listener drained")
 	}
-	if err := shutdownServer(adminSrv, ctx); err != nil {
+	// The admin listener only reports a failed graceful shutdown when the
+	// budget expired with requests still in flight; it always ends closed
+	// either way, so the error is a report, not a branch.
+	if err := <-adminErr; err != nil {
 		log.Warn().Str("error", sanitize.ErrorString(err)).Msg("admin listener closed; grace expired")
 	} else {
 		log.Info().Msg("admin listener closed")
 	}
+
+	// Terminal: nothing can accept a connection now, so /readyz stops answering
+	// "ready" permanently even if something answers the admin socket late.
+	lc.MarkStopped()
 	log.Info().Int("listeners", len(listeners)).Int("drained", drained).
 		Str("elapsed", time.Since(start).Truncate(time.Millisecond).String()).
 		Msg("shutdown complete")
