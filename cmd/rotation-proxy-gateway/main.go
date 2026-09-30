@@ -346,7 +346,7 @@ func run() error {
 }
 
 // shutdownAll stops the rotation engine and the warm pool first, then closes
-// every proxy listener socket at once and drains each one's active SOCKS
+// every proxy listener socket at once and drains each one's active client
 // sessions plus the admin listener concurrently, against one shared grace
 // budget. A drained listener returns immediately, so an idle process exits at
 // once; once the budget expires the remaining sessions' client connections are

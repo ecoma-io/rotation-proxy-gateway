@@ -84,13 +84,13 @@ func TestE2E_ReloadShrinksToOtherFamily(t *testing.T) {
 	GetVia(t, ProxyClient(g.V4Addr), target.URL+"/", "e2e-echo:/")
 
 	// Drop the v4 route entirely: mixed and v6 keep working, v4 stays live and
-	// its CONNECT requests now get the general-failure reply (no-route).
+	// its requests are now rejected with no-route.
 	cfg.Routes = []RouteConfig{{Proxy: v6.RouteValue(), Kind: "v6"}}
 	g.ReloadConfig(cfg, []string{v6.Addr})
 
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/", "e2e-echo:/")
 	GetVia(t, ProxyClient(g.V6Addr), target.URL+"/", "e2e-echo:/")
-	failedSocksTunnel(t, g.V4Addr, target.Host)
+	failedTunnel(t, g.V4Addr, target.Host)
 }
 
 func TestE2E_InvalidConfigKeepsServing(t *testing.T) {

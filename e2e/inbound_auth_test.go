@@ -1,8 +1,12 @@
 package e2e_test
 
 import (
+	"bufio"
+	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,12 +15,18 @@ import (
 	"time"
 )
 
-// authedConnect performs the account-gated handshake against a gateway
-// listener: a greeting offering both methods (the armed account must select
-// 0x02 over 0x00), the RFC 1929 exchange, and — when the credentials are
-// accepted — one CONNECT. It returns the RFC 1929 status and, on success, the
-// established tunnel with its reply code.
-func authedConnect(t *testing.T, proxyAddr, username, password, targetAddr string) (byte, net.Conn, byte) {
+// proxyAuthHeader renders the Proxy-Authorization value a client sends for one
+// account. An empty user or pass still produces a well-formed Basic value, so
+// the empty-password account stays expressible.
+func proxyAuthHeader(username, password string) string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
+}
+
+// authedConnect performs the account-gated request against a gateway listener:
+// one CONNECT carrying Proxy-Authorization, and — when the credentials are
+// accepted — an established tunnel. It returns the CONNECT status and, on
+// success, the established tunnel.
+func authedConnect(t *testing.T, proxyAddr, username, password, targetAddr string) (int, net.Conn) {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
 	if err != nil {
@@ -24,46 +34,22 @@ func authedConnect(t *testing.T, proxyAddr, username, password, targetAddr strin
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	if _, err := conn.Write([]byte{0x05, 0x02, 0x00, 0x02}); err != nil {
-		t.Fatalf("send greeting: %v", err)
-	}
-	selection := make([]byte, 2)
-	if _, err := io.ReadFull(conn, selection); err != nil {
-		t.Fatalf("read method selection: %v", err)
-	}
-	if selection[0] != 0x05 || selection[1] != 0x02 {
-		t.Fatalf("method selection = % x, want 05 02 — an armed account must not accept NO AUTHENTICATION", selection)
-	}
-	auth := []byte{0x01, byte(len(username))}
-	auth = append(auth, username...)
-	auth = append(auth, byte(len(password)))
-	auth = append(auth, password...)
-	if _, err := conn.Write(auth); err != nil {
-		t.Fatalf("send auth: %v", err)
-	}
-	status := make([]byte, 2)
-	if _, err := io.ReadFull(conn, status); err != nil {
-		t.Fatalf("read auth reply: %v", err)
-	}
-	if status[1] != 0x00 {
-		return status[1], nil, 0
-	}
-	req, err := socksConnectRequestBytes(targetAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := conn.Write(req); err != nil {
+	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: %s\r\n\r\n",
+		targetAddr, targetAddr, proxyAuthHeader(username, password))
+	if _, err := conn.Write([]byte(req)); err != nil {
 		t.Fatalf("send connect: %v", err)
 	}
-	head := make([]byte, 4)
-	if _, err := io.ReadFull(conn, head); err != nil {
-		t.Fatalf("read connect reply: %v", err)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatalf("read connect response: %v", err)
 	}
-	if err := discardSocksBND(conn, head[3]); err != nil {
-		t.Fatal(err)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return resp.StatusCode, nil
 	}
 	_ = conn.SetDeadline(time.Time{})
-	return 0x00, conn, head[1]
+	return http.StatusOK, &bufferedConn{Conn: conn, r: br}
 }
 
 // The full account-gated story against the real binary: correct credentials
@@ -80,9 +66,9 @@ func TestE2E_InboundAccountAuth(t *testing.T) {
 		{Proxy: socks.RouteValue(), Kind: "v4"},
 	}), "RPGW_ACCOUNT=e2e-user:e2e-pass")
 
-	authStatus, conn, reply := authedConnect(t, g.MixedAddr, "e2e-user", "e2e-pass", target.Host)
-	if authStatus != 0x00 || reply != 0x00 {
-		t.Fatalf("auth status=%#02x connect reply=%#02x, want 00/00", authStatus, reply)
+	status, conn := authedConnect(t, g.MixedAddr, "e2e-user", "e2e-pass", target.Host)
+	if status != http.StatusOK || conn == nil {
+		t.Fatalf("authenticated CONNECT status = %d, want 200 with a tunnel", status)
 	}
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write([]byte("GET /hello HTTP/1.0\r\nHost: e2e\r\n\r\n")); err != nil {
@@ -97,13 +83,12 @@ func TestE2E_InboundAccountAuth(t *testing.T) {
 	}
 	_ = conn.Close()
 
-	// Wrong password: the RFC 1929 failure reply and a close, before any
-	// route selection.
-	if status, _, _ := authedConnect(t, g.MixedAddr, "e2e-user", "wrong-pass", target.Host); status != 0xff {
-		t.Fatalf("wrong-password auth status = %#02x, want ff", status)
+	// Wrong password: 407 and a close, before any route selection.
+	if status, _ := authedConnect(t, g.MixedAddr, "e2e-user", "wrong-pass", target.Host); status != http.StatusProxyAuthRequired {
+		t.Fatalf("wrong-password CONNECT status = %d, want 407", status)
 	}
 
-	// A no-auth client is refused at method negotiation — the open-proxy
+	// A no-auth client is refused before route selection too — the open-proxy
 	// quiet direction the account exists to close.
 	noAuth, err := net.DialTimeout("tcp", g.V4Addr, 5*time.Second)
 	if err != nil {
@@ -111,15 +96,20 @@ func TestE2E_InboundAccountAuth(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = noAuth.Close() })
 	_ = noAuth.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := noAuth.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+	if _, err := noAuth.Write([]byte("CONNECT " + target.Host + " HTTP/1.1\r\nHost: " + target.Host + "\r\n\r\n")); err != nil {
 		t.Fatal(err)
 	}
-	selection := make([]byte, 2)
-	if _, err := io.ReadFull(noAuth, selection); err != nil {
-		t.Fatalf("read method selection: %v", err)
+	br := bufio.NewReader(noAuth)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatalf("read connect response: %v", err)
 	}
-	if selection[0] != 0x05 || selection[1] != 0xff {
-		t.Fatalf("method selection = % x, want 05 ff for a no-auth client", selection)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Fatalf("no-auth CONNECT status = %d, want 407", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Proxy-Authenticate"); !strings.Contains(got, `Basic realm="rotation-proxy-gateway"`) {
+		t.Fatalf("Proxy-Authenticate = %q, want the gateway's Basic realm", got)
 	}
 
 	st, err := g.Status()
@@ -142,9 +132,9 @@ func TestE2E_InboundAccountAuth(t *testing.T) {
 }
 
 // An account with an empty password is armed authentication like any other:
-// the RFC 1929 frame carries a zero-length password (PLEN=0), the
-// constant-time comparison must accept exactly that pair, and any non-empty
-// password or wrong username is rejected before route selection.
+// the Basic value carries an empty password, the constant-time comparison must
+// accept exactly that pair, and any non-empty password or wrong username is
+// rejected before route selection.
 func TestE2E_InboundAccountEmptyPasswordAuthenticates(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
@@ -155,9 +145,9 @@ func TestE2E_InboundAccountEmptyPasswordAuthenticates(t *testing.T) {
 		{Proxy: socks.RouteValue(), Kind: "v4"},
 	}), "RPGW_ACCOUNT=e2e-user:")
 
-	authStatus, conn, reply := authedConnect(t, g.MixedAddr, "e2e-user", "", target.Host)
-	if authStatus != 0x00 || reply != 0x00 {
-		t.Fatalf("empty-password auth status=%#02x connect reply=%#02x, want 00/00", authStatus, reply)
+	status, conn := authedConnect(t, g.MixedAddr, "e2e-user", "", target.Host)
+	if status != http.StatusOK || conn == nil {
+		t.Fatalf("empty-password CONNECT status = %d, want 200 with a tunnel", status)
 	}
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write([]byte("GET /empty-pass HTTP/1.0\r\nHost: e2e\r\n\r\n")); err != nil {
@@ -172,13 +162,13 @@ func TestE2E_InboundAccountEmptyPasswordAuthenticates(t *testing.T) {
 	}
 	_ = conn.Close()
 
-	// A non-empty password against the empty-password account fails the
-	// exchange; so does the right password under a wrong username.
-	if status, _, _ := authedConnect(t, g.MixedAddr, "e2e-user", "non-empty", target.Host); status != 0xff {
-		t.Fatalf("non-empty password auth status = %#02x, want ff", status)
+	// A non-empty password against the empty-password account is refused; so
+	// does the right password under a wrong username.
+	if status, _ := authedConnect(t, g.MixedAddr, "e2e-user", "non-empty", target.Host); status != http.StatusProxyAuthRequired {
+		t.Fatalf("non-empty password CONNECT status = %d, want 407", status)
 	}
-	if status, _, _ := authedConnect(t, g.MixedAddr, "e2e-other-user", "", target.Host); status != 0xff {
-		t.Fatalf("wrong-username auth status = %#02x, want ff", status)
+	if status, _ := authedConnect(t, g.MixedAddr, "e2e-other-user", "", target.Host); status != http.StatusProxyAuthRequired {
+		t.Fatalf("wrong-username CONNECT status = %d, want 407", status)
 	}
 
 	st, err := g.Status()

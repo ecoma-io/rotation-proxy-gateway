@@ -23,6 +23,23 @@ const (
 	errorKindRetryExhausted = "retry_exhausted"
 )
 
+// Error-kind HTTP status mapping is intentionally adjacent to the stable log
+// vocabulary rather than folded into logErrorKind: logs describe the precise
+// event that occurred, while a client can receive one status only after every
+// allowed fallback has ended. `setup` is split at ingress: malformed client HTTP
+// is rejected before route selection as 400; a selected-route local setup error
+// is ours and therefore 502. A rejected HTTP version is 505 before selection.
+//
+//   error_kind                                             terminal status
+//   proxy_connect, socks_connect, auth_route, connect_target 502 Bad Gateway
+//   no_route, retry_exhausted                                503 Service Unavailable
+//   setup (gateway-side after valid selection)               502 Bad Gateway
+//   setup (malformed client frame before selection)           400 Bad Request
+//   http_version_not_supported                               505 HTTP Version Not Supported
+//
+// The table is a public wire contract; do not change logErrorKind values to
+// smuggle a response distinction into observability.
+
 // upstreamLogValue returns the redacted route identity used in logs. URL.Host
 // excludes URL userinfo; never replace this with URL.String.
 func upstreamLogValue(p *pool.Proxy) string {
@@ -32,8 +49,10 @@ func upstreamLogValue(p *pool.Proxy) string {
 	return cleanLogValue(p.URL.Host)
 }
 
-// socksTargetLogValue keeps only a SOCKS target's normalized host:port.
-func socksTargetLogValue(target string) string {
+// targetLogValue keeps only an inbound HTTP target's normalized host:port.
+// The outbound hop remains SOCKS5H, but the target came from HTTP authority
+// syntax and this boundary must stay oblivious to either protocol's framing.
+func targetLogValue(target string) string {
 	host, port, err := net.SplitHostPort(target)
 	if err != nil || !validPortNumber(port) {
 		// SplitHostPort "succeeds" on any colon (e.g. a userinfo-shaped
@@ -44,16 +63,6 @@ func socksTargetLogValue(target string) string {
 		return cleanLogValue(dropUserinfo(target))
 	}
 	return cleanLogValue(net.JoinHostPort(dropUserinfo(host), port))
-}
-
-// socksRejectLogValue bounds and sanitizes a protocol-reject reason. Reject
-// errors are constructed locally from framing bytes; the sanitizer is the
-// single defense keeping any odd byte sequence out of logs.
-func socksRejectLogValue(err error) string {
-	if err == nil {
-		return ""
-	}
-	return sanitize.ErrorString(err)
 }
 
 func validPortNumber(port string) bool {

@@ -35,7 +35,10 @@ gateway routes by that authority and then forwards the request **origin-form**:
 An absolute-form request target is never forwarded unchanged. A target with no
 path (`GET http://api.example.com HTTP/1.1`) forwards as `GET / HTTP/1.1`.
 Only the `http` scheme is proxied; `https` in an absolute-form target is
-answered `501 Not Implemented`, and clients wanting TLS use `CONNECT`.
+answered `501 Not Implemented`, and clients wanting TLS use `CONNECT`. The
+method is relayed verbatim; only `GET`, `HEAD`, and `POST` have defined
+forward-proxy semantics here, so any other method is answered
+`405 Method Not Allowed` before a route is selected.
 
 A default port is implied when the authority omits one — `http://example.com`
 is `example.com:80`. An explicit port must be a real port number; zero is
@@ -99,6 +102,7 @@ server.
 | Inbound handshake deadline expired before the next attempt                                                           | `502 Bad Gateway`                   |
 | Malformed request: bad request line, origin-form without proxy role, absent or inconsistent authority, zero port     | `400 Bad Request`                   |
 | Unsupported scheme in an absolute-form target                                                                        | `501 Not Implemented`               |
+| Absolute-form request whose method is not `GET`, `HEAD`, or `POST`                                                   | `405 Method Not Allowed`            |
 | HTTP version other than 1.1                                                                                          | `505 HTTP Version Not Supported`    |
 | Missing or wrong `Proxy-Authorization` while `RPGW_ACCOUNT` is set                                                   | `407 Proxy Authentication Required` |
 

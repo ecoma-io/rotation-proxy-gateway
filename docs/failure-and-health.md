@@ -137,8 +137,9 @@ tracked targets are client-controlled strings that never appear in logs or
 ## What never mutates health
 
 Target bytes are ordinary tunnel data. A byte sequence that resembles an HTTP
-`407` is not SOCKS authentication data, does not rotate, and does not create
-cooldown; once the tunnel is established, nothing the target sends alters
+`407` is an application response, not authentication data, does not rotate, and
+does not create cooldown; once the tunnel is established, nothing the target
+sends alters
 route health. Local inbound protocol errors
 ([inbound HTTP forward-proxy behavior](inbound-http.md)) and everything after the tunnel
 exists are `setup`: no health mutation, no retry. Rotation probe traffic

@@ -614,23 +614,23 @@ func (g *Gateway) stop() {
 	}
 }
 
-// ProxyClient returns an HTTP client routing through one gateway listener.
-// The transport dials every connection as an inbound SOCKS5 tunnel (RFC 1928,
-// no auth), so HTTP and TLS run inside the tunnel and the gateway is a pure
-// TCP relay from the client's point of view. Keep-alives are disabled so one
-// HTTP request is one CONNECT: requests counter, route picks, and health
-// effects keep their historical per-request granularity. Tests that want to
-// exercise client-owned tunnel reuse build their own transport instead.
+// ProxyClient returns an HTTP client routing through one gateway listener as
+// an HTTP forward proxy: an https:// target is reached through a CONNECT
+// tunnel, an http:// one through an absolute-form request. Keep-alives are
+// disabled deliberately: net/http documents DisableKeepAlives as limiting a
+// connection to one HTTP request, which preserves the suite's historical
+// one-request-per-tunnel/route-pick and counter granularity for both shapes.
+// Tests that want client-owned tunnel reuse build their own transport instead.
 func ProxyClient(proxyAddr string) *http.Client {
-	tr := socksTransport(proxyAddr, false)
+	tr := proxyTransport(proxyAddr, false)
 	tr.DisableKeepAlives = true
 	return &http.Client{Transport: tr, Timeout: 15 * time.Second}
 }
 
 // ProxyClientInsecureTLS is ProxyClient with TLS verification disabled for
-// tunnel tests against httptest TLS targets.
+// CONNECT-tunnel tests against httptest TLS targets.
 func ProxyClientInsecureTLS(proxyAddr string) *http.Client {
-	tr := socksTransport(proxyAddr, true)
+	tr := proxyTransport(proxyAddr, true)
 	tr.DisableKeepAlives = true
 	return &http.Client{Transport: tr, Timeout: 15 * time.Second}
 }

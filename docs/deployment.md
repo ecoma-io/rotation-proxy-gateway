@@ -50,7 +50,9 @@ clients migrate:
   disabled; it is not consulted.
 - Clients that only spoke SOCKS5 need no other change. Anything that relied on
   the gateway's RFC 1928 method negotiation has no HTTP equivalent and simply
-  stops.
+  stops. An absolute-form client must speak the `http` scheme through the proxy;
+  a client that asked the gateway for a raw `https` request target now gets
+  `501` and must use `CONNECT` for TLS.
 
 **Rollback is a redeploy, not a mode.** There is no compatibility listener and
 no flag: to return to the previous behavior, redeploy the previous image and

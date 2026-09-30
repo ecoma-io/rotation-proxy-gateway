@@ -61,10 +61,10 @@ func TestE2E_HalfCloseDeliversDelayedResponse(t *testing.T) {
 		{Proxy: socks.RouteValue(), Kind: "v4"},
 	}))
 
-	conn := socksTunnel(t, g.MixedAddr, target)
-	tc, ok := conn.(*net.TCPConn)
+	conn := tunnelFor(t, g.MixedAddr, target)
+	tc, ok := conn.(interface{ CloseWrite() error })
 	if !ok {
-		t.Fatalf("tunnel conn = %T, want *net.TCPConn for CloseWrite", conn)
+		t.Fatalf("tunnel conn = %T, want one with CloseWrite", conn)
 	}
 	if err := tc.CloseWrite(); err != nil {
 		t.Fatalf("CloseWrite: %v", err)
@@ -79,7 +79,7 @@ func TestE2E_HalfCloseDeliversDelayedResponse(t *testing.T) {
 	}
 }
 
-// A pipelining client — greeting, CONNECT, and payload in one write, so the
+// A pipelining client — CONNECT and the tunneled payload in one write, so the
 // gateway relays through its prefix wrapper — must observe a reset, not a
 // clean EOF, when the upstream drops the live stream mid-flight: the
 // truncated stream stays visibly truncated (issue #37).
@@ -95,10 +95,8 @@ func TestE2E_PipelinedBurstSeesResetOnUpstreamBreak(t *testing.T) {
 	cfg.LogLevel = "debug" // the reset decision logs at debug
 	g := NewGateway(t, cfg)
 
-	frame, err := socksConnectRequestBytes("127.0.0.1:9")
-	if err != nil {
-		t.Fatal(err)
-	}
+	const head = "CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n"
+	const wantStatus = "HTTP/1.1 200"
 	for _, pipelined := range []struct {
 		name  string
 		burst bool
@@ -111,37 +109,21 @@ func TestE2E_PipelinedBurstSeesResetOnUpstreamBreak(t *testing.T) {
 			defer func() { _ = conn.Close() }()
 			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 			if pipelined.burst {
-				// One write: greeting, CONNECT frame, and payload together —
+				// One write: the CONNECT request head and payload together —
 				// the exact case whose prefix wrapper used to swallow the
 				// reset.
-				burst := append([]byte{0x05, 0x01, 0x00}, frame...)
-				burst = append(burst, []byte("burst-payload")...)
-				if _, err := conn.Write(burst); err != nil {
+				if _, err := conn.Write([]byte(head + "burst-payload")); err != nil {
 					t.Fatalf("write burst: %v", err)
 				}
-			} else {
-				if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-					t.Fatalf("write greeting: %v", err)
-				}
+			} else if _, err := conn.Write([]byte(head)); err != nil {
+				t.Fatalf("write connect: %v", err)
 			}
-			method := make([]byte, 2)
-			if _, err := io.ReadFull(conn, method); err != nil {
-				t.Fatalf("read method selection: %v", err)
+			status := make([]byte, len(wantStatus))
+			if _, err := io.ReadFull(conn, status); err != nil {
+				t.Fatalf("read status line: %v", err)
 			}
-			if method[0] != 0x05 || method[1] != 0x00 {
-				t.Fatalf("method selection = % x", method)
-			}
-			if !pipelined.burst {
-				if _, err := conn.Write(frame); err != nil {
-					t.Fatalf("write connect: %v", err)
-				}
-			}
-			reply := make([]byte, 10)
-			if _, err := io.ReadFull(conn, reply); err != nil {
-				t.Fatalf("read reply: %v", err)
-			}
-			if reply[1] != 0x00 {
-				t.Fatalf("CONNECT reply = 0x%02x, want success", reply[1])
+			if string(status) != wantStatus {
+				t.Fatalf("status line = %q, want %q", status, wantStatus)
 			}
 			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 			if _, err := io.Copy(io.Discard, conn); err == nil || !isConnResetError(err) {
@@ -180,7 +162,7 @@ func TestE2E_CleanTeardownNoReset(t *testing.T) {
 	cfg.LogLevel = "debug"
 	g := NewGateway(t, cfg)
 
-	conn := socksTunnel(t, g.MixedAddr, target)
+	conn := tunnelFor(t, g.MixedAddr, target)
 	_ = conn.Close()
 
 	waitForLogRecord(t, g, map[string]string{"msg": "tunnel closed", "close_reason": "client_closed"}, 10*time.Second)

@@ -144,8 +144,9 @@ changing failure classification.
   optional and authoritative) and absolute-form `GET http://host/path
 HTTP/1.1`. An origin-form target on a proxy listener is a request for a
   local resource that does not exist and gets `400`; a target with no path
-  forwards as `/`; only `http` is proxied (`501` otherwise), and a version
-  other than 1.1 gets `505`. A malformed or absent authority gets `400`. An
+  forwards as `/`; only `http` is proxied (`501` otherwise), a version other
+  than 1.1 gets `505`, and an absolute-form method outside `GET`/`HEAD`/`POST`
+  gets `405`. A malformed or absent authority gets `400`. An
   absolute-form request is rewritten to origin-form before forwarding — never
   forwarded unchanged. Malformed request lines get `400` without a tunnel.
   Domain targets are forwarded as names: DNS happens at the outbound route

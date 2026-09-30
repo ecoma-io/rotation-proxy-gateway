@@ -10,8 +10,8 @@ import (
 // semantics inside that scope, and a reload swaps policy and pool as one
 // generation. Only domain targets can match a rule, so every routed request
 // uses a name; the sims tunnel to a local echo instead of the named
-// destination (the same trick as the address-type tests), so names are
-// matched, never resolved.
+// destination (the same trick as the routing candidate-set tests), so names
+// are matched, never resolved.
 
 func routingSims(t *testing.T) (openaiA, openaiB, kiloC *SocksSim, echo *TargetSim) {
 	t.Helper()
@@ -98,9 +98,9 @@ func TestE2E_RoutingUnmatchedFailsClosed(t *testing.T) {
 	g := NewGateway(t, cfg)
 
 	GetVia(t, ProxyClient(g.MixedAddr), "http://api.openai.com/", "e2e-echo:/")
-	failedSocksTunnel(t, g.MixedAddr, "unmatched.example:80")
+	failedTunnel(t, g.MixedAddr, "unmatched.example:80")
 	// An IP target carries no hostname and can never match a rule.
-	failedSocksTunnel(t, g.MixedAddr, "127.0.0.1:1")
+	failedTunnel(t, g.MixedAddr, "127.0.0.1:1")
 
 	// Fail-closed targets leave route health untouched.
 	st, err := g.Status()
