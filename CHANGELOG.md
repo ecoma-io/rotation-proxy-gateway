@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/ecoma-io/rotation-proxy-gateway/compare/v0.5.0...v0.6.0) (2026-09-30)
+
+
+### Features
+
+* **proxyserver:** report readiness and drain every listener at once ([#89](https://github.com/ecoma-io/rotation-proxy-gateway/issues/89)) ([30740a3](https://github.com/ecoma-io/rotation-proxy-gateway/commit/30740a343460c8f3289b2214b3ebb6f93cabc13b)), closes [#87](https://github.com/ecoma-io/rotation-proxy-gateway/issues/87)
+
 ## [0.5.0](https://github.com/ecoma-io/rotation-proxy-gateway/compare/v0.4.0...v0.5.0) (2026-09-25)
 
 
