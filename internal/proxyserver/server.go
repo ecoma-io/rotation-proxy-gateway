@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"rotation-proxy-gateway/internal/analyticsstore"
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/sanitize"
@@ -131,6 +132,13 @@ type Server struct {
 	// request. Set once, before Serve starts, and read-only afterwards; nil
 	// keeps the forward proxy unauthenticated.
 	account *inboundAccount
+	// recorder receives this listener's terminal request outcomes for durable
+	// analytics. Set once, before Serve starts, and read-only afterwards; nil is
+	// the default and keeps every report a no-op. It is never consulted for a
+	// decision — nothing about route selection, health, or a response depends on
+	// it — so a recorder that is slow, wedged, or nil cannot change what the
+	// proxy does.
+	recorder Recorder
 
 	cmu   sync.Mutex
 	conns map[net.Conn]struct{}
@@ -383,8 +391,12 @@ func (s *Server) CloseConns() int {
 // AdminMux serves the health and status endpoints for one proxy listener, for
 // tests and for any single-listener embedding. A process serves one AdminMux
 // for all of its views; the process owns the lifecycle that mux reports.
+//
+// The single-listener view reports no analytics block: it is used by tests and
+// by embedders that never configure a store, and passing this server's own
+// recorder through would be a second place a caller has to remember to wire.
 func (s *Server) AdminMux() *http.ServeMux {
-	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s}, nil, nil, nil, NewLifecycle())
+	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s}, nil, nil, nil, nil, NewLifecycle())
 }
 
 // AdminMux serves aggregate health/status for all proxy listener views sharing
@@ -399,8 +411,10 @@ func (s *Server) AdminMux() *http.ServeMux {
 // non-nil, reports the warm-pool view (bounds, gauges, lifecycle counters); it
 // is omitted entirely when no warm pool backs the process. lc is the process
 // lifecycle /readyz reports; a nil lc is answered as ready, which is correct
-// for a single-listener embedding that owns no drain sequence.
-func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64, ipRevisits func() uint64, warm func() warmpool.Status, lc *Lifecycle) *http.ServeMux {
+// for a single-listener embedding that owns no drain sequence. analytics, when
+// non-nil, reports the durable-analytics writer's accounting; it is omitted
+// entirely when no analytics store is configured, exactly as warm is.
+func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64, ipRevisits func() uint64, warm func() warmpool.Status, analytics func() analyticsstore.AnalyticsStatus, lc *Lifecycle) *http.ServeMux {
 	mux := http.NewServeMux()
 	// Liveness, unconditionally. It never reports the drain: see lifecycle.go
 	// for why a liveness probe that fails while a process is stopping
@@ -450,6 +464,13 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 		}
 		if warm != nil {
 			status["warmPool"] = warm()
+		}
+		if analytics != nil {
+			// Reported whenever the process holds a recorder, and it says
+			// whether that recorder is enabled — so an operator can tell "this
+			// gateway records no analytics" from "this gateway's analytics is
+			// merely quiet", which a silent history table cannot distinguish.
+			status["analytics"] = analytics()
 		}
 		_ = json.NewEncoder(w).Encode(status)
 	})

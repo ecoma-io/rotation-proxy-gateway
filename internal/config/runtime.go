@@ -202,6 +202,15 @@ type BootstrapConfig struct {
 	// /status. An empty value keeps the file-seeded mode: the process reads its
 	// runtime YAML and serves it, with no durable store and no reconciler.
 	ConfigStoreDSN string
+	// AnalyticsDSN points at the durable analytics store. Like ConfigStoreDSN it
+	// is bootstrap-only, restart-only, and a secret that is never logged, never
+	// formatted into an error, and never reported by /status.
+	//
+	// An empty value disables analytics completely: no pool, no migrations, no
+	// writer goroutine, and every record call is a no-op. That is the default,
+	// and it is what keeps a deployment that has no analytics database running
+	// exactly as it did before the store existed.
+	AnalyticsDSN string
 	// ReconcileInterval overrides the control-plane reconcile period. Zero
 	// takes the package default. It exists as bootstrap rather than runtime
 	// configuration because it describes this instance's connection to the
@@ -369,6 +378,9 @@ func LoadBootstrap() (*BootstrapConfig, error) {
 	// defaults" reading, and trimming would silently discard a DSN whose
 	// password legitimately ends in whitespace.
 	envStr("RPGW_CONFIG_STORE_DSN", &cfg.ConfigStoreDSN)
+	// Same rule as the config-store DSN, and for the same reason. Unset is the
+	// normal case: analytics is off unless an operator names a database.
+	envStr("RPGW_ANALYTICS_DSN", &cfg.AnalyticsDSN)
 	// Parsed inline for the same reason as the shutdown grace: a malformed value
 	// must fail startup rather than fall back to a default the operator did not
 	// ask for.

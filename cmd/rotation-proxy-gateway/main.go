@@ -16,9 +16,11 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
+	"rotation-proxy-gateway/internal/analyticsstore"
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/configstore"
 	"rotation-proxy-gateway/internal/control"
@@ -268,6 +270,77 @@ func openControlPlane(ctx context.Context, bootstrap *config.BootstrapConfig) (*
 	return &controlPlane{store: repo, generations: generations, reconciler: reconciler}, materialized.Config, revision, nil
 }
 
+// openAnalytics opens the durable analytics store and migrates its schema.
+//
+// It is deliberately a separate function from openControlPlane rather than a
+// stage inside it, because the two are independent: an instance can serve a
+// durable configuration revision and record no analytics at all, or record
+// analytics while still serving a file-seeded configuration. Folding one into
+// the other would make each one's DSN gate the other's.
+//
+// Without RPGW_ANALYTICS_DSN this returns a nil recorder, no pool, no
+// migrations, and no goroutine — every record call on a nil recorder is a no-op,
+// and the whole serving path pays one nil check. That is the default, and it is
+// what keeps the e2e suite, which drives the real binary with no database,
+// measuring exactly what it measured before this package existed.
+//
+// Unlike the configuration store, an analytics failure is NOT fatal, and the
+// asymmetry is deliberate rather than an inconsistency. The configuration store
+// is load-bearing: without it the process cannot know which revision the cluster
+// agreed on, and serving a divergent local file is a split brain. The analytics
+// store is write-only and carries no state anything reads back: nothing about
+// route health, rotation, or eligibility depends on a history row existing.
+// Making a reporting database a hard boot dependency would turn an observability
+// outage into a traffic outage, so an unreachable or mismatched analytics
+// schema disables analytics and logs loudly, and the gateway serves on.
+func openAnalytics(ctx context.Context, bootstrap *config.BootstrapConfig, log zerolog.Logger) *analyticsstore.Recorder {
+	if bootstrap.AnalyticsDSN == "" {
+		return nil
+	}
+	recorder, release, err := analyticsstore.NewRecorder(ctx, bootstrap.AnalyticsDSN, analyticsstore.Instance(), log, analyticsstore.WriterOptions{
+		ShutdownGrace: bootstrap.ShutdownGrace,
+	})
+	if err != nil {
+		// pgx's error names a host and a database, never a password; the DSN
+		// itself is never formatted into this line.
+		log.Warn().Str("error", sanitize.ErrorString(err)).
+			Msg("durable analytics disabled; serving without it")
+		return nil
+	}
+	// One log line, and it says how many samples the process may drop before it
+	// loses them — an operator who cannot see the drop count will believe a
+	// quiet history table means a quiet gateway.
+	log.Info().Int("buffer_size", analyticsstore.DefaultBufferSize).
+		Str("bucket_width", analyticsstore.DefaultBucketWidth.String()).
+		Msg("durable analytics enabled")
+	// release is deliberately not deferred here: it stops the writer with a
+	// bounded final flush and closes the pool, which belongs to shutdownAll, in
+	// the drain order that function already documents.
+	analyticsReleases = append(analyticsReleases, analyticsReleaseOnce(release))
+	return recorder
+}
+
+// analyticsReleases collects the teardown functions openAnalytics produced, in
+// the order they were opened. It is a package-level slice rather than a return
+// value because the drain order belongs to shutdownAll, which is called from two
+// places in run(); threading a slice of teardowns through both call sites to
+// preserve one ordering is more state, not less. Writes happen only during
+// startup, before the goroutine shutdownAll runs on is reachable, and the two
+// reads happen after; run() is entered once per process.
+var analyticsReleases []func()
+
+// analyticsReleaseOnce makes a teardown function safe to call from both of
+// shutdownAll's callers. run() returns through shutdownAll on the signal and
+// listener-error paths, and returns directly on a startup failure — but a
+// startup failure that happens after openAnalytics has already released
+// (there is none today, and this is not a claim that there could not be) would
+// double-flush, and a sync.Once makes that shape safe rather than merely
+// currently unreachable.
+func analyticsReleaseOnce(release func()) func() {
+	var once sync.Once
+	return func() { once.Do(release) }
+}
+
 func run() error {
 	// or healthy. The bootstrap env and config may be invalid, or a listener
 	// bind may fail — in every such startup failure the notify channel stays
@@ -314,12 +387,33 @@ func run() error {
 	runtimeCfg := initialCfg
 	log := setupDynamicLogger(runtimeCfg.LogLevel)
 	warnUnavailableKindListeners(log, runtimeCfg, bootstrap)
+	// Durable analytics is opened after the logger exists and before anything
+	// can produce a sample, so nothing is dropped for want of a recorder. It
+	// returns nil when unconfigured or unreachable; every call site below treats
+	// nil as the disabled state.
+	analytics := openAnalytics(storeCtx, bootstrap, log)
+	// /status reads it as a closure over the same recorder, so the figures come
+	// from the writer that is actually running rather than a second snapshot
+	// taken at wiring time. Nil-safe by construction, and the closure is omitted
+	// from the mux entirely when analytics is off.
+	var analyticsStatus func() analyticsstore.AnalyticsStatus
+	if analytics != nil {
+		analyticsStatus = analytics.Status
+	}
 	// The store publishes one immutable generation (validated config + pool
 	// snapshot). Handlers load it once per operation; a new revision builds the
 	// next pool snapshot and swaps the whole generation atomically. The pool
 	// serves both origins; manual routes additionally carry rotation state.
 	poolStore := selectServingStore(controlPlane, runtimeCfg, served)
 	engine := rotation.New(poolStore, log)
+	// The rotation engine reports its terminal attempts and the egress addresses
+	// they verified through a two-method interface, and the analytics recorder is
+	// the implementation. The engine does not learn that a database exists; with
+	// analytics off, the adapter discards everything and the engine behaves
+	// exactly as it did before.
+	if analytics != nil {
+		engine.UseHistory(analyticsstore.NewRotationHistory(analytics))
+	}
 	// The warm pool keeps half-established upstream connections ready for the
 	// serving path to borrow (one non-blocking pop per attempt, cold dial on
 	// any miss) while never writing route health itself: cooldown, auth, and
@@ -338,6 +432,12 @@ func run() error {
 		srv.UseWarmPool(warm)
 		if bootstrap.Account != nil {
 			srv.UseInboundAccount(bootstrap.Account.Username, bootstrap.Account.Password)
+		}
+		// Attached before the listener binds, so no session can ever observe a
+		// half-configured recorder. The interface is satisfied by the analytics
+		// store and by nothing else, so nothing here can learn what a database is.
+		if analytics != nil {
+			srv.UseRecorder(analytics)
 		}
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
@@ -369,7 +469,7 @@ func run() error {
 	// so the handler closure and shutdownAll share one machine.
 	lc := proxyserver.NewLifecycle()
 	adminSrv := &http.Server{
-		Handler:           proxyserver.AdminMux(version, started, poolStore, listenerViews, engine.Rotations, engine.IPRevisits, warm.Snapshot, lc),
+		Handler:           proxyserver.AdminMux(version, started, poolStore, listenerViews, engine.Rotations, engine.IPRevisits, warm.Snapshot, analyticsStatus, lc),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
@@ -664,6 +764,19 @@ func shutdownAll(log zerolog.Logger, lc *proxyserver.Lifecycle, engineCancel con
 	// the sessions they exist to accelerate.
 	warmStop(ctx)
 	log.Debug().Msg("warm pool stopped")
+	// The analytics writer stops next, for the same reason: its final flush must
+	// happen while the process that produced the samples is still inside its
+	// grace budget, and it must happen after the rotation engine so a rotation
+	// unwinding right now still has somewhere to put its terminal attempt. Its
+	// own grace is a bound inside this budget, so a database that stopped
+	// answering costs the writer its flush and nothing else — the listeners
+	// still drain underneath it, because Stop returns on its own deadline rather
+	// than waiting for the shared one. It is idempotent, so a startup failure
+	// that unwinds through run() twice cannot double-flush.
+	for _, release := range analyticsReleases {
+		release()
+	}
+	log.Debug().Msg("analytics writer stopped")
 	start := time.Now()
 
 	// Step 3a: close every listen socket before draining any of them. Each

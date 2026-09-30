@@ -312,7 +312,10 @@ func TestRecordTunnelCloseBothDirectionsFailed(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var logs safeLogBuffer
-			recordTunnelClose(captureLogger(&logs), "example.test:80", nil, time.Now(), tc.first, tc.second)
+			// The Server argument is a zero Server: it carries no recorder, so
+			// this exercises the log-record behavior exactly as before, and
+			// familyMixed because the close record is not family-specific.
+			recordTunnelClose(&Server{}, captureLogger(&logs), "example.test:80", nil, time.Now(), tc.first, tc.second, familyMixed)
 			rec, ok := findRecord(logs.String(), map[string]string{"msg": tc.wantMsg, "close_reason": tc.wantReason})
 			if !ok {
 				t.Fatalf("records missing %s/%s:\n%s", tc.wantMsg, tc.wantReason, logs.String())

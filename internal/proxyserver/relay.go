@@ -104,7 +104,7 @@ func tcpConnOf(c net.Conn) *net.TCPConn {
 // protection, and close-record behavior of the former inbound tunnel path. It
 // is invoked only after CONNECT's HTTP 200 is written and all client deadlines
 // are cleared; no relay result is a route-health input.
-func (s *Server) relayTunnel(clientConn, upstream net.Conn, chosen *pool.Proxy, start time.Time, logTarget string, log zerolog.Logger) {
+func (s *Server) relayTunnel(clientConn, upstream net.Conn, chosen *pool.Proxy, start time.Time, logTarget string, log zerolog.Logger, family proxyFamily) {
 	defer upstream.Close() //nolint:errcheck // every relay exit owns the selected tunnel
 	closes := make(chan relayResult, 2)
 	relayDone := make(chan struct{})
@@ -132,7 +132,7 @@ func (s *Server) relayTunnel(clientConn, upstream net.Conn, chosen *pool.Proxy, 
 			<-relayDone
 		}
 		second := <-closes
-		recordTunnelClose(log, logTarget, chosen, start, relayResult{direction: relayToUpstream, bytes: n}, second)
+		recordTunnelClose(s, log, logTarget, chosen, start, relayResult{direction: relayToUpstream, bytes: n}, second, family)
 		return
 	}
 	closes <- relayResult{direction: relayToUpstream, bytes: n, err: err}
@@ -141,7 +141,7 @@ func (s *Server) relayTunnel(clientConn, upstream net.Conn, chosen *pool.Proxy, 
 	first := <-closes
 	second := <-closes
 	<-relayDone
-	recordTunnelClose(log, logTarget, chosen, start, first, second)
+	recordTunnelClose(s, log, logTarget, chosen, start, first, second, family)
 }
 
 type relayResult struct {
@@ -159,7 +159,12 @@ const (
 // bytes, route userinfo, or other unbounded input. A broken upstream read is
 // visible at warn because a client received a truncated tunnel; every result is
 // still strictly observational and must never modify selected-route health.
-func recordTunnelClose(log zerolog.Logger, target string, p *pool.Proxy, start time.Time, first, second relayResult) {
+//
+// It also hands the finished tunnel's byte counts to durable analytics, here,
+// at the one point both directions' counts exist. The sample records a request
+// that was served and a payload volume — never the payload itself — and is
+// written after the client's last byte, so the request path never waits for it.
+func recordTunnelClose(s *Server, log zerolog.Logger, target string, p *pool.Proxy, start time.Time, first, second relayResult, family proxyFamily) {
 	toClient, toUpstream := second, first
 	if first.direction == relayToClient {
 		toClient, toUpstream = first, second
@@ -188,4 +193,5 @@ func recordTunnelClose(log zerolog.Logger, target string, p *pool.Proxy, start t
 		ev = ev.Str("error", logErrorValue(cause))
 	}
 	ev.Msg(msg)
+	s.observeRequest(p, s.listener, familyLabel(family), target, true, toClient.bytes, toUpstream.bytes, time.Now())
 }

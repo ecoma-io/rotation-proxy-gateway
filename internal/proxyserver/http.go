@@ -74,6 +74,14 @@ type httpResponseWriter struct {
 	header      http.Header
 	close       bool
 	wroteHeader bool
+	// body counts the response body bytes this writer handed to the client. It is
+	// an observable counter and nothing more: no control-flow decision reads it,
+	// and only bytes that actually went to the socket are counted.
+	body int64
+	// failed records that the gateway — not the target — terminated the
+	// response. It is set only by forwardHTTP's ErrorHandler, and read only
+	// after ServeHTTP has returned, so it needs no synchronization.
+	failed bool
 }
 
 func newHTTPResponseWriter(conn io.Writer) *httpResponseWriter {
@@ -106,7 +114,9 @@ func (w *httpResponseWriter) Write(p []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	return w.conn.Write(p)
+	n, err := w.conn.Write(p)
+	w.body += int64(n)
+	return n, err
 }
 
 func (*httpResponseWriter) Flush() {}
@@ -624,14 +634,14 @@ func (s *Server) serveConn(conn net.Conn) {
 		client := bufferedClientConn(conn, reader)
 		s.serveTunnel(client, target, scope, deadline, &connectReplier{conn: client, failureStatus: http.StatusBadGateway},
 			func(upstream net.Conn, chosen *pool.Proxy, start time.Time, logTarget string) {
-				s.relayTunnel(client, upstream, chosen, start, logTarget, scope.log)
+				s.relayTunnel(client, upstream, chosen, start, logTarget, scope.log, family)
 			})
 		return
 	}
 
 	s.serveTunnel(conn, target, scope, deadline, &forwardReplier{conn: conn, failureStatus: http.StatusBadGateway},
 		func(upstream net.Conn, chosen *pool.Proxy, start time.Time, logTarget string) {
-			s.forwardHTTP(conn, req, upstream, scope.log, logTarget, chosen, start)
+			s.forwardHTTP(conn, req, upstream, scope.log, logTarget, chosen, start, family)
 		})
 }
 
@@ -695,6 +705,11 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, scope
 			log.Warn().Str("target", logTarget).Int("attempts", attempts).
 				Str("error_kind", errorKindSetup).Str("duration", logDuration(time.Since(start))).
 				Msg("inbound handshake deadline expired before the next attempt")
+			// Recorded at the same instant as the log line and the client
+			// response, with the same error kind, so the analytics row and the
+			// log always describe one event. chosen is nil here: the deadline
+			// expired between attempts, so this request never had a route.
+			s.observeFailure(chosen, s.listener, familyLabel(scope.family), errorKindSetup, logTarget, time.Now())
 			return
 		}
 		if attempt >= settings.maxRetries {
@@ -765,6 +780,11 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, scope
 				Int("attempt", attempts).Str("error_kind", logErrorKind(dialErr)).Str("error", logErrorValue(dialErr)).
 				Str("duration", logDuration(time.Since(start))).
 				Msg("upstream setup failed")
+			// The one failure with a route to attribute it to: this attempt did
+			// pick p before the local construction failed, so the row carries it
+			// and an operator can see which route produces gateway-side setup
+			// errors rather than only that some route does.
+			s.observeFailure(p, s.listener, familyLabel(scope.family), logErrorKind(dialErr), logTarget, time.Now())
 			p.Release()
 			return
 		}
@@ -787,6 +807,12 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, scope
 			ev = ev.Int("routing_candidates", len(candidates))
 		}
 		ev.Msg("tunnel failed")
+		// chosen is nil on this path by construction — nothing was ever
+		// selected — so the row carries no route. That is the honest shape: an
+		// empty route key in failure_events means "the pool had nothing to
+		// offer", which is exactly what an operator reading it needs to know and
+		// something a per-route counter could not say.
+		s.observeFailure(nil, s.listener, familyLabel(scope.family), kind, logTarget, time.Now())
 		return
 	}
 	defer chosen.Release()
@@ -807,7 +833,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, scope
 // absolute request target; Transport's one-use DialContext hands that already
 // established tunnel to net/http, and DisableKeepAlives binds this request's
 // transport lifetime to the pool hold and tunnel close record.
-func (s *Server) forwardHTTP(client net.Conn, req *http.Request, upstream net.Conn, log zerolog.Logger, logTarget string, chosen *pool.Proxy, start time.Time) {
+func (s *Server) forwardHTTP(client net.Conn, req *http.Request, upstream net.Conn, log zerolog.Logger, logTarget string, chosen *pool.Proxy, start time.Time, family proxyFamily) {
 	transport := &http.Transport{
 		DisableKeepAlives: true,
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
@@ -845,10 +871,29 @@ func (s *Server) forwardHTTP(client net.Conn, req *http.Request, upstream net.Co
 			// because transport errors can quote client-controlled request material.
 			log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(chosen)).
 				Str("error_kind", errorKindSetup).Msg("HTTP forward failed after tunnel establishment")
+			// Stamped here so the terminal sample forwardHTTP writes after
+			// ServeHTTP returns knows the client got this gateway's error page
+			// rather than the origin's response.
+			writer.failed = true
 		},
 	}
 	proxy.ServeHTTP(writer, req)
 	if upstream != nil {
 		_ = upstream.Close()
+	}
+	// One terminal sample for the forwarded request, recorded here because this
+	// is the only point its outcome is known: the response is on the wire and
+	// the body has been counted. ok is whether the client got the origin's
+	// response rather than this gateway's error page — a status code is not read
+	// as a failure here, because a 4xx or 5xx from the target is a successfully
+	// proxied request and counting it as one would make the analytics failure
+	// rate mean something different from /status's.
+	s.observeRequest(chosen, s.listener, familyLabel(family), logTarget, !writer.failed, writer.body, 0, time.Now())
+	if writer.failed {
+		// The forward failed after the tunnel existed, so it is a post-tunnel
+		// error: the route's health was already reported successful and nothing
+		// is retried. It is still an operator-visible failure of this gateway,
+		// so it gets its own bucketed row with the same error kind the log used.
+		s.observeFailure(chosen, s.listener, familyLabel(family), errorKindSetup, logTarget, time.Now())
 	}
 }
