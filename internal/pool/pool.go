@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"errors"
 	"math"
 	"net"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/routing"
 	"rotation-proxy-gateway/internal/sanitize"
+	"rotation-proxy-gateway/internal/socksdial"
 )
 
 // RotationState is the manual-route rotation lifecycle phase shown by /status.
@@ -739,8 +741,29 @@ func (pl *Pool) ReportFailure(p *Proxy, err error) time.Duration {
 		p.lastDialError = sanitize.ErrorString(err)
 	}
 	cd := SaturatingCooldown(base, max, p.consecutiveFailures)
+	if restated := restatedCooldown(err); restated > cd {
+		cd = restated
+	}
 	p.cooldownUntil.Store(relNanos(now.Add(cd)))
 	return cd
+}
+
+// restatedCooldown returns the cooldown an error explicitly asked for, or zero
+// when it asked for nothing. A caller that already knows the outcome — a test
+// seam standing in for a route that is down for the rest of the scenario, or
+// any future dialer with that knowledge — states it on the error instead of the
+// pool having to guess. The curve is still the floor: a restated value can hold
+// a route out longer, never cut the escalation a repeated failure earned.
+func restatedCooldown(err error) time.Duration {
+	var dialErr *socksdial.ProxyDialError
+	if errors.As(err, &dialErr) && dialErr.RetryAfter > 0 {
+		return dialErr.RetryAfter
+	}
+	var handshakeErr *socksdial.SocksHandshakeError
+	if errors.As(err, &handshakeErr) && handshakeErr.RetryAfter > 0 {
+		return handshakeErr.RetryAfter
+	}
+	return 0
 }
 
 // ReportTargetFailure records that a connected endpoint answered CONNECT for
@@ -778,6 +801,9 @@ func (pl *Pool) ReportTargetFailure(p *Proxy, target string, err error) time.Dur
 	}
 	e.consecutive++
 	cd := SaturatingCooldown(base, max, e.consecutive)
+	if restated := restatedCooldown(err); restated > cd {
+		cd = restated
+	}
 	e.deadline.Store(relNanos(now.Add(cd)))
 	return cd
 }

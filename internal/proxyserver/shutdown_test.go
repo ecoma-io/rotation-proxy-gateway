@@ -203,9 +203,9 @@ func TestServeTunnelStopsRetryingAfterHandshakeDeadline(t *testing.T) {
 		s.serveTunnel(
 			server,
 			socksdial.Target{Host: "example.test", Port: 80, Type: socksdial.AddrDomain},
+			requestScope{family: familyMixed, log: captureLogger(&logs)},
 			time.Now().Add(-time.Second),
 			&connectReplier{conn: server, failureStatus: http.StatusBadGateway},
-			captureLogger(&logs),
 			func(net.Conn, *pool.Proxy, time.Time, string) {},
 		)
 	}()

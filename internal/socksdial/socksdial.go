@@ -35,10 +35,27 @@ var handshakeBufPool = sync.Pool{
 
 // ProxyDialError means DNS resolution or TCP dialing of the configured SOCKS
 // endpoint failed. It is the only error category that changes dial health.
-type ProxyDialError struct{ Err error }
+type ProxyDialError struct {
+	Err error
+	// RetryAfter optionally restates how long the route should cool. A zero
+	// value means "whatever the pool's backoff curve says", which is the normal
+	// path — a test seam that must hold a route in cooldown for a whole
+	// scenario sets it so the route cannot recover underneath the assertions.
+	RetryAfter time.Duration
+}
 
 func (e *ProxyDialError) Error() string { return fmt.Sprintf("dial SOCKS endpoint: %v", e.Err) }
 func (e *ProxyDialError) Unwrap() error { return e.Err }
+
+// WithRetryAfter returns e with its cooldown restated, so a caller that already
+// knows how long this route will be unusable — a test seam standing in for an
+// endpoint that is down for the rest of a scenario — states that on the error
+// rather than leaving the pool's backoff curve to guess it. A zero value leaves
+// the curve in charge.
+func (e *ProxyDialError) WithRetryAfter(after time.Duration) *ProxyDialError {
+	e.RetryAfter = after
+	return e
+}
 
 // ProxyAuthError means a connected SOCKS endpoint could not authenticate this
 // route. It is distinct from endpoint reachability.
@@ -75,6 +92,9 @@ func (e *SocksProtocolError) Unwrap() error { return e.Err }
 type SocksHandshakeError struct {
 	Op  string
 	Err error
+	// RetryAfter optionally restates how long the route should cool; zero means
+	// the pool's own backoff curve. See ProxyDialError.RetryAfter.
+	RetryAfter time.Duration
 }
 
 func (e *SocksHandshakeError) Error() string {
@@ -84,6 +104,13 @@ func (e *SocksHandshakeError) Error() string {
 	return fmt.Sprintf("SOCKS handshake failed during %s: %v", e.Op, e.Err)
 }
 func (e *SocksHandshakeError) Unwrap() error { return e.Err }
+
+// WithRetryAfter returns e with its cooldown restated. See
+// ProxyDialError.WithRetryAfter.
+func (e *SocksHandshakeError) WithRetryAfter(after time.Duration) *SocksHandshakeError {
+	e.RetryAfter = after
+	return e
+}
 
 // IsDialError reports whether err is a SOCKS endpoint dial failure.
 func IsDialError(err error) bool {

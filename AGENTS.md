@@ -151,11 +151,12 @@ HTTP/1.1`. An origin-form target on a proxy listener is a request for a
   forwarded unchanged. Malformed request lines get `400` without a tunnel.
   Domain targets are forwarded as names: DNS happens at the outbound route
   (socks5h), never in the gateway. Hop-by-hop headers, `Proxy-Authorization`,
-  and every `x-ecoma-*` control header are removed before forwarding; request
-  bodies stream. A 30s read deadline bounds reading the request — including the
-  whole retry chain of outbound attempts — and is cleared once the tunnel is
-  established; established tunnels have no timeouts. One `CONNECT` tunnel is
-  one client connection's payload; keep-alive/reuse is the client's choice.
+  and every `x-ecoma-*` control header — named or not — are removed before
+  forwarding; request bodies stream. A 30s read deadline bounds reading the
+  request — including the whole retry chain of outbound attempts — and is
+  cleared once the tunnel is established; established tunnels have no timeouts.
+  One `CONNECT` tunnel is one client connection's payload; keep-alive/reuse is
+  the client's choice.
   Without `RPGW_ACCOUNT`, no `Proxy-Authorization` is required and one that
   arrives anyway is consumed and stripped. With `RPGW_ACCOUNT=username:password`
   set, every request on every proxy listener must carry
@@ -167,9 +168,32 @@ HTTP/1.1`. An origin-form target on a proxy listener is a request for a
   before forwarding. The env var name and its `user:pass` value format are
   unchanged from the SOCKS5 era; only the wire form changed. Userinfo and the
   inbound account must never appear in logs, `/status`, errors, or responses.
+- Two gateway-private `x-ecoma-*` control headers are read on ingress, stripped
+  before forwarding, and absent from route identity. `x-ecoma-proxy-family`
+  takes `v4`, `v6`, or `mixed` (absent = `mixed`): a request-scoped
+  route-selection constraint that narrows eligible routes exactly as a
+  listener's kind filter and the routing block do, composes with both by
+  intersection, and never binds a socket, resolves a name, or changes the
+  outbound SOCKS5 `CONNECT` target. A v4-only route can never serve a `v6`
+  request on any listener — including when every route is cooling, because
+  `PickFor` applies the same composed predicate to the all-cooling fallback.
+  Two requests differing only in this header hit the same `pool.Proxy` objects.
+  A value outside the closed set, an empty value, or a repeated header is
+  refused with `400` before route selection, as a local `setup`/`bad_request`
+  error that never advances `requests` nor touches route health — refusing
+  rather than falling back to `mixed`, because a client that asked for IPv6
+  egress and silently got IPv4 has no way to see it. `x-ecoma-request-id` is a
+  client correlation id: resolved once before selection, bounded to 64 bytes
+  inside `[A-Za-z0-9-_.:]`, replaced by a `r-`-prefixed id from `crypto/rand`
+  when absent, repeated, over-long, or carrying anything else, and preserved
+  across every retry of one chain. Both are specified in
+  [`docs/inbound-http.md`](docs/inbound-http.md).
 - Logs contain process-local `request_id` and `listener`; `target` and
-  `upstream` are host-only. `debug` shows flow, `info` terminal successes, and
-  `warn` fallback/terminal failures. Established tunnels log a close record
+  `upstream` are host-only. `request_id` stays the process-local ordinal,
+  because it is what the per-listener `/status` `requests` figure reports;
+  a client's `x-ecoma-request-id` travels beside it as `correlation_id`, and
+  the two are never conflated. `debug` shows flow, `info` terminal successes,
+  and `warn` fallback/terminal failures. Established tunnels log a close record
   (lifetime, per-direction byte counts, which side ended first) at `debug`; a
   tunnel broken by an upstream error logs at `warn` and resets the client
   connection.
@@ -240,7 +264,7 @@ binary `healthcheck` subcommand (no shell in the scratch image).
 - `internal/config` — bootstrap environment, Viper YAML validation, route parsing (auto + manual), rotation settings, routing-block compilation, content-hash change poller
 - `internal/pool` — LRU filtering, cooldown/auth state, in-flight work, rotation state, immutable generation snapshots (config + pool + routing policy as one unit)
 - `internal/routing` — the compiled domain-routing policy: it resolves one inbound target to its candidate route set and never selects, never reads or writes health
-- `internal/proxyserver` — inbound HTTP forward proxy: request parsing, `Proxy-Authorization`, the `x-ecoma-*` control headers, the protocol-agnostic route-selection and relay engine they feed, plus the admin mux
+- `internal/proxyserver` — inbound HTTP forward proxy: request parsing, `Proxy-Authorization`, the `x-ecoma-*` control headers (`x-ecoma-proxy-family` route constraint, `x-ecoma-request-id` correlation id), the protocol-agnostic route-selection and relay engine they feed, plus the admin mux
 - `internal/socksdial` — the shared SOCKS5 dialer used by the proxy server and the rotation probes; `DialHalf` parks a half-handshake (TCP + greeting + auth) the warm pool completes later with `CompleteConnect`
 - `internal/warmpool` — background pool of half-established upstream connections, bounded per route and process-wide, epoch-invalidated by rotation, borrowed on the serving path
 - `internal/rotation` — manual-route rotation engine: scheduling under the concurrency cap, drain, probes, rotate calls, verification, backoff

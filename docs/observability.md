@@ -140,19 +140,37 @@ Logs are structured JSON lines on stdout (`zerolog`: fields such as `level`,
 driver; set `log-level` in the runtime YAML to raise verbosity without a
 restart.
 
-Each request has a process-local `request_id`. Log lines additionally include
+Each request has a process-local `request_id` — the ordinal, not a client value,
+because it is what the per-listener `requests` figure in `/status` counts. A
+client may supply its own correlation id with
+[`x-ecoma-request-id`](inbound-http.md#x-ecoma-request-id); it is resolved once
+before route selection, bounded and validated, and appears on every record of
+that request's attempt chain as `correlation_id`. An id the gateway did not
+accept is replaced by a generated one marked with a leading `r-`, so a
+client-vouched id and a minted one are distinguishable by the prefix rather
+than by inspection. `request_id` and `correlation_id` travel together on every
+record of a request, so a client id can always be joined to the gateway's own
+ordinal.
+
+Log lines additionally include
 `listener=mixed|v4|v6`, host-only `target` and `upstream`, retry attempt
 counts, the error kind (`proxy_connect`, `auth_route`, `socks_connect`,
-`connect_target`, `setup`, `no_route`, `retry_exhausted`), and the applied
+`connect_target`, `setup`, `no_route`, `retry_exhausted`, plus the ingress-local
+`bad_request` and `auth_rejected`), and the applied
 cooldown for endpoint
 dial, SOCKS handshake, and refused connect-target failures. With a
 [routing block](configuration.md#request-routing-routing-block) configured,
 `route selected` (debug) carries the picked route's `route_id`, and the
 terminal `tunnel failed` (warn) carries `routing_candidates` — the size of the
 candidate set the policy left open for that target (absent when no routing
-block is configured; `0` is the fail-closed unmatched target). They never log
-full URLs, headers, bodies, userinfo, the inbound account, or the rotate-API
-configuration.
+block is configured; `0` is the fail-closed unmatched target). The same terminal
+record carries `kind_routes`, the size of the candidate set after the listener's
+kind filter and any
+[`x-ecoma-proxy-family`](inbound-http.md#x-ecoma-proxy-family) constraint — so
+`0` there with a non-zero `pool_size` is a family or listener filter that left
+no candidate, not an empty pool. They never log
+full URLs, headers, bodies, userinfo, the inbound account, the rotate-API
+configuration, or the value of a refused control header.
 
 Levels: `debug` shows flow (tunnel start, route selection, tunnel close),
 `info` terminal successes, and `warn` fallback/terminal failures. Every

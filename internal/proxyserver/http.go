@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/socksdial"
 
@@ -423,16 +424,133 @@ func requireProxyAuthorization(conn io.Writer) {
 	response.WriteHeader(http.StatusProxyAuthRequired)
 }
 
+// The gateway-private control headers. Both are read on ingress, stripped
+// before forwarding, and absent from route identity: nothing in the x-ecoma-
+// prefix reaches an upstream, whatever it happens to carry.
+const (
+	headerProxyFamily = "X-Ecoma-Proxy-Family"
+	headerRequestID   = "X-Ecoma-Request-Id"
+)
+
 // stripEcomaControlHeaders removes an entire case-insensitive header namespace
 // from the outbound HTTP request. ReverseProxy already removes the RFC 7230
 // hop-by-hop set itself (including values named by Connection), so duplicating
 // that drift-prone list here would weaken rather than harden the forwarder.
+//
+// The key is canonicalized before the delete. http.Header.Del canonicalizes its
+// argument, so it misses a lower-case key held directly in the map — which
+// would hand the client's control material to the origin. Only x-ecoma-*
+// keys are rewritten; a differently-cased header of any other prefix keeps the
+// key the caller chose.
 func stripEcomaControlHeaders(header http.Header) {
 	for name := range header {
-		if strings.HasPrefix(strings.ToLower(name), "x-ecoma-") {
-			header.Del(name)
+		if !strings.HasPrefix(strings.ToLower(name), "x-ecoma-") {
+			continue
 		}
+		if canonical := http.CanonicalHeaderKey(name); canonical != name {
+			header[canonical] = header[name]
+			delete(header, name)
+		}
+		header.Del(name)
 	}
+}
+
+// proxyFamily is the request-scoped egress-family constraint carried by
+// x-ecoma-proxy-family. It narrows the eligible route set for one request
+// exactly the way a listener's own kind filter and the routing policy do — a
+// route of another kind is simply not eligible — and composes with both by
+// intersection. It is not a socket binding: it never resolves a name, never
+// changes the target that leaves in the outbound SOCKS5 CONNECT, and never
+// enters route identity, so two requests for one target that differ only in
+// this header hit the same pool.Proxy objects.
+type proxyFamily int
+
+const (
+	// familyMixed is both an absent header and the literal "mixed" — the same
+	// request, and the only value that constrains nothing.
+	familyMixed proxyFamily = iota
+	familyV4
+	familyV6
+)
+
+// allows reports whether a route of this family may serve the request.
+// familyMixed imposes no constraint at all, which is what keeps the
+// absent-header path identical to a listener with no kind filter.
+func (f proxyFamily) allows(p *pool.Proxy) bool {
+	switch f {
+	case familyV4:
+		return p.Kind == config.EgressV4
+	case familyV6:
+		return p.Kind == config.EgressV6
+	default:
+		return true
+	}
+}
+
+// narrow intersects the family constraint with an already-composed predicate
+// and returns that predicate untouched for a mixed request. Handing back
+// `allow` as it was — nil included — is what preserves the no-routing fast
+// path, where a nil predicate still means "no filter at all".
+func (f proxyFamily) narrow(allow func(*pool.Proxy) bool) func(*pool.Proxy) bool {
+	if f == familyMixed {
+		return allow
+	}
+	if allow == nil {
+		return f.allows
+	}
+	return func(p *pool.Proxy) bool { return f.allows(p) && allow(p) }
+}
+
+// parseProxyFamily resolves the family constraint and refuses every spelling
+// outside the closed set. Refusing beats a silent fall back to mixed on
+// purpose: the stated egress family is a routing constraint, and quietly
+// serving the request from the other family is an invisible correctness
+// failure on the one property this gateway exists to provide — a client that
+// asked for IPv6 egress has no way to see that it got IPv4. 400 is the same
+// local pre-selection reject a malformed authority already gets, so a refused
+// value never advances the listener `requests` counter and never touches route
+// health. Two cases deserve their own words:
+//
+//   - An empty value is refused. It names no family, and reading it as absent
+//     would make "present but meaningless" indistinguishable from "never
+//     asked" — the silent fall back being refused here.
+//   - A repeated header is refused. The gateway cannot know which of the two
+//     constraints the client meant, and picking one would let an intermediary
+//     choose the egress family.
+//
+// Leading and trailing whitespace is not a spelling at all: net/http trims
+// optional field-value whitespace (RFC 9110 §5.5) before the value reaches
+// here, so " v4 " is the same request as "v4". Interior whitespace, upper case,
+// and every other spelling are outside the set.
+func parseProxyFamily(header http.Header) (proxyFamily, error) {
+	values := header.Values(headerProxyFamily)
+	switch {
+	case len(values) > 1:
+		return familyMixed, errors.New("x-ecoma-proxy-family appears more than once")
+	case len(values) == 0:
+		return familyMixed, nil
+	}
+	switch values[0] {
+	case "mixed":
+		return familyMixed, nil
+	case "v4":
+		return familyV4, nil
+	case "v6":
+		return familyV6, nil
+	}
+	return familyMixed, errors.New("x-ecoma-proxy-family is not one of mixed, v4, v6")
+}
+
+// requestScope is the per-request state serveTunnel needs that a generation, a
+// listener, or a connection cannot supply. It exists so the request's own
+// narrowing travels as one value rather than as a growing parameter list:
+// family is a request-scoped candidate constraint and has no correct home on
+// the Server, whose allow filter is the same shape for every request on one
+// listener. Only a real ingress request has one; a session that arrived without
+// a family header is familyMixed.
+type requestScope struct {
+	family proxyFamily
+	log    zerolog.Logger
 }
 
 // serveConn parses, authenticates, and validates one HTTP proxy request. Every
@@ -462,6 +580,23 @@ func (s *Server) serveConn(conn net.Conn) {
 		s.log.Warn().Str("error_kind", "auth_rejected").Msg("HTTP proxy authentication rejected")
 		return
 	}
+	// Both control headers are read here, before the namespace is stripped below:
+	// they are the gateway's own, and they have to outlive this frame. A family
+	// outside the closed set is a protocol reject on the same footing as a
+	// malformed authority — answered locally, before route selection, without
+	// advancing the request counter or touching route health.
+	family, err := parseProxyFamily(req.Header)
+	if err != nil {
+		_ = writeHTTPError(conn, http.StatusBadRequest)
+		s.log.Debug().Str("error_kind", "bad_request").Msg("HTTP proxy request rejected")
+		return
+	}
+	// One correlation id per request, resolved once here and carried by every
+	// line of this request's attempt chain however many routes it ends up
+	// trying. It is deliberately not the request_id counter value: that one
+	// must keep counting valid requests that reached selection, whatever a
+	// client asked for, because it is what /status reports.
+	correlationID := resolveRequestID(req.Header)
 	// Authentication has consumed the client credential. Remove it explicitly
 	// before either accepted shape reaches its target: ReverseProxy currently
 	// strips it as a hop-by-hop field too, but this is a credential boundary, not
@@ -478,19 +613,25 @@ func (s *Server) serveConn(conn net.Conn) {
 	}
 
 	requestID := s.requests.Add(1)
-	log := s.log.With().Int64("request_id", int64(requestID)).Logger()
+	scope := requestScope{
+		family: family,
+		log: s.log.With().
+			Int64("request_id", int64(requestID)).
+			Str("correlation_id", correlationID).
+			Logger(),
+	}
 	if isConnect {
 		client := bufferedClientConn(conn, reader)
-		s.serveTunnel(client, target, deadline, &connectReplier{conn: client, failureStatus: http.StatusBadGateway}, log,
+		s.serveTunnel(client, target, scope, deadline, &connectReplier{conn: client, failureStatus: http.StatusBadGateway},
 			func(upstream net.Conn, chosen *pool.Proxy, start time.Time, logTarget string) {
-				s.relayTunnel(client, upstream, chosen, start, logTarget, log)
+				s.relayTunnel(client, upstream, chosen, start, logTarget, scope.log)
 			})
 		return
 	}
 
-	s.serveTunnel(conn, target, deadline, &forwardReplier{conn: conn, failureStatus: http.StatusBadGateway}, log,
+	s.serveTunnel(conn, target, scope, deadline, &forwardReplier{conn: conn, failureStatus: http.StatusBadGateway},
 		func(upstream net.Conn, chosen *pool.Proxy, start time.Time, logTarget string) {
-			s.forwardHTTP(conn, req, upstream, log, logTarget, chosen, start)
+			s.forwardHTTP(conn, req, upstream, scope.log, logTarget, chosen, start)
 		})
 }
 
@@ -512,10 +653,18 @@ func bufferedClientConn(conn net.Conn, reader *bufio.Reader) net.Conn {
 // accepted HTTP shapes. It fixes one generation for the attempt chain, routes
 // only to narrow candidates, excludes every failed route, and holds the winning
 // route until the shape-specific established-tunnel work has completed.
-func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, handshakeDeadline time.Time, reply replier, log zerolog.Logger, serveEstablished func(net.Conn, *pool.Proxy, time.Time, string)) {
+//
+// The candidate predicate is composed, never branched: the routing policy, the
+// listener's egress-kind view, and the request's own family constraint each
+// narrow it, and the effective eligible set is their intersection. The pool
+// stays the sole authority on health and order — a route the composed predicate
+// excludes is simply never offered to it — so this remains one selection path,
+// not a second one. Nothing here resolves a name or inspects tunnel bytes.
+func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, scope requestScope, handshakeDeadline time.Time, reply replier, serveEstablished func(net.Conn, *pool.Proxy, time.Time, string)) {
 	gen := s.generation()
 	settings := generationSettings(gen)
 	start := time.Now()
+	log := scope.log
 	targetAddr := target.Addr()
 	logTarget := targetLogValue(targetAddr)
 	log.Debug().Str("target", logTarget).Msg("tunnel start")
@@ -529,6 +678,11 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 			return ok && (listenerAllow == nil || listenerAllow(p))
 		}
 	}
+	// The family constraint composes with what routing and the listener already
+	// decided, so a v4-only route can never serve a v6 request even on the mixed
+	// listener. For a mixed request this returns the composed predicate
+	// untouched, leaving the no-routing path free of a second filter.
+	allow = scope.family.narrow(allow)
 
 	exclude := map[*pool.Proxy]bool{}
 	var upstream net.Conn
@@ -626,7 +780,7 @@ func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, hands
 		}
 		_ = replyFailure(reply, http.StatusServiceUnavailable)
 		ev := log.Warn().Str("target", logTarget).Int("attempts", attempts).
-			Int("pool_size", gen.Pool.Size()).Int("kind_routes", gen.Pool.CountAllowed(s.allow)).
+			Int("pool_size", gen.Pool.Size()).Int("kind_routes", gen.Pool.CountAllowed(allow)).
 			Int("excluded", len(exclude)).
 			Str("error_kind", kind).Str("duration", logDuration(time.Since(start)))
 		if candidates != nil {

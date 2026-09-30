@@ -21,6 +21,26 @@ Baselines must be captured fresh at the migration commit: the numbers are
 **not comparable** to the SOCKS5-era benchmarks, which measured a different
 path.
 
+## What changed with the control headers
+
+The two `x-ecoma-*` control headers add one header-parsing pass that is already
+inside the request the gateway had to read anyway: reading a header map and
+testing one value is not a measurable step next to an inbound HTTP exchange and
+an outbound SOCKS5 handshake. The absent-header case — every request that does
+not use them — allocates nothing beyond a nil candidate predicate, which is the
+path the benchmarks already exercise.
+
+Minting a correlation id (`x-ecoma-request-id` absent, repeated, or unusable)
+costs one 16-byte `crypto/rand` read per request, which is on the order of a few
+hundred nanoseconds on Linux and is measured inside the same request. It is on
+the data path by necessity — the id has to exist before route selection so the
+whole attempt chain shares it — and it does not add a syscall or a lock beyond
+what the dial that follows already performs.
+
+**No committed baseline is invalidated by this change**, and the HTTP-ingress
+baselines above still stand. The same before/after `benchstat` workflow applies
+if you want to measure the delta rather than assume it.
+
 ## Workflow
 
 Recorded baseline numbers are deliberately **not** stored here: throughput and

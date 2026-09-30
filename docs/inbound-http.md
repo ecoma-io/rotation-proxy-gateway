@@ -101,6 +101,7 @@ server.
 | No eligible route, or retry budget spent with routes left (`no_route`, `retry_exhausted`)                            | `503 Service Unavailable`           |
 | Inbound handshake deadline expired before the next attempt                                                           | `502 Bad Gateway`                   |
 | Malformed request: bad request line, origin-form without proxy role, absent or inconsistent authority, zero port     | `400 Bad Request`                   |
+| `x-ecoma-proxy-family` outside the closed set, empty, or repeated                                                    | `400 Bad Request`                   |
 | Unsupported scheme in an absolute-form target                                                                        | `501 Not Implemented`               |
 | Absolute-form request whose method is not `GET`, `HEAD`, or `POST`                                                   | `405 Method Not Allowed`            |
 | HTTP version other than 1.1                                                                                          | `505 HTTP Version Not Supported`    |
@@ -111,13 +112,117 @@ terminal outcome of its attempt chain. The `error_kind` values the process logs
 are unchanged by this migration and are listed in
 [failure and route health](failure-and-health.md).
 
+## Control headers
+
+Two headers in the gateway-private `x-ecoma-` namespace are read on ingress.
+Both are stripped before forwarding, and neither is part of route identity. The
+namespace as a whole is gateway-private: an `x-ecoma-` header the gateway has
+never heard of is dropped just the same, and no `x-ecoma-` header ever reaches
+an upstream, whatever it carries.
+
+### `x-ecoma-proxy-family`
+
+Constrains which **egress IP family** may carry one request. Values are the
+closed set `v4`, `v6`, and `mixed`; an absent header is exactly `mixed`, and
+the two are the same request.
+
+    CONNECT api.example.com:443 HTTP/1.1
+    Host: api.example.com:443
+    X-Ecoma-Proxy-Family: v6
+
+This is a request-scoped **route-selection constraint, not a socket binding**.
+It narrows the eligible route set the same way a listener's own egress-kind
+filter and the routing block do, and it composes with both **by intersection**:
+the effective eligible set is whatever all three agree on. So on the mixed
+listener, a `v6` request is served by a `kind: v6` route; on the dedicated v4
+listener, a `v6` request has no candidate at all, because the listener's filter
+excludes every route a v6 request could have wanted. A v4-only route can never
+serve a `v6` request, on any listener, under any combination of the two.
+
+What it does **not** do: it does not resolve a name, does not change the target's
+address family, and does not change the address or address type that leaves in
+the outbound SOCKS5 `CONNECT`. A domain target stays a domain target. The
+header chooses the route; the route chooses the connection.
+
+**Route identity is untouched.** The header never enters the canonical route
+key, so two requests for one target that differ only in this header hit the
+same `pool.Proxy` objects and share their health, their cooldown, and their
+cooldown counters. A family-scoped request is not a new route and does not
+fork route state.
+
+**An invalid value is refused with `400 Bad Request`**, before route selection,
+on the same footing as a malformed authority. It is a local pre-selection
+reject: it never advances the listener `requests` counter, never touches route
+health, and is never retried. The cases the grammar draws:
+
+| Header state                                              | Result               |
+| --------------------------------------------------------- | -------------------- |
+| absent, or exactly one occurrence of `mixed`/`v4`/`v6`    | accepted             |
+| a value outside the closed set (`V4`, `ipv4`, `any`, `4`) | `400 Bad Request`    |
+| an empty value (`X-Ecoma-Proxy-Family:`)                  | `400 Bad Request`    |
+| more than one occurrence, even with the same value        | `400 Bad Request`    |
+| interior whitespace (`v 4`), upper case, a quoted value   | `400 Bad Request`    |
+| leading or trailing whitespace (`" v4"`, `"v4 "`)         | accepted — see below |
+
+Leading and trailing whitespace is not a spelling at all: HTTP strips optional
+field-value whitespace (RFC 9110 §5.5) before the value reaches the gateway, so
+`" v4 "` is byte-for-byte the same request as `v4`.
+
+Refusing rather than falling back to `mixed` is a deliberate choice. A client
+that asked for IPv6 egress and silently received IPv4 would have no way to see
+it — an invisible correctness failure on the one property this gateway exists to
+provide. An empty value is refused for the same reason: reading it as absent
+would make "present but meaningless" indistinguishable from "never asked",
+which is precisely the silent fallback being refused. A repeated header is
+refused because the gateway cannot know which of the two constraints was meant,
+and choosing one would let an intermediary pick the client's egress family.
+
+A family constraint that leaves no eligible route is `no_route` — the ordinary
+`503 Service Unavailable`, not a protocol error. An empty candidate set and a
+refused value are different failures with different statuses.
+
+### `x-ecoma-request-id`
+
+An optional client-supplied correlation id. It appears as `correlation_id` on
+the log records of the request it was resolved for, so a client can find its own
+request among the gateway's.
+
+    CONNECT api.example.com:443 HTTP/1.1
+    Host: api.example.com:443
+    X-Ecoma-Request-Id: 01J8Z9RQ4M7N2K3P4T5V6W7X8Y
+
+**One request, one id.** It is resolved once, before route selection, and the
+same value is carried by every record of that request's attempt chain — however
+many routes the chain tried, the failure record and the eventual success record
+share the id.
+
+An id is echoed only when it is **exactly one occurrence**, at most **64 bytes**,
+and every byte inside `[A-Za-z0-9-_.:]`. Anything else — absent, repeated,
+over-long, quoted, whitespace-bearing, or carrying a control character or an
+ANSI sequence — is **replaced by a freshly generated id**, not refused. A
+serviceable request is not failed over a diagnostic header the client loses
+nothing by dropping.
+
+A generated id is marked with a leading `r-` and is otherwise the same shape as
+an accepted one: same alphabet, bounded length, no quoting, one line. An
+operator distinguishes a client-vouched id from a minted one by the prefix,
+never by having to unpick the value.
+
+**`correlation_id` is a companion field, not a replacement.** The
+`request_id` field stays the process-local ordinal, and it must: that counter
+is what the per-listener `requests` figure in `/status` reports, and its
+documented meaning is _valid requests that reached route selection_. Overwriting
+it with a client-controlled string would destroy that metric. The two travel
+together, so an operator can always join a client's id to the gateway's own
+ordinal. See [observability](observability.md).
+
 ## Header handling
 
 - Hop-by-hop headers (RFC 7230 §6.1) are removed before forwarding. This is the
   standard library's behavior, not a second list maintained here.
 - `Proxy-Authorization` is removed, per the authentication section above.
-- Every `x-ecoma-*` header is removed before forwarding. These are internal
-  control headers; none of them, valid or not, may ever reach an upstream.
+- Every `x-ecoma-*` header is removed before forwarding, whatever it carries.
+  These are internal control headers; none of them may ever reach an upstream.
 - Request bodies are streamed, never buffered. There is no body size limit
   configured at the gateway, and none is needed for a forward proxy that
   streams.
