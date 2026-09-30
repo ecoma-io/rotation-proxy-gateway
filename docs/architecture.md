@@ -1,23 +1,25 @@
 # Architecture and behavioral contract
 
-This document records the behavior implemented by release `0.6.0` before the
-breaking HTTP-forward-proxy migration tracked in [#92]. It is an evidence-led
-baseline for preserving safety properties across the migration; the detailed
-protocol and operational contract remains in the linked pages.
+This document records the behavior the gateway implements and the safety
+properties each layer must preserve. The detailed protocol and operational
+contract remains in the linked pages.
 
 ## Scope and intentional replacement
 
-At this baseline the data plane is an inbound SOCKS5 server. One shared route
-pool is exposed as mixed, v4-only, and v6-only listener views. Each valid
-inbound `CONNECT` results in one SOCKS5 upstream `CONNECT`; a domain target is
-carried to the upstream as a domain address, so DNS occurs at the upstream
-route.
+The data plane is an inbound HTTP forward proxy. One shared route pool is
+exposed as mixed, v4-only, and v6-only listener views. Each valid inbound
+`CONNECT` (or absolute-form HTTP request) results in one SOCKS5 upstream
+`CONNECT`; a domain target is carried to the upstream as a domain address, so
+DNS occurs at the upstream route.
 
-The migration intentionally replaces only the inbound protocol and its
-listener/authentication configuration. HTTP forward-proxy ingress will become
-the sole data plane, supporting `CONNECT` and absolute-form HTTP. Outbound
-SOCKS5H remains the transport and target-hostname preservation requirement.
-No compatibility ingress is retained.
+This replaced a SOCKS5 (RFC 1928) inbound with HTTP forward-proxy ingress
+([#92]). The replacement is intentional and complete: the `CONNECT` and
+absolute-form shapes are the only ingress, `Proxy-Authorization` replaces RFC
+1929 negotiation, and no compatibility listener, flag, or fallback port is
+retained. The health classification, retry authority, cooldown scopes, and
+route-health state machine were deliberately left untouched — only the bytes
+on the client-facing side changed. Outbound SOCKS5H remains the transport and
+the target-hostname preservation requirement.
 
 ## Immutable serving generation
 
@@ -94,9 +96,10 @@ remains, or `retry_exhausted` when the configured budget ends while candidates
 remain. A successful established tunnel must never retroactively change health
 because target stream bytes or a mid-stream connection failure fail later.
 
-For HTTP ingress, the old SOCKS reply bytes are superseded by correct HTTP
-proxy response/error behavior; the health classification and retry authority
-are not.
+The client-facing replies are HTTP proxy responses and errors
+([inbound HTTP forward-proxy behavior](inbound-http.md)); the health
+classification and retry authority are the ones above, unchanged by the ingress
+migration.
 
 ## Rotation and egress-IP identity
 

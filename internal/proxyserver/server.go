@@ -313,8 +313,8 @@ func (s *Server) UseWarmPool(w WarmBorrower) {
 	s.warm = w
 }
 
-// UseInboundAccount arms mandatory RFC 1929 username/password authentication
-// for every session on this listener. It must be called before Serve;
+// UseInboundAccount arms mandatory Proxy-Authorization: Basic authentication
+// for every request on this listener. It must be called before Serve;
 // afterwards the field is read-only. The configured pair is reduced to
 // digests immediately, so the caller's slices are not retained.
 func (s *Server) UseInboundAccount(username, password []byte) {

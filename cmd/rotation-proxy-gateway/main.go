@@ -1,6 +1,9 @@
-// Command rotation-proxy-gateway runs a SOCKS5 proxy with v4, v6, and mixed
-// egress listener views plus an always-on admin listener. Every client tunnel
-// is relayed through SOCKS5 routes from a shared health-aware pool.
+// Command rotation-proxy-gateway runs an HTTP forward proxy with v4, v6, and
+// mixed egress listener views plus an always-on admin listener. Every client
+// request is relayed through SOCKS5H routes from a shared health-aware pool:
+// CONNECT opens a byte-transparent tunnel and an absolute-form request is
+// forwarded to its origin in origin form. The gateway resolves no target name
+// itself, so a hostname reaches the outbound route untouched.
 package main
 
 import (
@@ -152,10 +155,10 @@ func warnUnavailableKindListeners(log zerolog.Logger, cfg *config.RuntimeConfig,
 		}
 	}
 	if bootstrap.V4ListenAddr != "" && v4 == 0 {
-		log.Warn().Str("listener", "v4").Msg("listener has no eligible routes; replying a general SOCKS failure")
+		log.Warn().Str("listener", "v4").Msg("listener has no eligible routes; replying 503 Service Unavailable")
 	}
 	if bootstrap.V6ListenAddr != "" && v6 == 0 {
-		log.Warn().Str("listener", "v6").Msg("listener has no eligible routes; replying a general SOCKS failure")
+		log.Warn().Str("listener", "v6").Msg("listener has no eligible routes; replying 503 Service Unavailable")
 	}
 }
 

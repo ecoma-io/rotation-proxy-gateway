@@ -11,9 +11,9 @@ services:
       context: .
     container_name: rpgw
     ports:
-      - "30121:30121" # mixed IPv4/IPv6 egress SOCKS5 listener
-      - "30122:30122" # IPv4-egress SOCKS5 listener
-      - "30123:30123" # IPv6-egress SOCKS5 listener
+      - "30121:30121" # mixed IPv4/IPv6 egress HTTP proxy listener
+      - "30122:30122" # IPv4-egress HTTP proxy listener
+      - "30123:30123" # IPv6-egress HTTP proxy listener
       - "30120:30120" # admin (HTTP): healthz, readyz, status
     environment:
       # Bootstrap-only settings: changes require a container restart.
@@ -22,7 +22,7 @@ services:
       # below stop_grace_period so docker's SIGKILL never cuts it short.
       # RPGW_SHUTDOWN_GRACE: 45s
       # Optional. username:password — when set, every proxy listener requires
-      # SOCKS5 username/password auth (RFC 1929); unset keeps the no-auth
+      # Proxy-Authorization: Basic on every request; unset keeps the no-auth
       # default. Bootstrap-only like everything in this block.
       # RPGW_ACCOUNT=user:pass
     # docker stop sends SIGTERM and waits this long before SIGKILL. Keep it

@@ -22,26 +22,28 @@ classified, how routes are selected, and what each outcome does to health.
   retried like any other handshake-stage failure, but the cooldown it creates
   is scoped to the (route, target) pair — see
   [Cooldown scopes](#cooldown-scopes).
-- **`setup`**: local SOCKS request errors that behave the same on every route
-  (malformed target encoding, oversized configured credentials, invalid
-  target) and every error after the tunnel is established, including target
-  reads, writes, cancellation, and established-tunnel failures.
+- **`setup`**: local inbound request errors that behave the same on every route
+  (malformed request line, origin-form request target on a proxy listener,
+  absent or inconsistent authority, zero port, an unsupported absolute-form
+  scheme, oversized configured credentials) and every error after the tunnel is
+  established, including target reads, writes, cancellation, and
+  established-tunnel failures.
 - **`no_route`**: no eligible untried route remains.
 - **`retry_exhausted`**: the `max-retries` budget was spent while eligible
   untried routes still remained — the pool ran out of retries, not routes.
-  The client still receives `05 01`; the distinct kind only tells the
+  The client still receives `503`; the distinct kind only tells the
   operator which condition ended the chain.
 
-| Outcome                                                                                                                       | Pool handling                                                                 | Request handling                                                                 |
-| ----------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| SOCKS endpoint DNS/TCP dial fails                                                                                             | Record `proxy_connect`, exponential cooldown                                  | Retry a distinct eligible route; `05 01` general-failure reply when none remains |
-| SOCKS endpoint cannot authenticate                                                                                            | Auth-block the route; no dial cooldown                                        | Retry a distinct eligible route; `05 01` general-failure reply when none remains |
-| SOCKS handshake fails before the tunnel is established (no explicit refusal)                                                  | Record `socks_connect`, exponential route cooldown                            | Retry a distinct eligible route; `05 01` general-failure reply when none remains |
-| Upstream refuses the CONNECT request with a non-zero reply                                                                    | Record `connect_target`, exponential cooldown scoped to the route+target pair | Retry a distinct eligible route; `05 01` general-failure reply when none remains |
-| Local SOCKS request error (invalid target encoding, credentials, invalid target) or any error after the tunnel is established | No health mutation and no retry                                               | Close loop; `05 01` general-failure reply for inbound setup errors               |
-| Target reads/writes fail or the target response is malformed                                                                  | No health mutation and no retry                                               | Close tunnel                                                                     |
-| Client cancellation/disconnect                                                                                                | No health mutation and no retry                                               | Close connection                                                                 |
-| Established tunnel breaks                                                                                                     | No health mutation                                                            | Close tunnel                                                                     |
+| Outcome                                                                                                                                       | Pool handling                                                                 | Request handling                                                                                  |
+| --------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| SOCKS endpoint DNS/TCP dial fails                                                                                                             | Record `proxy_connect`, exponential cooldown                                  | Retry a distinct eligible route; `503` when none remains                                          |
+| SOCKS endpoint cannot authenticate                                                                                                            | Auth-block the route; no dial cooldown                                        | Retry a distinct eligible route; `503` when none remains                                          |
+| SOCKS handshake fails before the tunnel is established (no explicit refusal)                                                                  | Record `socks_connect`, exponential route cooldown                            | Retry a distinct eligible route; `503` when none remains                                          |
+| Upstream refuses the CONNECT request with a non-zero reply                                                                                    | Record `connect_target`, exponential cooldown scoped to the route+target pair | Retry a distinct eligible route; `503` when none remains                                          |
+| Local inbound request error (malformed request target, invalid authority, oversized credentials) or any error after the tunnel is established | No health mutation and no retry                                               | Reply `4xx` for a malformed request, `407` for bad credentials, or `502` for a read/write failure |
+| Target reads/writes fail or the target response is malformed                                                                                  | No health mutation and no retry                                               | Close tunnel                                                                                      |
+| Client cancellation/disconnect                                                                                                                | No health mutation and no retry                                               | Close connection                                                                                  |
+| Established tunnel breaks                                                                                                                     | No health mutation                                                            | Close tunnel                                                                                      |
 
 A request tries at most `max-retries` distinct eligible routes in total (see
 [configuration](configuration.md#runtime-yaml)); a request never tries the same
@@ -93,7 +95,7 @@ into the router.
 - `no_route` means no eligible untried **candidate** remains — including the
   configured fail-closed case where the candidate set is empty (an unmatched
   target with no `default-routes`, or an IP target under the same
-  configuration). The client sees the ordinary `05 01`; nothing outside the
+  configuration). The client sees the ordinary `503`; nothing outside the
   set is ever contacted as a fallback. A malformed hostname (an empty or
   invalid label) is likewise an unmatched target, never a wildcard match.
 - Tunnel bytes stay invisible to routing as they are to health: an HTTP 429 or
@@ -138,7 +140,7 @@ Target bytes are ordinary tunnel data. A byte sequence that resembles an HTTP
 `407` is not SOCKS authentication data, does not rotate, and does not create
 cooldown; once the tunnel is established, nothing the target sends alters
 route health. Local inbound protocol errors
-([inbound SOCKS5 behavior](inbound-socks5.md)) and everything after the tunnel
+([inbound HTTP forward-proxy behavior](inbound-http.md)) and everything after the tunnel
 exists are `setup`: no health mutation, no retry. Rotation probe traffic
 bypasses pool health entirely ([manual rotation routes](rotation.md)), and the
 [warm pool](warm-pool.md) never writes route health either.

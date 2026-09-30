@@ -81,7 +81,7 @@ Each attempt runs: **drain → baseline probe → rotate call → verify**.
    anyway, and the in-flight requests keep running on their existing tunnels —
    they finish on the old egress IP, none are broken. Draining a route that
    serves no other purpose can make requests fail with the ordinary `no_route`
-   general-failure reply (`05 01`) until the window ends.
+   `503 Service Unavailable` reply until the window ends.
 2. **Baseline probe.** The gateway dials through the route (SOCKS, then TLS)
    to `ip-check-url` and reads the `ip=` line. Three attempts; if all fail the
    procedure continues with no known baseline (**unverified mode**), and later
@@ -227,5 +227,5 @@ health entirely and never creates cooldowns or failures. Requests picked before
 a rotation began keep running on their tunnels — even when the drain timeout
 expires, they simply finish on the old egress IP. Requests arriving during a
 procedure select other routes, or receive the ordinary `no_route`
-general-failure reply (`05 01`) when none exist
+`503 Service Unavailable` when none exist
 ([failure and route health](failure-and-health.md)).

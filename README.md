@@ -1,12 +1,16 @@
 # rotation-proxy-gateway
 
-`rotation-proxy-gateway` is a Go SOCKS5 proxy that accepts stable inbound
-SOCKS5 (RFC 1928) endpoints and routes connections through a health-aware pool
-of **SOCKS5-only** upstream routes. It runs three inbound proxy listeners —
-one mixed egress family, one IPv4-only, one IPv6-only — over a single shared
+`rotation-proxy-gateway` is a Go HTTP forward proxy that accepts stable inbound
+HTTP endpoints and routes connections through a health-aware pool of
+**SOCKS5-only** upstream routes. It runs three inbound proxy listeners — one
+mixed egress family, one IPv4-only, one IPv6-only — over a single shared
 route-health pool. An optional routing block scopes any domain target to a
 candidate set of named routes; the pool stays the sole authority on health,
 cooldowns, and selection order.
+
+Clients speak either `CONNECT` (for `https://` targets) or absolute-form HTTP
+(for `http://` targets); target hostnames are resolved at the outbound
+SOCKS5H route, never in the gateway.
 
 <p align="center">
   <a href="https://github.com/ecoma-io/rotation-proxy-gateway/actions/workflows/ci.yml"><img src="https://github.com/ecoma-io/rotation-proxy-gateway/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
@@ -16,36 +20,35 @@ cooldowns, and selection order.
 
 > **Status:** The authoritative behavior contract lives under
 > [`docs/`](docs/); this README is the entry point. In particular, never infer
-> SOCKS route health from a destination HTTP response — see
+> route health from a destination HTTP response — see
 > [Failure and route health](docs/failure-and-health.md).
 
 ## Inbound endpoints
 
 The process starts one admin listener and up to three proxy listeners:
 
-| Endpoint     |         Default | Protocol | Purpose                                                              |
-| ------------ | --------------: | -------- | -------------------------------------------------------------------- |
-| Admin        | `0.0.0.0:30120` | HTTP     | `/healthz`, `/readyz`, `/status`; operator controls network exposure |
-| Mixed SOCKS5 |        `:30121` | SOCKS5   | Selects both v4- and v6-egress routes                                |
-| IPv4 SOCKS5  |        `:30122` | SOCKS5   | Selects only `kind: v4` routes                                       |
-| IPv6 SOCKS5  |        `:30123` | SOCKS5   | Selects only `kind: v6` routes                                       |
+| Endpoint    |         Default | Protocol   | Purpose                                                              |
+| ----------- | --------------: | ---------- | -------------------------------------------------------------------- |
+| Admin       | `0.0.0.0:30120` | HTTP       | `/healthz`, `/readyz`, `/status`; operator controls network exposure |
+| Mixed proxy |        `:30121` | HTTP proxy | Selects both v4- and v6-egress routes                                |
+| IPv4 proxy  |        `:30122` | HTTP proxy | Selects only `kind: v4` routes                                       |
+| IPv6 proxy  |        `:30123` | HTTP proxy | Selects only `kind: v6` routes                                       |
 
 `kind` is the public egress IP family supplied by a proxy provider. It is not
-the SOCKS endpoint address family and it does not impose an IPv4/IPv6 policy on
-the client's target destination.
+the upstream SOCKS endpoint address family and it does not impose an
+IPv4/IPv6 policy on the client's target destination.
 
-A single shared pool owns health state. Therefore, a dial cooldown or SOCKS
+A single shared pool owns health state. Therefore, a dial cooldown or upstream
 authentication block observed through the v4 listener is also observed by the
 mixed listener when it considers that route. A listener never falls through to
 a route of another kind. A v4-only or v6-only route pool is valid: mixed selects
 the available family, and the enabled dedicated listener without matching routes
-remains live but replies with the ordinary no-route SOCKS general-failure
-(`05 01`) until that family is added.
+remains live but answers `503 Service Unavailable` until that family is added.
 
 Domain-based request routing is optional and configured in the runtime YAML:
 rules map domain patterns (exact or `*.`-prefixed) to candidate route sets,
 first match wins, and unmatched targets resolve to `default-routes` or fail
-closed with `05 01`. Only domain targets match rules — IP targets and the
+closed with `503`. Only domain targets match rules — IP targets and the
 wire bytes are never rewritten — and routing never overrides health: the pool
 still decides which candidate serves. See
 [configuration](docs/configuration.md#request-routing-routing-block) and
@@ -61,7 +64,8 @@ RPGW_V6_LISTEN_ADDR=:30123 \
 RPGW_ADMIN_ADDR=0.0.0.0:30120 \
 go run ./cmd/rotation-proxy-gateway
 
-curl --socks5-hostname 127.0.0.1:30121 https://example.com/
+curl -x http://127.0.0.1:30121 https://example.com/
+curl -x http://127.0.0.1:30121 http://example.com/
 curl http://127.0.0.1:30120/status
 ```
 
@@ -91,13 +95,15 @@ bootstrap variable carries the `RPGW_` prefix;
   classification contract (`proxy_connect`, `auth_route`, `socks_connect`,
   `connect_target`, `setup`, `no_route`, `retry_exhausted`), round-robin
   selection, and the two cooldown scopes.
-- [Inbound SOCKS5 behavior](docs/inbound-socks5.md) — RFC 1928/1929
-  authentication, commands, target-address transparency, replies, the
-  handshake deadline, and keep-alive ownership.
+- [Inbound HTTP forward-proxy behavior](docs/inbound-http.md) — the `CONNECT`
+  and absolute-form request shapes, `Proxy-Authorization`, the status-code
+  mapping per failure class, header handling, the handshake deadline, and
+  tunnel ownership.
 - [Observability](docs/observability.md) — the admin listener, the `/status`
   JSON contract, and the logging and redaction contract.
 - [Deployment](docs/deployment.md) — Docker and compose, migrating inbound
-  clients to SOCKS5, build and verification, and shutdown sizing.
+  clients to the HTTP forward proxy, build and verification, and shutdown
+  sizing.
 
 Benchmarks live in [`e2e/BENCH.md`](e2e/BENCH.md): end-to-end, HA, and
 warm-pool A/B scenarios, with the workflow for trustworthy before/after

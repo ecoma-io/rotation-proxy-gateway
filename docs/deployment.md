@@ -12,8 +12,9 @@ docker compose up -d --build
 curl http://127.0.0.1:30120/status
 ```
 
-Compose publishes ports `30120` (admin, HTTP), `30121` (mixed SOCKS5),
-`30122` (v4 SOCKS5), and `30123` (v6 SOCKS5) on all host interfaces. The admin
+Compose publishes ports `30120` (admin), `30121` (mixed egress), `30122`
+(v4 egress), and `30123` (v6 egress) on all host interfaces. Admin is plain
+HTTP; all three proxy listeners are HTTP forward proxies. The admin
 process listener deliberately binds all interfaces inside its network
 namespace; operators control exposure through Docker port publishing, Docker
 networks, and firewall policy. The image remains a static binary in `scratch`
@@ -25,27 +26,37 @@ in-place host edits apply without restart, while an atomic replace across the
 single-file mount stays invisible — see
 [reload behavior](configuration.md#reload-behavior).
 
-## Migrating inbound clients to SOCKS5
+## Migrating inbound clients to the HTTP forward proxy
 
-The listener protocol changed from HTTP forward proxying to SOCKS5, so inbound
+The listener protocol changed from SOCKS5 to HTTP forward proxying, so inbound
 clients migrate:
 
-- Switch each client's proxy URL to a SOCKS5 URL. With a curl-style client this
-  is `curl --socks5-hostname 127.0.0.1:30121 https://example.com/`; in a
-  browser or library, configure the SOCKS5 proxy (host `127.0.0.1`, port
-  `30121`) with remote DNS — the gateway never resolves target names.
+- Switch each client's proxy URL to an `http://` URL. With a curl-style client
+  this is `curl -x http://127.0.0.1:30121 https://example.com/`; in a browser or
+  library, configure the HTTP proxy (host `127.0.0.1`, port `30121`). The
+  gateway resolves no target names itself — DNS happens at the outbound route —
+  so no "remote DNS" client option is needed or wanted.
 - Remove any `global:` block from `config.yaml`. The old
   `global.target-tls-insecure` and `global.max-body-buffer` keys are no longer
   accepted and the config fails validation otherwise (on first boot the process
   refuses to start).
-- Authentication follows `RPGW_ACCOUNT`. Unset, only NO AUTHENTICATION is
-  offered and a client configured to send SOCKS username/password must have
-  that mode disabled. Set, every client must speak SOCKS username/password
-  mode with the exact configured `username:password` (see
-  [inbound SOCKS5 behavior](inbound-socks5.md#authentication)).
-- Keep-alive is now client-owned: one client connection carries exactly one
-  tunnel, and pooled clients reuse it across requests. HTTP clients over SOCKS
-  typically do this automatically.
+- Authentication follows `RPGW_ACCOUNT`, and the wire form changed with the
+  protocol. Unset, no `Proxy-Authorization` is required. Set, every client must
+  send `Proxy-Authorization: Basic base64(username:password)` with the exact
+  configured `username:password` on every request, or receive
+  `407 Proxy Authentication Required` (see
+  [inbound HTTP forward-proxy behavior](inbound-http.md#authentication)). A
+  client still configured for SOCKS username/password auth must have that
+  disabled; it is not consulted.
+- Clients that only spoke SOCKS5 need no other change. Anything that relied on
+  the gateway's RFC 1928 method negotiation has no HTTP equivalent and simply
+  stops.
+
+**Rollback is a redeploy, not a mode.** There is no compatibility listener and
+no flag: to return to the previous behavior, redeploy the previous image and
+revert the client proxy URLs. The two versions cannot serve the same port
+simultaneously, so run the rollback as a normal rolling deployment rather than
+expecting an in-place switch.
 
 For each old `proxies.txt` line, create one `proxies.auto` item and choose
 `kind` from your provider's documented public egress family. There is no safe
@@ -80,7 +91,7 @@ Graceful shutdown runs in a fixed order, and the order is the contract:
    is the window a load balancer needs: a probe scheduled before the signal
    still lands on a live socket, so it observes a `503` rather than a refused
    connection. It covers all three proxy listeners and the admin listener, not
-   just admin — the caller-facing SOCKS5 listeners are the ones that actually
+   just admin — the caller-facing proxy listeners are the ones that actually
    get refused. A `500ms` interval plus a `500ms` timeout on the probe side is
    1s of worst-case notification, comfortably inside 5s; a `2s` interval plus
    `2s` timeout is 4s and still fits, but only just.
@@ -113,7 +124,7 @@ example `stop_grace_period: 60s` in compose — so its kill timer never cuts the
 drain short.
 
 **`stop_grace_period` is not a lever for availability.** It bounds how long the
-outgoing container keeps running, and while it drains its SOCKS5 listeners are
+outgoing container keeps running, and while it drains its proxy listeners are
 closed, so a single-replica deployment has nowhere to send new connections for
 exactly that long. Making it larger makes the incident worse. What closes the
 window is the topology below; the grace should be sized to the real drain-time

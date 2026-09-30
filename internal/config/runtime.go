@@ -188,7 +188,7 @@ type BootstrapConfig struct {
 	// ShutdownGrace bounds the entire graceful drain: one shared deadline for
 	// all listeners, not a per-listener window.
 	ShutdownGrace time.Duration
-	// Account, when set, is the RFC 1929 credential pair every proxy listener
+	// Account, when set, is the credential pair every proxy listener
 	// demands from clients. Nil keeps the no-authentication default. Like every
 	// bootstrap value it is restart-only.
 	Account *InboundAccount
