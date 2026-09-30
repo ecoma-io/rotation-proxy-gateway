@@ -141,3 +141,28 @@ func NewEchoBodyTarget(t testing.TB) *TargetSim {
 	t.Cleanup(srv.Close)
 	return fromServer(srv)
 }
+
+// newHoldingTarget serves 200 with a small body only after the request context
+// ends — which happens exactly when the gateway's client connection goes away.
+// A request against it therefore models a tunnel that is genuinely long-lived:
+// only the gateway can end it.
+func newHoldingTarget(t testing.TB) *TargetSim {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	return fromServer(srv)
+}
+
+// newDelayedTarget answers after a fixed delay, so a request in flight when a
+// drain starts has something to complete.
+func newDelayedTarget(t testing.TB, hold time.Duration) *TargetSim {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(hold)
+		_, _ = fmt.Fprintf(w, "delayed:%s", hold)
+	}))
+	t.Cleanup(srv.Close)
+	return fromServer(srv)
+}

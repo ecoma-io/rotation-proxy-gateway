@@ -175,17 +175,26 @@ changing failure classification.
   health entirely; rotate-API headers, bodies, and URLs must never reach logs,
   errors, or `/status`. `rotation.drain-timeout` (one route's pre-rotation
   quiesce) is unrelated to `RPGW_SHUTDOWN_GRACE` (whole-process listener drain).
-- Shutdown cancels the rotation engine first — procedures abort at their next
-  checkpoint and never extend the budget — then drains all proxy listeners and
-  admin against one shared `RPGW_SHUTDOWN_GRACE` budget (default 55s; one deadline
-  for the whole process, not a window per listener), then force-closes
-  established tunnels. Keep the surrounding orchestrator's kill timer above the
-  budget (`stop_grace_period: 60s` in compose).
+- Shutdown runs in a fixed order: `/readyz` goes `503` while every listener is
+  still accepting, then a 5s readiness head start (drawn from the grace, capped
+  at `grace/2`, covering all listeners plus admin), then the rotation engine,
+  then the warm pool, then every listen socket closed and all proxy listeners
+  plus admin drained concurrently against one shared `RPGW_SHUTDOWN_GRACE`
+  budget (default 55s; one deadline for the whole process, not a window per
+  listener), then force-closed established tunnels. `/healthz` stays `200`
+  throughout: it is liveness, and a probe that failed while the process is
+  stopping correctly would invite the orchestrator to kill it mid-drain. Keep
+  the surrounding orchestrator's kill timer above the budget
+  (`stop_grace_period: 60s` in compose). A readiness signal is necessary but
+  not sufficient for a zero-downtime rollout — that needs ≥2 replicas and a
+  load balancer that honours it, which is deployment-side; see
+  [`docs/deployment.md`](docs/deployment.md) "Zero-downtime rollout".
 
 ## Admin
 
 ```bash
-curl http://127.0.0.1:30120/healthz # body "ok\n"
+curl http://127.0.0.1:30120/healthz # body "ok\n" — unconditional liveness
+curl http://127.0.0.1:30120/readyz  # 200 "ok\n" while serving, 503 from the first drain instant
 curl http://127.0.0.1:30120/status  # requests/failovers per listener, global rotations, safe pool state
 RPGW_ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 ./bin/rpgw version

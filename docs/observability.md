@@ -1,22 +1,65 @@
 # Admin and observability
 
-The always-on admin listener (default `0.0.0.0:30120`, HTTP) exposes the health
-and status endpoints. The process listener deliberately binds all interfaces
-inside its network namespace; operators control exposure through Docker port
-publishing, Docker networks, and firewall policy.
+The always-on admin listener (default `0.0.0.0:30120`, HTTP) exposes the health,
+readiness, and status endpoints. The process listener deliberately binds all
+interfaces inside its network namespace; operators control exposure through
+Docker port publishing, Docker networks, and firewall policy.
 
 ```bash
 curl http://127.0.0.1:30120/healthz # body: ok\n
+curl http://127.0.0.1:30120/readyz  # 200 ok\n serving, 503 draining/stopped
 curl http://127.0.0.1:30120/status
 RPGW_ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 ./bin/rpgw version
 ```
 
 `healthcheck` is a binary subcommand (used by the Docker healthcheck): it loads
-only the bootstrap environment and probes the admin listener's `/healthz` — it
+only the bootstrap environment and probes the admin listener's `/readyz` — it
 deliberately does not parse runtime YAML, so a bad reload cannot make an
 otherwise-running process fail the probe. Wildcard listener addresses are
 mapped to their loopback equivalent for the probe.
+
+## `/healthz` and `/readyz`
+
+They answer different questions, and conflating them is the bug this split
+exists to prevent.
+
+| Endpoint   | Answers                       | While draining       |
+| ---------- | ----------------------------- | -------------------- |
+| `/healthz` | "is this process alive?"      | `200`                |
+| `/readyz`  | "send this instance traffic?" | `503` from the start |
+
+`/healthz` is unconditional: it answers `200 "ok\n"` for the entire remaining
+life of the process, drain window included. It must stay that way. The
+container health check reads it, and a liveness probe that failed while the
+process is stopping correctly would tell Docker to kill it mid-drain, with live
+tunnels on it.
+
+`/readyz` goes `503` the instant the drain begins and stays there for good —
+before any listener socket closes, and while every listener is still accepting
+for a 5 second head start (see
+[deployment](deployment.md#shutdown-sizing)). That window is the whole point: a
+load balancer that still believes the instance is ready gets told otherwise
+while the socket it is routing to is still answering.
+
+| State    | Status | Body         |
+| -------- | ------ | ------------ |
+| ready    | `200`  | `ok\n`       |
+| starting | `503`  | `starting\n` |
+| draining | `503`  | `draining\n` |
+| stopped  | `503`  | `stopped\n`  |
+
+The state is a monotonic machine, not a flag: a process only moves forward
+through it, so a late or duplicated transition cannot re-advertise an instance
+that already told its load balancer to stop. The body is the state token and
+nothing else — readiness is a statement about this process alone, never derived
+from a route's cooldown, the warm pool, or an upstream provider, so there is
+nothing in it to leak. Responses are `Cache-Control: no-store`: a cached `200`
+replayed after the drain began would route traffic into a socket about to close.
+A non-GET is `405` with `Allow: GET`.
+
+`/readyz` is an admin-plane path alongside `/status`, not part of any wire
+contract the gateway speaks to a client, so it is plain text with no envelope.
 
 ## `/status` contract
 
