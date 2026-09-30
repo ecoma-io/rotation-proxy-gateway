@@ -435,6 +435,12 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 			"failovers": failovers,
 			"listeners": perListener,
 			"pool":      gen.Pool.Snapshot(),
+			// The revision is read from the generation /status already loads,
+			// so reporting it costs no query against the control database and
+			// cannot drift from what is serving. Zero means this instance is
+			// running on its local seed configuration rather than a durable
+			// revision.
+			"configRevision": gen.ConfigRevision,
 		}
 		if rotations != nil {
 			status["rotations"] = rotations()

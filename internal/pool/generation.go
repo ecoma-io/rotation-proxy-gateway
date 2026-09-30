@@ -26,6 +26,18 @@ type Generation struct {
 	// both as one unit, and in-flight sessions keep matching against their
 	// original policy.
 	Router *routing.Router
+	// ConfigRevision is the durable configuration revision this generation was
+	// materialized from, or 0 when it came from the local seed file rather than
+	// the durable store. It rides on the generation on purpose: /status reports
+	// the served revision by reading the generation it already loads, so the
+	// status path never queries the control database, and the number reported is
+	// by construction the revision actually serving rather than the newest one
+	// committed.
+	//
+	// It is metadata, never an input. Route identity is canonical URL+kind+origin
+	// and nothing here, so bumping the revision number cannot reset a route's
+	// health and a rename of an operator-facing id cannot either.
+	ConfigRevision int64
 }
 
 // NewGeneration combines validated configuration with its pool snapshot. It
@@ -79,11 +91,27 @@ func (s *Store) Store(gen *Generation) {
 // generation by not calling Publish at all. The new pool reuses unchanged
 // Proxy health state from the current generation via Reconfigure.
 func (s *Store) Publish(cfg *config.RuntimeConfig) *Generation {
+	return s.PublishRevision(cfg, 0)
+}
+
+// PublishRevision is Publish with the durable configuration revision the
+// candidate came from, recorded on the published generation so /status reports
+// the revision that is actually serving without a store lookup.
+//
+// A zero revision means the configuration did not come from the durable store —
+// the local seed file — and is reported as such rather than as revision 0 of
+// the store.
+//
+// The revision is recorded, never consulted: it takes no part in building the
+// pool snapshot, so a revision bump that changes nothing else reuses every
+// route's retained state exactly as any other identity-preserving reload does.
+func (s *Store) PublishRevision(cfg *config.RuntimeConfig, revision int64) *Generation {
 	if cfg == nil {
-		panic("pool: Publish requires a non-nil RuntimeConfig")
+		panic("pool: PublishRevision requires a non-nil RuntimeConfig")
 	}
 	current := s.value.Load()
 	gen := NewGeneration(cfg, current.Pool.Reconfigure(cfg.AllRoutes(), cfg.CooldownBase, cfg.CooldownMax))
+	gen.ConfigRevision = revision
 	s.value.Store(gen)
 	return gen
 }

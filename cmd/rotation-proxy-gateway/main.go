@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/configstore"
+	"rotation-proxy-gateway/internal/control"
 	"rotation-proxy-gateway/internal/logging"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/proxyserver"
@@ -162,8 +164,94 @@ func warnUnavailableKindListeners(log zerolog.Logger, cfg *config.RuntimeConfig,
 	}
 }
 
+// controlPlane is the opened durable configuration substrate: the store, the
+// reconciler that materializes revisions into the local generation, and the
+// revision the first serving generation came from.
+type controlPlane struct {
+	store      configstore.Repository
+	reconciler *control.Reconciler
+}
+
+// servedRevision names the durable revision the first generation was built
+// from, or NoRevision when this instance is running file-seeded with no store
+// configured.
+type servedRevision = configstore.Revision
+
+// openControlPlane opens the durable store, migrates its schema, and resolves
+// the configuration this instance should start from.
+//
+// The seed decision, and why it is narrow: the runtime YAML is the seed for a
+// store that has no committed revision, and nothing else. That path exists
+// because a store has to get its first revision from somewhere, and requiring
+// an operator to commit one by hand before any instance can start would mean a
+// fresh deployment cannot come up on its own. Once a revision exists the YAML is
+// never read again for the serving configuration — an instance converges on the
+// active revision instead. Seeding an already-seeded store would let one
+// instance's local file overwrite the cluster's configuration, which is exactly
+// the file-as-authority behavior this store replaces, so Seed refuses it.
+//
+// Without RPGW_CONFIG_STORE_DSN there is no store at all: the process reads its
+// YAML, serves it, and reloads it on change exactly as before. That keeps a
+// single-instance deployment — and the existing e2e suite — working with no
+// database in the picture.
+func openControlPlane(ctx context.Context, bootstrap *config.BootstrapConfig) (*controlPlane, *config.RuntimeConfig, servedRevision, error) {
+	// The YAML is read first either way: it is the seed, and it is the whole
+	// configuration when no store is configured. Its errors are already
+	// sanitized and secret-free.
+	seed, err := config.LoadRuntime(bootstrap.ConfigFile)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	if bootstrap.ConfigStoreDSN == "" {
+		return nil, seed, configstore.NoRevision, nil
+	}
+
+	repo, err := configstore.NewPostgres(ctx, bootstrap.ConfigStoreDSN)
+	if err != nil {
+		// The DSN is a secret; this error is pgx's own and never quotes it.
+		return nil, nil, 0, err
+	}
+	// Migrations run before anything binds. A failure here is fatal: an
+	// instance that cannot trust its schema must not serve, and an unknown
+	// future schema version is refused rather than worked around.
+	if err := repo.Migrate(ctx); err != nil {
+		repo.Close()
+		return nil, nil, 0, err
+	}
+	version, err := repo.SchemaVersion(ctx)
+	if err != nil {
+		repo.Close()
+		return nil, nil, 0, err
+	}
+	log := setupDynamicLogger(seed.LogLevel)
+	log.Info().Int("schema_version", version).Msg("config store schema ready")
+
+	// The reconciler publishes into a throwaway generation store purely to
+	// materialize the boot configuration; the process builds its real store from
+	// the result. A pool with zero routes is enough for a publication and can
+	// never serve, because nothing binds until this returns.
+	boot := pool.NewStore(seed, pool.NewRoutes(nil, seed.CooldownBase, seed.CooldownMax))
+	reconciler := control.NewReconciler(repo, boot, log, control.Options{Interval: bootstrap.ReconcileInterval})
+
+	// Seed commits the first revision only when the store has none, and
+	// otherwise converges on the active one. It is also what validates: a
+	// durable revision that this build refuses is reported here rather than
+	// discovered by the first reconcile tick, while the failure is still a
+	// startup decision.
+	revision, err := reconciler.Seed(ctx, seed)
+	if err != nil {
+		repo.Close()
+		return nil, nil, 0, err
+	}
+	materialized := boot.Load()
+	if revision.IsValid() {
+		log.Info().Int64("revision", int64(revision)).Int("upstreams", len(materialized.Config.AllRoutes())).
+			Msg("serving durable configuration revision")
+	}
+	return &controlPlane{store: repo, reconciler: reconciler}, materialized.Config, revision, nil
+}
+
 func run() error {
-	// Install the signal handler before anything can make the process reachable
 	// or healthy. The bootstrap env and config may be invalid, or a listener
 	// bind may fail — in every such startup failure the notify channel stays
 	// armed until the deferred signal.Stop, and a SIGTERM arriving before the
@@ -184,26 +272,52 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	runtimeCfg, err := config.LoadRuntime(bootstrap.ConfigFile)
+
+	// The durable configuration store is opened and migrated BEFORE any
+	// listener binds and before the runtime YAML is consulted. Two properties
+	// depend on that order: a process must never serve against a schema its code
+	// does not expect, and the configuration the first generation is built from
+	// must be the one the cluster agrees on rather than whichever local file
+	// this instance happened to have.
+	//
+	// A failed migration is fatal here rather than a degraded mode. Refusing to
+	// start is the honest outcome: an instance that serves from its local file
+	// while the cluster serves another revision is a split brain, which is
+	// strictly worse than not running.
+	storeCtx, cancelStore := context.WithCancel(context.Background())
+	defer cancelStore()
+	controlPlane, initialCfg, served, err := openControlPlane(storeCtx, bootstrap)
 	if err != nil {
 		return err
 	}
+	if controlPlane != nil {
+		defer controlPlane.store.Close()
+	}
 
+	runtimeCfg := initialCfg
 	log := setupDynamicLogger(runtimeCfg.LogLevel)
 	warnUnavailableKindListeners(log, runtimeCfg, bootstrap)
 	// The store publishes one immutable generation (validated config + pool
-	// snapshot). Handlers load it once per operation; reload builds the next
-	// pool snapshot and swaps the whole generation atomically. The pool serves
-	// both origins; manual routes additionally carry rotation state.
-	store := pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.AllRoutes(), runtimeCfg.CooldownBase, runtimeCfg.CooldownMax))
-	engine := rotation.New(store, log)
+	// snapshot). Handlers load it once per operation; a new revision builds the
+	// next pool snapshot and swaps the whole generation atomically. The pool
+	// serves both origins; manual routes additionally carry rotation state.
+	poolStore := pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.AllRoutes(), runtimeCfg.CooldownBase, runtimeCfg.CooldownMax))
+	// Stamp the revision the first generation came from, so /status reports the
+	// configuration that is actually serving rather than zero. It goes through
+	// the same publication path every later revision uses, so there is no second
+	// way for a generation to acquire a revision — and the reconfigure is a
+	// no-op on identity, retaining every route.
+	if served.IsValid() {
+		poolStore.PublishRevision(runtimeCfg, int64(served))
+	}
+	engine := rotation.New(poolStore, log)
 	// The warm pool keeps half-established upstream connections ready for the
 	// serving path to borrow (one non-blocking pop per attempt, cold dial on
 	// any miss) while never writing route health itself: cooldown, auth, and
 	// rotation state change only on the request path. It follows config
 	// generations on its own; a disabled config parks it at zero idle
 	// connections and every dial is cold again.
-	warm := warmpool.New(store, log, nil)
+	warm := warmpool.New(poolStore, log, nil)
 
 	listeners := make([]runningListener, 0, 3)
 	listenerViews := make(map[string]*proxyserver.Server, 3)
@@ -211,7 +325,7 @@ func run() error {
 		if addr == "" {
 			return nil
 		}
-		srv := proxyserver.NewRuntime(store, log, version, name, kinds...)
+		srv := proxyserver.NewRuntime(poolStore, log, version, name, kinds...)
 		srv.UseWarmPool(warm)
 		if bootstrap.Account != nil {
 			srv.UseInboundAccount(bootstrap.Account.Username, bootstrap.Account.Password)
@@ -246,7 +360,7 @@ func run() error {
 	// so the handler closure and shutdownAll share one machine.
 	lc := proxyserver.NewLifecycle()
 	adminSrv := &http.Server{
-		Handler:           proxyserver.AdminMux(version, started, store, listenerViews, engine.Rotations, engine.IPRevisits, warm.Snapshot, lc),
+		Handler:           proxyserver.AdminMux(version, started, poolStore, listenerViews, engine.Rotations, engine.IPRevisits, warm.Snapshot, lc),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
@@ -275,10 +389,58 @@ func run() error {
 		}
 	}()
 
-	poller := config.NewPoller(bootstrap.ConfigFile, config.DefaultPollInterval, log)
-	pollCtx, cancelPoll := context.WithCancel(context.Background())
-	defer cancelPoll()
-	go poller.Run(pollCtx, log)
+	// The two configuration sources are mutually exclusive by construction, and
+	// exactly one of them runs.
+	//
+	// With a durable store configured, the reconciler is the sole authority and
+	// the poller never starts. The YAML was read exactly once, above, to seed
+	// the first revision; an in-place edit of that file afterwards changes
+	// nothing, which is the point. Two authorities that both react to changes
+	// would let a local edit silently overwrite a cluster-wide revision, and the
+	// store would stop being the authority — so in this mode the file is a seed
+	// and only a seed.
+	//
+	// With no store configured there is no durable authority at all, and the
+	// poller keeps the pre-existing behavior exactly. That is what keeps a
+	// single-instance deployment — and the e2e suite, which drives the real
+	// binary with a file and no database — working unchanged.
+	//
+	// Both feed one `reload` channel, so the process-global side effects of a
+	// configuration change — the log level and the kind-listener warnings — have
+	// exactly one writer in either mode.
+	reload := make(chan *config.RuntimeConfig, 1)
+	reloadSource := "poll"
+	// reloadAuthority names, in the SIGHUP line, where a configuration change
+	// would have to come from. It is mode-accurate on purpose: telling a
+	// file-mode operator that changes arrive "through the durable revision"
+	// would point them at a subsystem they are not running.
+	reloadAuthority := "configuration reloads are poller-driven, stop with SIGTERM"
+	cancelReload := context.CancelFunc(func() {})
+	if controlPlane != nil {
+		reloadSource = "revision"
+		reloadAuthority = "configuration changes arrive through the durable revision, stop with SIGTERM"
+		reconcileCtx, cancelReconcile := context.WithCancel(context.Background())
+		cancelReload = cancelReconcile
+		// The subscriber receives only validated, already-published
+		// configurations, so the process-global effects can never run against a
+		// configuration the gateway refused to serve.
+		controlPlane.reconciler.Subscribe(func(next *config.RuntimeConfig) {
+			select {
+			case reload <- next:
+			default:
+				// A publication is already queued; the newer value supersedes it
+				// rather than being applied twice.
+			}
+		})
+		// Reconciled into the real store, so a revision committed by another
+		// instance reaches this one's serving generation.
+		go controlPlane.reconciler.Run(reconcileCtx)
+	} else {
+		pollCtx, cancelPoll := context.WithCancel(context.Background())
+		cancelReload = cancelPoll
+		defer cancelPoll()
+		go watchConfigFile(pollCtx, bootstrap.ConfigFile, poolStore, reload, log)
+	}
 
 	// The rotation engine owns manual-route egress IP rotation. Its context is
 	// canceled before the listeners drain so in-flight rotations stop promptly
@@ -292,34 +454,30 @@ func run() error {
 	// their serve goroutines are running: from this instant a probe that reaches
 	// /readyz is answered by a process that is certainly serving every listener.
 	// The signal handler was armed before any of it, so a SIGTERM that arrived
-	// during startup already took the graceful path and the deferred
-	// cancelPoll/engineCancel above have already unwound — this transition can
-	// only move forward from here.
+	// during startup already took the graceful path and the deferred cancels
+	// above have already unwound — this transition can only move forward from
+	// here.
 	lc.MarkReady()
 
-	// Reloads from the poller arrive on one channel and are handled by this
-	// serialized loop; the source label only records how it was reached.
-	reload := func(source string) {
-		next, err := config.LoadRuntime(bootstrap.ConfigFile)
-		if err != nil {
-			log.Warn().Str("source", source).Str("error", sanitize.ErrorString(err)).Msg("reload failed; keeping previous configuration")
-			return
-		}
-		// LoadRuntime fully validates before Publish builds the next pool
-		// snapshot and swaps the whole generation. Invalid input keeps the
-		// previous generation (and its route health) serving untouched.
-		store.Publish(next)
+	// A published configuration — from a durable revision or from the file
+	// poller — arrives here as one value on one channel, handled by this
+	// serialized loop. It carries the process-global side effects only; the
+	// generation itself was already published atomically by whoever produced
+	// the value, and a rejected configuration never reaches this point at all.
+	reconfigure := func(next *config.RuntimeConfig, source string) {
 		// Only this goroutine writes the global level, so the package-global
 		// atomic swap is race-free and every future event picks it up.
 		zerolog.SetGlobalLevel(parseZerologLevel(next.LogLevel))
 		warnUnavailableKindListeners(log, next, bootstrap)
-		log.Info().Str("source", source).Int("upstreams", len(next.AllRoutes())).Msg("configuration reloaded")
+		log.Info().Str("source", source).Int("upstreams", len(next.AllRoutes())).
+			Msg("configuration reloaded")
 	}
 
 	hupLogged := false
 	for {
 		select {
 		case err := <-errCh:
+			cancelReload()
 			shutdownAll(log, lc, engineCancel, warm.Stop, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return err
 		case sig := <-sigCh:
@@ -330,17 +488,58 @@ func run() error {
 			if sig == syscall.SIGHUP {
 				if !hupLogged {
 					hupLogged = true
-					log.Info().Msg("SIGHUP received; ignored — configuration reloads are poller-driven, stop with SIGTERM")
+					log.Info().Msg("SIGHUP received; ignored — " + reloadAuthority)
 				}
 				continue
 			}
 			log.Info().Str("signal", sig.String()).Str("grace", bootstrap.ShutdownGrace.String()).Msg("shutting down")
+			cancelReload()
 			shutdownAll(log, lc, engineCancel, warm.Stop, listeners, adminSrv, bootstrap.ShutdownGrace)
 			return nil
+		case next := <-reload:
+			reconfigure(next, reloadSource)
+		}
+	}
+}
+
+// watchConfigFile is the file-seeded reload path: it publishes a changed runtime
+// YAML to the live generation store and reports the published value on out.
+//
+// It runs only when no durable store is configured. It keeps the same ordering
+// the reconciler does — LoadRuntime validates completely, Publish builds the next
+// pool snapshot and swaps the whole generation, and only a configuration that
+// passed validation is ever published — so invalid input keeps the previous
+// generation and its route health serving untouched. Publication happens in this
+// goroutine before the value is reported, so the process-global effects in the
+// main loop can never run ahead of the generation they describe.
+func watchConfigFile(ctx context.Context, path string, generations *pool.Store, out chan<- *config.RuntimeConfig, log zerolog.Logger) {
+	poller := config.NewPoller(path, config.DefaultPollInterval, log)
+	// NewPoller seeds the baseline with the file's content right now — the
+	// content the boot-time load already published — so the first tick is quiet
+	// unless the file genuinely changes. Constructed here rather than by the
+	// caller so the baseline is taken after that publication, never before it.
+	go poller.Run(ctx, log)
+	for {
+		select {
+		case <-ctx.Done():
+			return
 		case <-poller.Changes():
 			// The poller hash-gates on applied content, so one signal means one
 			// distinct configuration; no debounce is needed.
-			reload("poll")
+			next, err := config.LoadRuntime(path)
+			if err != nil {
+				log.Warn().Str("source", "poll").Str("error", sanitize.ErrorString(err)).
+					Msg("reload failed; keeping previous configuration")
+				continue
+			}
+			generations.Publish(next)
+			select {
+			case out <- next:
+			default:
+				// Coalescing send, matching the poller's own coalescing: a
+				// configuration applied while a previous one was still queued is
+				// superseded by the newer value rather than applied twice.
+			}
 		}
 	}
 }
