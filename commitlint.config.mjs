@@ -27,6 +27,17 @@ export default {
         "ci",
         "workspace",
         "release",
+        // Added by the HTTP-forward-proxy migration (#92). `inbound` is the
+        // ingress protocol layer, which the SOCKS era expressed inside
+        // proxyserver and which the HTTP era gives its own seam: request
+        // parsing, `Proxy-Authorization`, and the x-ecoma-* control headers are
+        // ingress concerns, while proxyserver keeps the route-selection and
+        // relay engine they feed. The migration phases that follow add
+        // `store` (durable configuration and analytics), `coord` (Redis lease,
+        // fencing, and the distributed rotation epoch), and `api` (the admin
+        // resource endpoints); they are added when those packages land, so a
+        // scope never names a package that does not exist.
+        "inbound",
       ],
     ],
     "body-max-line-length": [0],
