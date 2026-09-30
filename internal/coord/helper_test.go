@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -148,16 +147,6 @@ func parseTokenLine(line string) (uint64, bool) {
 	}
 	return 0, false
 }
-
-// Signals used to pause and resume a helper. SIGSTOP/SIGCONT are the real
-// thing: the process genuinely stops executing, cannot renew its lease, and
-// resumes with its in-memory state intact — the same shape as a stop-the-world
-// pause or a suspended VM, and not something an injected clock can fake.
-const (
-	syscallStop = syscall.SIGSTOP
-	syscallCont = syscall.SIGCONT
-	syscallTerm = syscall.SIGTERM
-)
 
 // freeLoopbackAddr reserves and releases a loopback port, returning its address.
 //

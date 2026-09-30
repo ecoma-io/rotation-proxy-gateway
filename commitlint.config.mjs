@@ -38,6 +38,9 @@ export default {
         // resource endpoints); they are added when those packages land, so a
         // scope never names a package that does not exist.
         "inbound",
+        // Added with internal/coord, the Redis coordination authority: the
+        // lease, its fencing tokens, and the cluster rotation epoch.
+        "coord",
       ],
     ],
     "body-max-line-length": [0],
