@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/coord"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/sanitize"
 	"rotation-proxy-gateway/internal/socksdial"
@@ -65,6 +66,19 @@ type Engine struct {
 	due    map[string]time.Time // canonical route ID -> next attempt
 	active map[string]*pool.Proxy
 	consec map[string]int // canonical route ID -> consecutive same-IP outcomes
+
+	// coordMu guards the cluster coordinator and its epoch-adoption closure.
+	// They are installed once at boot, before Run, and read from every
+	// procedure goroutine afterwards, so they get their own lock rather than
+	// being folded into mu — mu is held while scheduling and must never be
+	// held across a network call.
+	coordMu sync.Mutex
+	// coordinator is nil in single-instance mode, which is the default and
+	// must keep behaving exactly as it did before coordination existed.
+	coordinator Coordinator
+	// adoptEpochFn raises every route's local epoch to the cluster epoch. It
+	// is normally rotation.ClusterEpochAdopter(store).
+	adoptEpochFn func(coord.Epoch) int
 }
 
 // New builds an Engine over a generation store.
@@ -201,6 +215,18 @@ func (e *Engine) evaluate(ctx context.Context) {
 		}
 	}
 
+	// Cluster gate. With coordination configured, only the lease holder starts
+	// a procedure, so two instances never drain and rotate the same route
+	// concurrently. It is a gate and not a guarantee: a holder that pauses past
+	// this check is not thereby safe, and the fenced commit re-checks the token
+	// at the mutation. Without coordination this returns true and every
+	// instance rotates, exactly as before.
+	//
+	// It is taken once per pass rather than per route: the lease is cluster
+	// wide, so a pass that holds it may admit every due route it has capacity
+	// for.
+	holdsLease := e.mayRotate(ctx)
+
 	active := len(e.active)
 	for _, spec := range specs {
 		id := routeID(spec.RouteSpec)
@@ -209,6 +235,13 @@ func (e *Engine) evaluate(ctx context.Context) {
 		}
 		due, scheduled := e.due[id]
 		if !scheduled || due.After(now) {
+			continue
+		}
+		if !holdsLease {
+			// Another instance holds the rotation lease. This one keeps
+			// serving and rotates nothing; the holder will pick the route up.
+			// Deliberately silent: for every instance but one this is the
+			// steady state, not an event.
 			continue
 		}
 		if active >= cap {
@@ -339,6 +372,31 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 		// against, and the later load is the one whose answer is worth having.
 		at := e.Now()
 		revisit, err := e.store.Load().Pool.CommitRotation(e.store, p, ip, at)
+		if err == nil && e.coordinatorOrNil() != nil {
+			// Coordination is on: the cluster authority is the record of this
+			// rotation, and the local commit alone is not enough. The fenced
+			// commit runs immediately after the local one and is what makes the
+			// rotation cluster-wide.
+			//
+			// Order matters and is deliberate. The local commit first, then the
+			// distributed one: a fenced holder has already failed here on the
+			// token comparison, so it never reaches the local write either. A
+			// Redis outage, by contrast, must not stop this instance from
+			// recording what it verified locally — the route did rotate, and
+			// withholding that would lose real information.
+			switch outcome, _ := e.commitDistributed(ctx, p, id, baseline, ip, started); outcome {
+			case distributedFenced:
+				// Replaced mid-procedure. The local commit above already
+				// recorded the verified address, which is correct for this
+				// instance's own pool; the cluster record names the winner, and
+				// this instance must not treat that as a rotation failure.
+				// Route health is untouched: losing a lease proves nothing
+				// about the endpoint's reachability.
+				log.Warn().Msg("rotation committed locally but not in the cluster; another instance owns the rotation lease")
+			case distributedDuplicate:
+				log.Debug().Msg("rotation already committed in the cluster for this attempt")
+			}
+		}
 		switch {
 		case errors.Is(err, pool.ErrRotationRouteGone):
 			// The route left the live pool while the procedure was verifying.

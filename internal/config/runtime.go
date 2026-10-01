@@ -207,6 +207,25 @@ type BootstrapConfig struct {
 	// configuration because it describes this instance's connection to the
 	// store, not the traffic policy the store governs.
 	ReconcileInterval time.Duration
+	// CoordRedisAddr points at the coordination authority used for
+	// multi-instance rotation coordination: the rotation lease, its fencing
+	// tokens, and the cluster rotation epoch. Bootstrap-only and restart-only
+	// for the same reason the listener addresses are.
+	//
+	// It is a secret in the general case — a hosted Redis commonly embeds a
+	// password in the URL — so it is never logged, never formatted into an
+	// error, and never reported by /status.
+	//
+	// An empty value keeps the single-instance behavior exactly: every
+	// instance rotates on its own, with no lease and no cluster epoch, which is
+	// what keeps a one-instance deployment and the e2e suite working with no
+	// Redis in the picture.
+	CoordRedisAddr string
+	// CoordWatchInterval overrides the cluster-epoch reconcile period. Zero
+	// takes the coordination package default. Pub/sub only makes the common
+	// case faster; this interval is what guarantees convergence after a
+	// dropped notification.
+	CoordWatchInterval time.Duration
 }
 
 // RuntimeConfig is the immutable set of values used by new client operations.
@@ -381,6 +400,20 @@ func LoadBootstrap() (*BootstrapConfig, error) {
 			return nil, fmt.Errorf("RPGW_RECONCILE_INTERVAL must be positive, got %s", d)
 		}
 		cfg.ReconcileInterval = d
+	}
+	// The coordination address uses the plain string rule, for the same reason
+	// as the store DSN: there is no meaningful "empty address disables
+	// coordination but keeps the defaults" reading.
+	envStr("RPGW_COORD_REDIS_ADDR", &cfg.CoordRedisAddr)
+	if raw, ok := os.LookupEnv("RPGW_COORD_WATCH_INTERVAL"); ok && raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("RPGW_COORD_WATCH_INTERVAL %q must be a Go duration", raw)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("RPGW_COORD_WATCH_INTERVAL must be positive, got %s", d)
+		}
+		cfg.CoordWatchInterval = d
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
