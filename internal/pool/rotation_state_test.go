@@ -197,6 +197,51 @@ func TestRotationEpochAdvancesOnlyAtBegin(t *testing.T) {
 	}
 }
 
+// TestClusterEpochCannotBeMaskedByLocalAttempts proves the two epoch domains
+// stay separate. Local attempts advance the warm generation even when they
+// never produce a Redis commit; a later peer commit can therefore carry a
+// numerically smaller authoritative epoch. It is still new authority state and
+// must invalidate every connection parked before the peer's rotation.
+func TestClusterEpochCannotBeMaskedByLocalAttempts(t *testing.T) {
+	c := &clock{now: time.Unix(0, 0)}
+	pl := newManualPool(t, c, "socks5://m1:1")
+	p := pl.entries[0]
+
+	// Model repeated unchanged-IP attempts. Every BeginRotation advances only
+	// the local generation, while Redis's cluster counter remains at zero.
+	for range 8 {
+		p.BeginRotation(RotationDraining)
+		pl.MarkStale(p, time.Second, 1)
+	}
+	local := p.RotationEpoch()
+	if local != 8 {
+		t.Fatalf("local generation after attempts = %d, want 8", local)
+	}
+
+	// Another instance now succeeds for the first time, so Redis reports epoch
+	// 1. It is lower than this route's local generation but newer than every
+	// cluster epoch this route has observed; it must advance the warm generation
+	// exactly once rather than being ignored by a numeric max comparison.
+	if !p.AdoptClusterEpoch(1) {
+		t.Fatal("first observed cluster epoch was ignored because local attempts were numerically ahead")
+	}
+	if got := p.RotationEpoch(); got != local+1 {
+		t.Fatalf("generation after cluster epoch = %d, want %d; a connection stamped before the peer rotation would otherwise stay eligible", got, local+1)
+	}
+	if p.AdoptClusterEpoch(1) {
+		t.Fatal("re-observing the same cluster epoch advanced the local generation twice")
+	}
+	if got := p.RotationEpoch(); got != local+1 {
+		t.Fatalf("generation after duplicate cluster epoch = %d, want %d", got, local+1)
+	}
+	if !p.AdoptClusterEpoch(2) {
+		t.Fatal("the next authoritative cluster epoch was not applied")
+	}
+	if got := p.RotationEpoch(); got != local+2 {
+		t.Fatalf("generation after next cluster epoch = %d, want %d", got, local+2)
+	}
+}
+
 // TestRotationPredicatesAndRoutePointers covers the narrow exported surface
 // background consumers read: the rotating/cooldown predicates and the
 // pointer-identity route enumeration. The clock is pinned past processStart

@@ -31,31 +31,37 @@ func (p *Proxy) BeginRotation(phase RotationState) {
 	p.mu.Unlock()
 }
 
-// AdoptClusterEpoch raises the route's rotation epoch to at least cluster, and
-// reports whether it moved.
+// AdoptClusterEpoch applies a newly observed authoritative cluster epoch and
+// reports whether it moved this route's local warm-connection generation.
 //
 // This is how a cluster-wide rotation reaches this instance's warm
 // connections. It reuses the mechanism internal/warmpool already enforces — a
-// parked connection whose stamped epoch differs from the route's current
+// parked connection whose stamped generation differs from the route's current
 // RotationEpoch is discarded — rather than adding a second invalidation path
-// beside it. Raising the epoch is therefore sufficient and all that is needed:
-// every connection parked before the cluster rotation was stamped with a lower
-// epoch and fails the existing check on the next sweep or borrow.
+// beside it.
 //
-// It never lowers the epoch. A route that rotated locally has an epoch this
-// function's input may be behind, and lowering it would let a connection
-// stamped during the local rotation survive.
+// The Redis epoch and RotationEpoch are intentionally different ordinal spaces:
+// local BeginRotation advances RotationEpoch for every attempt, while Redis
+// advances only on a successful cluster commit. Therefore this method compares
+// the incoming authority cursor only with clusterEpoch, then increments the
+// local generation once. Assigning or maxing the Redis number into
+// RotationEpoch would let failed local attempts make a later peer rotation look
+// old, leaving a connection parked before that peer rotation eligible.
 //
 // It deliberately does not touch health: nothing here changes cooldown, auth,
 // or the rotating flag. A cluster rotation observed by an instance that is not
 // rotating the route invalidates warm connections, and nothing else.
 func (p *Proxy) AdoptClusterEpoch(cluster uint64) bool {
+	if cluster == 0 {
+		return false
+	}
 	for {
-		current := p.rotationEpoch.Load()
-		if cluster <= current {
+		observed := p.clusterEpoch.Load()
+		if cluster <= observed {
 			return false
 		}
-		if p.rotationEpoch.CompareAndSwap(current, cluster) {
+		if p.clusterEpoch.CompareAndSwap(observed, cluster) {
+			p.rotationEpoch.Add(1)
 			return true
 		}
 	}
