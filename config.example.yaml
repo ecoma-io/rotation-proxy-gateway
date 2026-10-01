@@ -58,6 +58,15 @@ warm-pool:
 
 # Manual-route rotation knobs. Every value below is also the default.
 rotation:
+  # How traffic is admitted to a route while its rotation runs. One procedure
+  # serves both; only this admission policy differs.
+  #   disruptive (default) - the route leaves service for the rotation: it takes
+  #     no new picks from the start of the procedure until verification passes.
+  #   seamless - the route keeps serving across the rotation. New picks are held
+  #     back only for the changeover itself (bounded, then forced through), so
+  #     requests already in flight finish on the tunnel they already have while
+  #     the new egress IP is verified underneath them.
+  mode: disruptive
   # How many rotations may run at once: a fixed count (1) or a percent of the
   # manual pool ("25%", rounds up, minimum 1, never above the pool size).
   # Rotating takes a route offline briefly, so this bounds how much of the

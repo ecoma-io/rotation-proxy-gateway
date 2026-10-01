@@ -107,6 +107,28 @@ type RotateAPI struct {
 	Timeout time.Duration
 }
 
+// RotationMode is a manual route's traffic-admission mode: how the route is
+// treated for the duration of its rotation procedure. Both modes run the same
+// procedure — drain, baseline probe, rotate call, verify, and the same commit —
+// and differ only in whether the route keeps taking new picks while it runs.
+type RotationMode string
+
+const (
+	// RotationModeDisruptive takes the route out of service for the rotation
+	// and re-admits it once the outcome is verified. Requests arriving during
+	// the window select another route or receive the ordinary no_route reply.
+	RotationModeDisruptive RotationMode = "disruptive"
+	// RotationModeSeamless keeps serving traffic on the route across the
+	// rotation, holding back only the connections opened at the changeover so
+	// in-flight work finishes instead of being cut.
+	RotationModeSeamless RotationMode = "seamless"
+)
+
+// DefaultRotationMode is the mode a configuration that names none gets.
+// Disruptive is this gateway's historical rotation behavior, so an absent key
+// must not silently change which traffic a route is allowed to take.
+const DefaultRotationMode = RotationModeDisruptive
+
 // RotationSettings holds the global knobs for manual-route rotation.
 // MaxConcurrentFixed and MaxConcurrentPercent are mutually exclusive; resolve
 // the effective cap per cycle with ResolveMaxConcurrent so reloads that change
@@ -114,12 +136,25 @@ type RotateAPI struct {
 type RotationSettings struct {
 	MaxConcurrentFixed   *int
 	MaxConcurrentPercent *int
+	Mode                 RotationMode
 	DrainTimeout         time.Duration
 	RotateOnStart        bool
 	IPCheckURL           string
 	IPCheckTimeout       time.Duration
 	IPCheckInterval      time.Duration
 	RetryBackoffMax      time.Duration
+}
+
+// ResolveMode returns the effective traffic-admission mode, substituting the
+// default for an unset value. It lets a hand-built settings struct (tests, and
+// any future caller that assembles one without the config parser) reach a mode
+// rather than the empty string, while parsing still rejects a value outside the
+// closed set.
+func (r RotationSettings) ResolveMode() RotationMode {
+	if r.Mode == "" {
+		return DefaultRotationMode
+	}
+	return r.Mode
 }
 
 // ResolveMaxConcurrent returns the effective rotation concurrency for n manual
@@ -231,6 +266,7 @@ type cooldownFileConfig struct {
 
 type rotationFileConfig struct {
 	MaxConcurrent   any    `mapstructure:"max-concurrent"`
+	Mode            string `mapstructure:"mode"`
 	DrainTimeout    string `mapstructure:"drain-timeout"`
 	RotateOnStart   *bool  `mapstructure:"rotate-on-start"`
 	IPCheckURL      string `mapstructure:"ip-check-url"`
@@ -586,6 +622,7 @@ func labeledRoutes(cfg *RuntimeConfig) []labeledRoute {
 // may be a typo of a secret in a shared config file.
 func parseRotationSettings(raw rotationFileConfig) (RotationSettings, error) {
 	settings := RotationSettings{
+		Mode:            DefaultRotationMode,
 		DrainTimeout:    DefaultDrainTimeout,
 		IPCheckURL:      DefaultIPCheckURL,
 		IPCheckTimeout:  DefaultIPCheckTimeout,
@@ -597,6 +634,9 @@ func parseRotationSettings(raw rotationFileConfig) (RotationSettings, error) {
 		return settings, err
 	}
 	settings.MaxConcurrentFixed, settings.MaxConcurrentPercent = fixed, percent
+	if raw.Mode != "" {
+		settings.Mode = RotationMode(raw.Mode)
+	}
 	if raw.RotateOnStart != nil {
 		settings.RotateOnStart = *raw.RotateOnStart
 	}
@@ -653,6 +693,14 @@ func (r RotationSettings) validate() error {
 		// probe — rejected here like validateProxyURL rejects a host-less
 		// route endpoint.
 		errs = append(errs, errors.New("rotation.ip-check-url must include a host"))
+	}
+	switch r.Mode {
+	case RotationModeDisruptive, RotationModeSeamless:
+	case "":
+		// An unset mode resolves to the default; see ResolveMode.
+	default:
+		errs = append(errs, fmt.Errorf("rotation.mode must be %q or %q, got %q",
+			RotationModeDisruptive, RotationModeSeamless, r.Mode))
 	}
 	if r.DrainTimeout <= 0 {
 		errs = append(errs, fmt.Errorf("rotation.drain-timeout must be positive, got %s", r.DrainTimeout))

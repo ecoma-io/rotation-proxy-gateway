@@ -910,3 +910,41 @@ func TestStopHonorsCallerDeadline(t *testing.T) {
 		t.Fatalf("Stop with a 200ms deadline took %s; it must yield to the shared shutdown budget, not the fixed %s tail", elapsed, stopWaitLimit)
 	}
 }
+
+func TestAdmitRotationEpochInvalidatesWarmConnections(t *testing.T) {
+	srv := newHalfServer(t, "ok")
+	w := defaultWarm()
+	store, pools := warmStore(w, mustURL(t, "socks5://"+srv.addr))
+	wp := newTestPool(store)
+	defer wp.Stop(context.Background())
+	wp.sweep()
+	drain(wp)
+	if wp.Snapshot().IdleTotal != 1 {
+		t.Fatalf("idle before epoch advance = %d, want 1", wp.Snapshot().IdleTotal)
+	}
+	p := pools[0]
+	before := p.RotationEpoch()
+	p.AdmitRotationEpoch()
+	after := p.RotationEpoch()
+	if after <= before {
+		t.Fatalf("epoch did not advance: before=%d after=%d", before, after)
+	}
+	wc := wp.Borrow(p)
+	if wc != nil {
+		_ = wc.Close()
+		t.Fatal("expected borrowed connection to be invalidated by epoch advance")
+	}
+	if st := wp.Snapshot(); st.IdleTotal != 0 || st.GenerationInvalidated == 0 {
+		t.Fatalf("stats after invalidation = %+v, want idle=0 and generationInvalidated>=1", st)
+	}
+	wp.sweep()
+	drain(wp)
+	if got := wp.Snapshot().IdleTotal; got != 1 {
+		t.Fatalf("idle after replenishment = %d, want 1", got)
+	}
+	wc2 := wp.Borrow(p)
+	if wc2 == nil {
+		t.Fatal("expected a fresh warm connection after replenishment")
+	}
+	_ = wc2.Close()
+}

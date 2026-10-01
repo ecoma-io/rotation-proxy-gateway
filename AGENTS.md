@@ -63,7 +63,7 @@ name fails startup with an error naming its replacement, and
 [`.env.example`](.env.example) lists the full set.
 
 Runtime settings and active routes live only in `config.yaml`:
-`log-level`, `max-retries`, `cooldown`, `dial-timeout`, `proxies.auto`,
+`log-level`, `max-retries`, `cooldown`, `dial-timeout`, `rotation.mode`, `proxies.auto`,
 `proxies.manual`, the `rotation` block, the optional `warm-pool` block, and
 the optional `routing` block. The process polls the file each
 second and reloads when its content hash changes, so in-place edits and atomic
@@ -205,7 +205,16 @@ HTTP/1.1`. An origin-form target on a proxy listener is a request for a
 - Manual routes (`proxies.manual`) rotate their public egress IP through a
   provider HTTP API on a per-route schedule, driven by `internal/rotation`:
   drain → baseline probe → rotate call → verify (success requires a changed IP
-  that collides with no other manual route). An unchanged IP never takes the
+  that collides with no other manual route). `rotation.mode` picks how traffic is
+  admitted to the route while its own procedure runs — one procedure, two
+  policies, no second engine. `disruptive` (default) takes the route out of
+  picks for the whole procedure and re-admits it after verification;
+  `seamless` keeps serving, bounding the drain and holding back only the
+  changeover so in-flight work finishes on the tunnel it already has while the
+  new IP is verified underneath it. Both modes advance the rotation epoch
+  exactly once per procedure, so a warm connection whose epoch no longer matches
+  its route is discarded either way. A failed or interrupted rotation leaves the
+  route serving with health untouched in both modes. An unchanged IP never takes the
   route out of service: it serves in the `stale` state and retries forever with
   doubling, capped, jittered backoff. Probe and rotate traffic bypasses pool
   health entirely; rotate-API headers, bodies, and URLs must never reach logs,
@@ -267,7 +276,7 @@ binary `healthcheck` subcommand (no shell in the scratch image).
 - `internal/proxyserver` — inbound HTTP forward proxy: request parsing, `Proxy-Authorization`, the `x-ecoma-*` control headers (`x-ecoma-proxy-family` route constraint, `x-ecoma-request-id` correlation id), the protocol-agnostic route-selection and relay engine they feed, plus the admin mux
 - `internal/socksdial` — the shared SOCKS5 dialer used by the proxy server and the rotation probes; `DialHalf` parks a half-handshake (TCP + greeting + auth) the warm pool completes later with `CompleteConnect`
 - `internal/warmpool` — background pool of half-established upstream connections, bounded per route and process-wide, epoch-invalidated by rotation, borrowed on the serving path
-- `internal/rotation` — manual-route rotation engine: scheduling under the concurrency cap, drain, probes, rotate calls, verification, backoff
+- `internal/rotation` — manual-route rotation engine: scheduling under the concurrency cap, drain, probes, rotate calls, verification, backoff; `admission.go` holds the `TrafficAdmissionPolicy` the `mode` setting selects between
 - `cmd/rotation-proxy-gateway` — lifecycle, signals, watcher, admin endpoints
 - `docs` — the behavior-contract pages (configuration, rotation, warm pool, failure and route health, inbound HTTP forward proxy, observability, deployment)
 - `e2e` — black-box tests and benchmarks driving the real binary as a

@@ -4,6 +4,14 @@
 // rotate API, and verifies the egress IP actually changed. A rotation that
 // leaves the IP unchanged is retried forever with growing backoff; the route
 // keeps serving in the meantime.
+//
+// Every procedure runs as one RotationProcedure — the same drain, baseline
+// probe, rotate call, verify, commit and backoff path in both traffic-admission
+// modes. A mode changes only what the procedure's TrafficAdmissionPolicy may do
+// with the route while the procedure runs: a disruptive rotation holds the
+// route out of picks until the outcome is verified, a seamless one keeps serving
+// it and holds back only the connections opened at the changeover. See
+// admission.go.
 package rotation
 
 import (
@@ -65,6 +73,14 @@ type Engine struct {
 	due    map[string]time.Time // canonical route ID -> next attempt
 	active map[string]*pool.Proxy
 	consec map[string]int // canonical route ID -> consecutive same-IP outcomes
+
+	// seams holds the seamless policies by canonical route ID, created the
+	// first time a route in that mode starts a procedure. A policy keeps one
+	// route's live changeover state, so it is keyed like every other piece of
+	// per-route engine state and reused across attempts — the seamless route's
+	// holdback must survive from one attempt to the next, not be forgotten
+	// between them. Entries are dropped when the route leaves the config.
+	seams map[string]*seamlessPolicy
 }
 
 // New builds an Engine over a generation store.
@@ -77,6 +93,7 @@ func New(store *pool.Store, log zerolog.Logger) *Engine {
 		due:    map[string]time.Time{},
 		active: map[string]*pool.Proxy{},
 		consec: map[string]int{},
+		seams:  map[string]*seamlessPolicy{},
 		dial:   socksdial.Dial,
 		probeTLS: func(host string) *tls.Config {
 			return &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
@@ -192,6 +209,14 @@ func (e *Engine) evaluate(ctx context.Context) {
 			delete(e.consec, id)
 		}
 	}
+	for id := range e.seams {
+		// A seamless route's holdback outlives the attempt that opened it, so
+		// its state is dropped only when the route leaves the configuration —
+		// the same lifetime every other piece of per-route engine state has.
+		if !current[id] {
+			delete(e.seams, id)
+		}
+	}
 	for id, p := range e.active {
 		if !current[id] {
 			// Its procedure aborts on its own; stop counting it now so the
@@ -239,21 +264,81 @@ func (e *Engine) runProcedure(ctx context.Context, gen *pool.Generation, spec co
 	if p == nil || gone() {
 		return
 	}
-	if e.rotate(ctx, gen, spec, p, id, gone) {
+	// The mode is configuration, not health: it selects which policy constrains
+	// the route's admission, and it is read from the generation the procedure
+	// was admitted under so a reload changing it takes effect on the next
+	// attempt rather than half-way through this one. The policy itself only
+	// ever constrains the pool's existing rotating flag and epoch; it is not an
+	// input to route eligibility.
+	policy := e.policyFor(gen.Config.Rotation.ResolveMode(), id)
+	proc := &RotationProcedure{
+		engine: e, gen: gen, spec: spec, p: p, id: id,
+		policy: policy, gone: gone,
+	}
+	if proc.run(ctx) {
 		// The procedure aborted — shutdown, or a reload removed or replaced
-		// the route — so its rotation marker must be cleared. Every other
+		// the route — so the policy returns the route to service. Every other
 		// outcome leaves the route's rotation state terminal already.
-		p.AbandonRotation()
+		policy.Readmit(p, proc.log)
 	}
 }
 
-// rotate runs one full rotation procedure: drain, baseline probe, rotate
-// call, verify, and the terminal bookkeeping. It reports that the procedure
-// aborted without reaching a terminal rotation state, so the caller clears
-// the route's rotation marker.
-func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.ManualRouteSpec, p *pool.Proxy, id string, gone func() bool) bool {
-	settings := gen.Config.Rotation
-	log := e.log.With().Str("route", p.URL.Host).Str("kind", string(p.Kind)).Logger()
+// policyFor resolves the traffic-admission policy for one route. It is the only
+// place a mode becomes behavior, and it is keyed like every other piece of
+// per-route engine state: a seamless policy keeps one route's live changeover
+// state across attempts, so it is created once and reused until the route
+// leaves the configuration.
+func (e *Engine) policyFor(mode Mode, id string) TrafficAdmissionPolicy {
+	if mode != ModeSeamless {
+		return disruptivePolicy{}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.seams == nil {
+		e.seams = map[string]*seamlessPolicy{}
+	}
+	policy := e.seams[id]
+	if policy == nil {
+		// The policy shares the engine's clock: a changeover's own deadlines
+		// must be measured on the same timeline as the procedure's.
+		policy = newSeamlessPolicy(e.Now)
+		e.seams[id] = policy
+	}
+	return policy
+}
+
+// RotationProcedure is one manual-route rotation: drain, baseline probe,
+// rotate call, verify, and the terminal bookkeeping. There is exactly one
+// procedure, and every traffic-admission mode runs it — the mode reaches it only
+// as the policy it is handed, consulted at the admission points below and
+// nowhere else. A mode that needed to branch anywhere inside the sequence would
+// mean two procedures, which is what this type exists to prevent.
+type RotationProcedure struct {
+	engine *Engine
+	gen    *pool.Generation
+	spec   config.ManualRouteSpec
+	p      *pool.Proxy
+	id     string
+	policy TrafficAdmissionPolicy
+	gone   func() bool // procedure must stop: shutdown, or the route left the pool
+
+	log     zerolog.Logger
+	seam    *seamlessPolicy // the seamless policy, nil in any other mode
+	attempt uint64          // the route's rotation epoch when this procedure began
+}
+
+// run executes the procedure and reports that it aborted without reaching a
+// terminal rotation state, so the caller re-admits the route.
+func (rp *RotationProcedure) run(ctx context.Context) bool {
+	e, p, policy := rp.engine, rp.p, rp.policy
+	settings := rp.gen.Config.Rotation
+	rp.log = e.log.With().
+		Str("route", p.URL.Host).
+		Str("kind", string(p.Kind)).
+		Str("mode", policy.Name()).
+		Logger()
+	rp.seam, _ = policy.(*seamlessPolicy)
+	log := rp.log
 
 	// Phase transitions carry how long the previous phase took and how far
 	// the procedure is from its start: together they answer "where did the
@@ -267,7 +352,13 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 		phase, phaseStart = name, e.Now()
 	}
 
-	p.BeginRotation(pool.RotationDraining)
+	// Admission point 1: the procedure begins. A disruptive route leaves
+	// service here; a seamless one keeps serving and only invalidates its
+	// old-generation connections. Either way the route's rotation epoch
+	// advances, so nothing established under the previous egress IP can be
+	// borrowed once the changeover is under way.
+	policy.Admit(p, pool.RotationDraining, log)
+	rp.attempt = p.RotationEpoch()
 	drainEv := log.Debug().Str("phase", "draining").Str("drain_timeout", dlog(settings.DrainTimeout))
 	if n := p.InFlight(); n > 0 {
 		drainEv = drainEv.Int("in_flight", n)
@@ -279,18 +370,21 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 	// on its existing tunnels, none are broken.
 	drainDeadline := e.Now().Add(settings.DrainTimeout)
 	for p.InFlight() > 0 {
-		if !e.Now().Before(drainDeadline) {
-			log.Warn().Int("in_flight", p.InFlight()).Msg("drain timeout expired; forcing rotation")
+		keepWaiting, until := policy.ShouldContinue(p, e.Now(), drainDeadline)
+		if !keepWaiting {
+			log.Warn().Int("in_flight", p.InFlight()).
+				Str("drain_budget", dlog(until.Sub(e.Now()))).
+				Msg("drain timeout expired; forcing rotation")
 			break
 		}
-		if gone() {
+		if rp.gone() {
 			return true
 		}
 		if !sleepCtx(ctx, drainPoll) {
 			return true
 		}
 	}
-	if gone() {
+	if rp.gone() {
 		return true
 	}
 
@@ -298,8 +392,8 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 	// rotation can only be verified as "not colliding with other routes".
 	p.SetRotationPhase(pool.RotationRotating)
 	enterPhase("rotating")
-	baseline, verified := e.baselineProbe(ctx, gen, spec, settings.IPCheckTimeout, log)
-	if gone() {
+	baseline, verified := e.baselineProbe(ctx, rp.gen, rp.spec, settings.IPCheckTimeout, log)
+	if rp.gone() {
 		return true
 	}
 	if !verified {
@@ -307,14 +401,21 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 	}
 
 	// 3. Call the provider rotate API, directly — never through the pool.
-	retryAfter, apiErr := e.callRotateAPI(ctx, spec.API)
+	retryAfter, apiErr := e.callRotateAPI(ctx, rp.spec.API)
 	// The provider call can sit in flight for its whole timeout; a reload
 	// that removed or replaced the route meanwhile is caught here, at the
 	// phase boundary, instead of after a verify window of probes through the
 	// removed route's endpoint.
-	if gone() {
+	if rp.gone() {
 		return true
 	}
+	// Admission point 2: the changeover has happened, and everything the
+	// procedure does from here until verification is waiting for the new egress
+	// IP to appear. A seamless route announces that wait now — its existing
+	// connections keep running, and the ones opened from here dial cold rather
+	// than borrow a half-established upstream connection. A disruptive route is
+	// already out of picks and has nothing to announce.
+	policy.HoldTraffic(p, log)
 
 	// 4. Verify: the egress IP must actually have changed. Carriers can hand
 	// back the same address, which does not count as a rotation. A candidate
@@ -323,7 +424,7 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 	p.SetRotationPhase(pool.RotationVerifying)
 	enterPhase("verifying")
 	commit := func(ip string) commitOutcome {
-		if gone() {
+		if rp.gone() {
 			return commitAborted
 		}
 		// The live pool decides both remaining questions in one critical
@@ -354,7 +455,7 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 		// 5. Success: the new IP became the baseline, dial health earned by
 		// the old IP is discarded, and the route serves fresh.
 		p.MarkRotated()
-		e.clearConsecutive(id)
+		e.clearConsecutive(rp.id)
 		e.rotations.Add(1)
 		if revisit {
 			// The provider handed back an address this route had already
@@ -362,21 +463,30 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 			// the route's egress diversity.
 			e.ipRevisits.Add(1)
 		}
-		e.setDue(id, e.Now().Add(spec.RotateInterval))
-		log.Info().Str("egress_ip", ip).Str("next_in", dlog(spec.RotateInterval)).Msg("rotation complete")
+		e.setDue(rp.id, e.Now().Add(rp.spec.RotateInterval))
+		log.Info().Str("egress_ip", ip).Str("next_in", dlog(rp.spec.RotateInterval)).Msg("rotation complete")
 		return commitDone
 	}
-	changed := e.verify(ctx, gen, spec, p, baseline, verified, settings, apiErr != nil, log, commit)
+	changed := e.verify(ctx, rp.gen, rp.spec, p, baseline, verified, settings, apiErr != nil, log, commit)
 
-	if gone() {
+	// Admission point 3: the changeover is settled — either a candidate was
+	// committed or verification gave up. A seamless route closes its
+	// holdback here, so the connections it held back dial warm again, and only
+	// once: the attempt stamp means a second procedure's changeover can never
+	// release this one's hold.
+	if rp.seam != nil && rp.seam.releaseHold(p, rp.attempt) {
+		log.Debug().Str("traffic", "warm again").Msg("seamless changeover complete; connections resume borrowing")
+	}
+
+	if rp.gone() {
 		return true
 	}
 	if apiErr != nil {
 		log.Warn().Str("error", sanitize.ErrorString(apiErr)).Msg("rotate API call failed")
 	}
 	if !changed {
-		consecutive := e.bumpConsecutive(id)
-		backoff := BackoffFor(spec.RotateInterval, consecutive, settings.RetryBackoffMax)
+		consecutive := e.bumpConsecutive(rp.id)
+		backoff := BackoffFor(rp.spec.RotateInterval, consecutive, settings.RetryBackoffMax)
 		// A provider Retry-After hint may extend the wait, but never past the
 		// configured ceiling: an unbounded hint would let one response silence
 		// the route's rotation retries for days.
@@ -385,7 +495,7 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 		// generation between the gone() check and here, and jumpToBack must
 		// land on the route the live pool actually picks from.
 		e.store.Load().Pool.MarkStale(p, backoff, consecutive)
-		e.setDue(id, e.Now().Add(backoff))
+		e.setDue(rp.id, e.Now().Add(backoff))
 		warnEv := log.Warn().Int("consecutive_same_ip", consecutive).Str("retry_in", dlog(backoff))
 		if retryAfter > 0 {
 			// The provider's raw hint, before the ceiling clamp: the gap

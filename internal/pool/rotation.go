@@ -15,13 +15,15 @@ import (
 // EndRotation or MarkStale returns it to serving; in-flight requests picked
 // before BeginRotation keep running and drain on their own.
 //
-// It is also the only writer of the rotation epoch, advanced after the
-// rotating flag is set: anything stamped with an older epoch was established
-// before this procedure began and — however the procedure ends — predates the
-// route's next verified egress IP. The flag-then-epoch order means a reader
-// that still sees rotating == false also still sees the old epoch, so nothing
-// can start through the beginning of a rotation and validate as the new
-// generation.
+// It raises the rotating flag and then advances the rotation epoch: anything
+// stamped with an older epoch was established before this procedure began and —
+// however the procedure ends — predates the route's next verified egress IP.
+// The flag-then-epoch order means a reader that still sees rotating == false
+// also still sees the old epoch, so nothing can start through the beginning of
+// a rotation and validate as the new generation.
+//
+// A mode that keeps the route serving across the rotation advances the epoch
+// without the flag, through AdmitRotationEpoch.
 func (p *Proxy) BeginRotation(phase RotationState) {
 	p.rotating.Store(true)
 	p.rotationEpoch.Add(1)
@@ -29,6 +31,29 @@ func (p *Proxy) BeginRotation(phase RotationState) {
 	p.rotationState = phase
 	p.nextRetryIn = 0
 	p.mu.Unlock()
+}
+
+// AdmitRotationEpoch advances the route's rotation epoch while leaving it
+// eligible for picks and its display state untouched.
+//
+// It is the seamless mode's epoch step, and it exists because BeginRotation
+// bundles two effects that a mode serving traffic across the rotation needs
+// separately. Advancing the epoch alone is what makes the old generation
+// unusable: every warm connection parked against this route carries the epoch
+// it was dialed under, and the warm pool discards any whose stamp no longer
+// matches the route's current epoch — so bumping it retires exactly the
+// half-established connections that could otherwise be borrowed, and hands over
+// to connections established after the provider changed the egress IP. No
+// second eligibility mechanism is involved: the epoch is consulted by the warm
+// pool, never by PickFor.
+//
+// The flag-then-epoch ordering argument on BeginRotation is not needed here and
+// does not hold for this call, deliberately: a route that raises no flag has no
+// window in which it is simultaneously ineligible and advertising a new epoch,
+// and callers that only serve traffic across the rotation have nothing to
+// protect against that case.
+func (p *Proxy) AdmitRotationEpoch() {
+	p.rotationEpoch.Add(1)
 }
 
 // SetRotationPhase advances the displayed phase (draining → rotating →
