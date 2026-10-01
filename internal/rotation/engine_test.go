@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/coord"
 	"rotation-proxy-gateway/internal/logging"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/socksdial"
@@ -1591,6 +1592,75 @@ func TestRunCancelAbandonsActiveProcedure(t *testing.T) {
 	case <-handlerDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("rotate API handler never finished")
+	}
+}
+
+// fencedCoordinator models the only result the engine needs to distinguish at
+// its terminal boundary: the authority rejected an otherwise verified rotation
+// because another instance acquired a newer fencing token. It intentionally has
+// no Redis implementation here — the live-Redis two-process tests prove the
+// script itself; this test proves the engine does not mutate its local pool
+// after the script says no.
+type fencedCoordinator struct {
+	lease   coord.Lease
+	commits atomic.Int64
+}
+
+func (c *fencedCoordinator) Held() coord.Lease { return c.lease }
+
+func (c *fencedCoordinator) TryAcquire(context.Context) (coord.Lease, error) { return c.lease, nil }
+
+func (c *fencedCoordinator) CommitRotation(context.Context, coord.Commit, func(coord.Epoch) int) (coord.Epoch, bool, error) {
+	c.commits.Add(1)
+	return coord.NoEpoch, false, coord.ErrFenced
+}
+
+func (*fencedCoordinator) AdoptAll(coord.Epoch, func(coord.Epoch) int) int { return 0 }
+
+// TestFencedCommitDoesNotMutateTheLocalPool guards the ordering that makes a
+// fencing token useful in the engine, not only in Redis. The procedure reaches
+// verification and sees a changed IP, but the authority refuses its old token.
+// The candidate must never become this process's lastIP, never increment local
+// or global success counters, never clear dial health, and never enter the
+// same-IP stale backoff path. runProcedure's abort cleanup returns the route to
+// serving, leaving the lease winner to drive the next procedure.
+func TestFencedCommitDoesNotMutateTheLocalPool(t *testing.T) {
+	const baseline, candidate = "203.0.113.7", "203.0.113.8"
+	ips := newIPServer(t, baseline)
+	api := newAPIServer(t)
+	spec := manualRoute(t, "m1.test", time.Minute, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: fastSettings(), ManualRoutes: []config.ManualRouteSpec{spec}}
+	s := newSetup(t, cfg, nil, ips)
+	coordinator := &fencedCoordinator{lease: coord.Lease{Name: "rotation", Owner: "stale-instance", Token: 1}}
+	s.e.UseCoordinator(coordinator, nil)
+
+	// The provider action really happened; this is specifically the late-owner
+	// case where a peer took the lease while A was mid-procedure.
+	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		ips.set(candidate)
+		w.WriteHeader(http.StatusOK)
+	})
+	s.e.bootPrecheck(context.Background(), s.gen)
+	s.runOne(spec)
+
+	if got := coordinator.commits.Load(); got != 1 {
+		t.Fatalf("authority commits = %d, want 1", got)
+	}
+	if got := s.e.Rotations(); got != 0 {
+		t.Fatalf("global rotations = %d, want 0 after a fenced commit", got)
+	}
+	if got := s.e.IPRevisits(); got != 0 {
+		t.Fatalf("global IP revisits = %d, want 0 after a fenced commit", got)
+	}
+	st := snapshotHost(t, s.pl, "m1.test").Rotation
+	if st.LastIP != baseline {
+		t.Fatalf("fenced procedure recorded lastIP %q, want the pre-procedure baseline %q", st.LastIP, baseline)
+	}
+	if st.RotationCount != 0 || st.IPRevisitCount != 0 {
+		t.Fatalf("fenced procedure updated local success counters: %+v", st)
+	}
+	if st.State != "idle" || st.ConsecutiveSameIP != 0 || st.NextRetryIn != "" {
+		t.Fatalf("fenced procedure entered a terminal failure state instead of returning to serving: %+v", st)
 	}
 }
 

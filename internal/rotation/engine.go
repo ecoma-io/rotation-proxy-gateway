@@ -355,58 +355,68 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 	// the collision set atomically with the record.
 	p.SetRotationPhase(pool.RotationVerifying)
 	enterPhase("verifying")
+	// coordinationRefused separates "the provider did not rotate" from "this
+	// instance may no longer publish the rotation it observed". The latter is
+	// not a health failure and must neither back off nor mark the route stale:
+	// the holder that won the lease owns the next procedure. runProcedure's
+	// normal abort cleanup returns this route to serving.
+	coordinationRefused := false
 	commit := func(ip string) commitOutcome {
 		if gone() {
 			return commitAborted
 		}
-		// The live pool decides both remaining questions in one critical
-		// section: whether this route is still a member of it (a reload may
-		// have removed or replaced it since the check above — that check is a
-		// fast path, not the guarantee), and whether a second procedure
-		// committed this same candidate between verify's screen above and
-		// here.
-		//
-		// The commit's timestamp is read before the pool is loaded so the pool
-		// committed into is the one live at the commit, not one observed a
-		// moment earlier: operand order decides which pool the check runs
-		// against, and the later load is the one whose answer is worth having.
-		at := e.Now()
-		revisit, err := e.store.Load().Pool.CommitRotation(e.store, p, ip, at)
-		if err == nil && e.coordinatorOrNil() != nil {
-			// Coordination is on: the cluster authority is the record of this
-			// rotation, and the local commit alone is not enough. The fenced
-			// commit runs immediately after the local one and is what makes the
-			// rotation cluster-wide.
-			//
-			// Order matters and is deliberate. The local commit first, then the
-			// distributed one: a fenced holder has already failed here on the
-			// token comparison, so it never reaches the local write either. A
-			// Redis outage, by contrast, must not stop this instance from
-			// recording what it verified locally — the route did rotate, and
-			// withholding that would lose real information.
+
+		// With coordination enabled, authority comes first. A stale holder must
+		// be rejected before it can write lastIP, counters, terminal rotation
+		// state, or dial health into its local pool. This call happens before —
+		// and never while holding — Pool.CommitRotation's mutex, so it is off the
+		// serving lock and off the request path.
+		authorityAccepted := false
+		if e.coordinatorOrNil() != nil {
 			switch outcome, _ := e.commitDistributed(ctx, p, id, baseline, ip, started); outcome {
 			case distributedFenced:
-				// Replaced mid-procedure. The local commit above already
-				// recorded the verified address, which is correct for this
-				// instance's own pool; the cluster record names the winner, and
-				// this instance must not treat that as a rotation failure.
-				// Route health is untouched: losing a lease proves nothing
-				// about the endpoint's reachability.
-				log.Warn().Msg("rotation committed locally but not in the cluster; another instance owns the rotation lease")
+				coordinationRefused = true
+				log.Warn().Msg("rotation not committed locally: this instance no longer owns the cluster rotation lease")
+				return commitAborted
+			case distributedCommitted:
+				authorityAccepted = true
 			case distributedDuplicate:
-				log.Debug().Msg("rotation already committed in the cluster for this attempt")
+				// A prior authority commit for this token survived a caller retry.
+				// Continue into the local critical section: it is still the only
+				// place that can decide whether this generation contains the route
+				// and whether a local manual route holds this candidate.
+				authorityAccepted = true
+				log.Debug().Msg("rotation already committed in the cluster for this attempt; applying it to the local generation")
 			}
 		}
+
+		// The live pool decides both remaining local questions in one critical
+		// section: whether this route is still a member of it (a reload may have
+		// removed or replaced it since the check above), and whether another
+		// local procedure committed this same candidate between verify's screen
+		// and here. Redis is deliberately not held under this mutex.
+		at := e.Now()
+		revisit, err := e.store.Load().Pool.CommitRotation(e.store, p, ip, at)
 		switch {
 		case errors.Is(err, pool.ErrRotationRouteGone):
 			// The route left the live pool while the procedure was verifying.
-			// Nothing was recorded, and the route this procedure owns no
+			// Nothing was recorded locally, and the route this procedure owns no
 			// longer serves traffic, so the attempt must not be reported as a
 			// rotation failure either: unwinding as an abort is what lets the
 			// caller stop without marking the route stale or backing it off.
 			log.Debug().Str("egress_ip", ip).Msg("route left the live pool before the commit")
 			return commitAborted
 		case err != nil: // pool.ErrRotationCollision
+			if authorityAccepted {
+				// The cluster has already committed this exact candidate. Trying
+				// another candidate with the same fencing token would only get the
+				// first commit back as a duplicate, and could make the local pool
+				// record an IP the authority never accepted. The authority-side
+				// global collision reservation is a separate concern; locally, stop
+				// rather than inventing a second outcome for this token.
+				log.Warn().Str("egress_ip", ip).Msg("cluster rotation committed but the live local pool rejected the candidate; leaving local bookkeeping unchanged")
+				return commitAborted
+			}
 			return commitLateCollision
 		}
 		// 5. Success: the new IP became the baseline, dial health earned by
@@ -426,7 +436,7 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 	}
 	changed := e.verify(ctx, gen, spec, p, baseline, verified, settings, apiErr != nil, log, commit)
 
-	if gone() {
+	if gone() || coordinationRefused {
 		return true
 	}
 	if apiErr != nil {
