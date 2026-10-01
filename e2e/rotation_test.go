@@ -453,9 +453,8 @@ func TestRotationDeadRouteRotatesUnverified(t *testing.T) {
 }
 
 // TestRotationSingleManualRouteWindowNoRoute: while the only route is
-// mid-rotation the client's CONNECT gets the general-failure reply (no-route
-// window, surfaced as a SOCKS transport error, not an HTTP status); afterwards
-// traffic flows again.
+// mid-rotation the client's request is rejected (no-route window, surfaced as
+// a gateway status reject); afterwards traffic flows again.
 func TestRotationSingleManualRouteWindowNoRoute(t *testing.T) {
 	skipShort(t)
 	rt := newRotationTest(t, 1)
@@ -474,9 +473,9 @@ func TestRotationSingleManualRouteWindowNoRoute(t *testing.T) {
 	sawNoRoute := false
 	deadline := time.Now().Add(6 * time.Second)
 	for time.Now().Before(deadline) {
-		conn, err := dialSocksTunnel(context.Background(), g.MixedAddr, echo.Host)
+		conn, err := connectTunnel(context.Background(), g.MixedAddr, echo.Host)
 		if err != nil {
-			if strings.Contains(err.Error(), "reply 0x01") {
+			if httpStatusOf(err) == http.StatusServiceUnavailable {
 				sawNoRoute = true
 				break
 			}
@@ -764,7 +763,7 @@ func TestRotationLifecycleStatesVisibleInStatus(t *testing.T) {
 	// the request is mid-flight (it ends ~5.9s), the interval fires at the
 	// first tick past 4s, and the drain waits for it before rotating. The
 	// body must be read to completion: client.Get returns at the headers, and
-	// closing the body there would tear down the one-tunnel-per-request SOCKS
+	// closing the body there would tear down the one-request-per-connection
 	// relay early, releasing the route's in-flight hold before the drain.
 	time.Sleep(3400 * time.Millisecond)
 	go func() {

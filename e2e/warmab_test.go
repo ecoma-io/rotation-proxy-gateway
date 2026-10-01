@@ -109,7 +109,7 @@ func tunnelLoad(tb testing.TB, proxyAddr, target string, window time.Duration) *
 	for time.Now().Before(deadline) {
 		ctx, cancel := context.WithTimeout(context.Background(), haPerOp)
 		setupStart := time.Now()
-		conn, err := dialSocksTunnel(ctx, proxyAddr, target)
+		conn, err := connectTunnel(ctx, proxyAddr, target)
 		cancel()
 		ok := err == nil
 		if ok {

@@ -20,4 +20,8 @@ commit-msg:
 pre-push:
   commands:
     test:
-      run: go test ./...
+      # The e2e package needs more than Go's default 600s per-package timeout —
+      # it drives the real binary through the whole suite. CI runs it the same
+      # way, with the same 25m budget, so a push is gated by exactly what CI
+      # will run rather than by a stricter local accident.
+      run: go test -timeout 25m ./...

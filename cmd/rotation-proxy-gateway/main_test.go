@@ -316,7 +316,7 @@ func captureWarnOutput(t *testing.T, cfg *config.RuntimeConfig, bootstrap *confi
 
 // warnUnavailableListenerMsg is the fixed message of the
 // warnUnavailableKindListeners records; the listener name rides in a field.
-const warnUnavailableListenerMsg = "listener has no eligible routes; replying a general SOCKS failure"
+const warnUnavailableListenerMsg = "listener has no eligible routes; replying 503 Service Unavailable"
 
 func TestWarnUnavailableKindListeners(t *testing.T) {
 	v4only := warnTestConfig(t, config.EgressV4)

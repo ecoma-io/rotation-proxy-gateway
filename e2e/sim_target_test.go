@@ -1,12 +1,15 @@
 package e2e_test
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -62,6 +65,99 @@ func NewHeaderCaptureTarget(t testing.TB, seen chan<- http.Header) *TargetSim {
 	}))
 	t.Cleanup(srv.Close)
 	return fromServer(srv)
+}
+
+// ObservedRequest is one raw request-line and header observation at an origin.
+// RequestLine comes from the wire before net/http normalizes the request target,
+// so absolute-form forwarding tests can distinguish it from origin form.
+type ObservedRequest struct {
+	RequestLine string
+	Host        string
+	Header      http.Header
+}
+
+// NewRequestLineEchoTarget starts a raw HTTP origin that records the exact
+// request line, parsed Host, and headers it receives. It writes a minimal
+// HTTP/1.1 response itself instead of using net/http's server parser, which
+// would discard the raw form this simulator needs to observe.
+func NewRequestLineEchoTarget(t testing.TB) (*TargetSim, <-chan ObservedRequest) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(chan ObservedRequest, 32)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				br := bufio.NewReader(c)
+				line, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+				head, err := textproto.NewReader(br).ReadMIMEHeader()
+				if err != nil {
+					return
+				}
+				parts := strings.SplitN(line, " ", 3)
+				if len(parts) != 3 {
+					return
+				}
+				select {
+				case seen <- ObservedRequest{RequestLine: line, Host: head.Get("Host"), Header: http.Header(head)}:
+				default:
+				}
+				_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\norigin-ok")
+			}(conn)
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+	return &TargetSim{Host: ln.Addr().String(), URL: "http://" + ln.Addr().String()}, seen
+}
+
+// NewPipelinedEchoTarget starts a raw origin that echoes whatever bytes it
+// receives. It exists for the CONNECT-pipelining regression: a client that
+// writes its request head and its first payload in one syscall needs those
+// payload bytes to survive the gateway's header parsing intact.
+func NewPipelinedEchoTarget(t testing.TB) *TargetSim {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+	return &TargetSim{Host: ln.Addr().String(), URL: "http://" + ln.Addr().String()}
+}
+
+// ReadObservedRequest returns the next raw-origin observation, failing the
+// test when no request arrives inside timeout.
+func ReadObservedRequest(t testing.TB, seen <-chan ObservedRequest, timeout time.Duration) ObservedRequest {
+	t.Helper()
+	select {
+	case obs := <-seen:
+		return obs
+	case <-time.After(timeout):
+		t.Fatalf("origin recorded no request within %s", timeout)
+		return ObservedRequest{}
+	}
 }
 
 func fromServer(srv *httptest.Server) *TargetSim {

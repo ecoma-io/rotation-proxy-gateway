@@ -8,10 +8,11 @@ import (
 	"rotation-proxy-gateway/internal/pool"
 )
 
-// socksTargetLogValue keeps only the normalized host:port of a SOCKS target.
+// targetLogValue keeps only the normalized host:port of an inbound target.
 // Credentials inside a target string must never survive, whether or not the
-// target parses as host:port.
-func TestSocksTargetLogValueFallbacks(t *testing.T) {
+// target parses as host:port — the ingress is HTTP, but the value it logs is
+// still an authority-shaped string and the userinfo defense is unchanged.
+func TestTargetLogValueFallbacks(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		input string
@@ -25,13 +26,13 @@ func TestSocksTargetLogValueFallbacks(t *testing.T) {
 		{"empty", "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := socksTargetLogValue(tc.input)
+			got := targetLogValue(tc.input)
 			if got != tc.want {
-				t.Fatalf("socksTargetLogValue(%q) = %q, want %q", tc.input, got, tc.want)
+				t.Fatalf("targetLogValue(%q) = %q, want %q", tc.input, got, tc.want)
 			}
 			for _, secret := range []string{"TESTUSER", "TESTPASS"} {
 				if strings.Contains(got, secret) {
-					t.Fatalf("socksTargetLogValue(%q) leaked credentials: %q", tc.input, got)
+					t.Fatalf("targetLogValue(%q) leaked credentials: %q", tc.input, got)
 				}
 			}
 		})

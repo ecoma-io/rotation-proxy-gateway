@@ -109,10 +109,10 @@ func reportLoad(b *testing.B, prefix string, r *loadResult) {
 }
 
 // runLoad drives workers fetching one small HTTP response per fresh tunnel
-// through a gateway SOCKS listener for window. Each operation is bounded by
+// through a gateway proxy listener for window. Each operation is bounded by
 // perOp; it returns once the window elapses and every worker finished its
 // current operation. A worker stuck past perOp unwinds at worst at the
-// gateway's own 30s inbound handshake deadline, which is a broken-gateway
+// gateway's own 30s inbound request deadline, which is a broken-gateway
 // condition a benchmark window cannot survive anyway.
 func runLoad(tb testing.TB, proxyAddr, target string, workers int, window, perOp time.Duration) *loadResult {
 	tb.Helper()
@@ -137,14 +137,14 @@ func runLoad(tb testing.TB, proxyAddr, target string, workers int, window, perOp
 	return res
 }
 
-// oneLoadOp is one load operation: a fresh inbound SOCKS5 tunnel plus one
+// oneLoadOp is one load operation: a fresh inbound CONNECT tunnel plus one
 // minimal HTTP request, so the operation cost includes exactly the setup
 // work a warm upstream connection could skip.
 func oneLoadOp(proxyAddr, target string, timeout time.Duration) (bool, time.Duration) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	conn, err := dialSocksTunnel(ctx, proxyAddr, target)
+	conn, err := connectTunnel(ctx, proxyAddr, target)
 	if err != nil {
 		return false, time.Since(start)
 	}

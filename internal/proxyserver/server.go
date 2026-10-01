@@ -1,17 +1,15 @@
-// Package proxyserver implements the inbound SOCKS5 proxy. Client connections
-// speak RFC 1928 CONNECT, with no authentication unless a bootstrap account is
-// configured (RFC 1929); every accepted tunnel is relayed through SOCKS5
-// routes from the shared health-aware pool.
+// Package proxyserver implements the inbound HTTP forward proxy. Client
+// connections send HTTP/1.1 CONNECT or absolute-form HTTP requests; every
+// request reaches its target through a SOCKS5H route from the shared
+// health-aware pool.
 package proxyserver
 
 import (
-	"bufio"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,35 +35,10 @@ import (
 // success reply is written so established tunnels have no timeouts.
 const inboundHandshakeTimeout = 30 * time.Second
 
-// SOCKS5 wire constants (RFC 1928).
-const (
-	socksVersion             = 0x05
-	socksAuthNone            = 0x00
-	socksAuthUserPass        = 0x02
-	socksAuthUnaccepted      = 0xff
-	socksCmdConnect          = 0x01
-	socksCmdBind             = 0x02
-	socksCmdUDPAssociate     = 0x03
-	socksAtypIPv4            = 0x01
-	socksAtypDomain          = 0x03
-	socksAtypIPv6            = 0x04
-	socksReplySuccess        = 0x00
-	socksReplyGeneral        = 0x01
-	socksReplyCmdUnsupported = 0x07
-)
-
-// RFC 1929 username/password subnegotiation constants: one version byte
-// (0x01) framing ULEN/UNAME/PLEN/PASSWD and a one-byte status in the reply.
-const (
-	authUPVersion = 0x01
-	authUPSuccess = 0x00
-	authUPFailure = 0xff
-)
-
-// errInboundAuth marks a completed RFC 1929 exchange whose credentials did
-// not match the configured account: the failure reply was already written,
-// so the caller only logs and closes. It never carries credential bytes.
-var errInboundAuth = errors.New("inbound authentication rejected")
+// inboundBufSize keeps enough room for ordinary HTTP request headers while the
+// framing path still has a hard upper bound for adversarial inputs. It is shared
+// by the HTTP parser and CONNECT's read-ahead preservation wrapper.
+const inboundBufSize = 4 << 10
 
 // credentialDigestSize is the fixed length every credential field is reduced
 // to before any comparison: constant-time comparison cannot depend on field
@@ -102,11 +75,11 @@ func credentialDigest(field []byte) [credentialDigestSize]byte {
 	return digest
 }
 
-// inboundAccount is the RFC 1929 credential pair a server demands from every
+// inboundAccount is the HTTP Basic credential pair a server demands from every
 // client, held as digests of the configured fields: digesting the configured
-// pair once keeps the per-session cost at digesting the presented fields, and
+// pair once keeps the per-request cost at digesting the presented fields, and
 // the fixed digest length keeps the configured field lengths out of the
-// comparison. A nil pointer keeps the historical NO AUTHENTICATION handshake.
+// comparison. A nil pointer leaves the forward proxy unauthenticated.
 type inboundAccount struct {
 	usernameSum [credentialDigestSize]byte
 	passwordSum [credentialDigestSize]byte
@@ -120,6 +93,19 @@ func newInboundAccount(username, password []byte) *inboundAccount {
 	}
 }
 
+// credentialsMatch compares presented HTTP Basic credentials against the
+// configured account without leaking which field mismatched or either side's
+// field lengths. Every field is reduced to a fixed-length digest first, and
+// both comparisons always execute so a wrong username never skips password
+// comparison (and vice versa).
+func credentialsMatch(account *inboundAccount, username, password []byte) bool {
+	usernameSum := credentialDigest(username)
+	passwordSum := credentialDigest(password)
+	userOK := subtle.ConstantTimeCompare(usernameSum[:], account.usernameSum[:])
+	passOK := subtle.ConstantTimeCompare(passwordSum[:], account.passwordSum[:])
+	return userOK&passOK == 1
+}
+
 // WarmBorrower is the serving path's window into the warm pool. Borrow is a
 // non-blocking pop: nil means dial cold, exactly as before the pool existed.
 // DiscardRoute drops the route's parked siblings after a borrowed connection
@@ -129,7 +115,7 @@ type WarmBorrower interface {
 	DiscardRoute(*pool.Proxy)
 }
 
-// Server is the inbound SOCKS5 listener handler.
+// Server is the inbound HTTP forward-proxy listener handler.
 type Server struct {
 	store    *pool.Store
 	log      zerolog.Logger
@@ -141,9 +127,9 @@ type Server struct {
 	// test Server) keeps the cold dial path. It is set once, before Serve
 	// starts, and read-only afterwards.
 	warm WarmBorrower
-	// account, when non-nil, switches the inbound handshake to mandatory
-	// RFC 1929 username/password authentication. Set once, before Serve
-	// starts, and read-only afterwards; nil keeps no-authentication.
+	// account, when non-nil, requires HTTP Basic proxy authentication on every
+	// request. Set once, before Serve starts, and read-only afterwards; nil
+	// keeps the forward proxy unauthenticated.
 	account *inboundAccount
 
 	cmu   sync.Mutex
@@ -313,10 +299,10 @@ func (s *Server) UseWarmPool(w WarmBorrower) {
 	s.warm = w
 }
 
-// UseInboundAccount arms mandatory RFC 1929 username/password authentication
-// for every session on this listener. It must be called before Serve;
-// afterwards the field is read-only. The configured pair is reduced to
-// digests immediately, so the caller's slices are not retained.
+// UseInboundAccount arms mandatory HTTP Basic proxy authentication for every
+// request on this listener. It must be called before Serve; afterwards the
+// field is read-only. The configured pair is reduced to digests immediately,
+// so the caller's slices are not retained.
 func (s *Server) UseInboundAccount(username, password []byte) {
 	s.account = newInboundAccount(username, password)
 }
@@ -367,698 +353,6 @@ func generationSettings(gen *pool.Generation) sessionSettings {
 // settings from that same snapshot.
 func (s *Server) settings() sessionSettings {
 	return generationSettings(s.generation())
-}
-
-// serveConn runs one client session: SOCKS5 greeting, one CONNECT request, and
-// the established-tunnel relay. Protocol-level rejects log under
-// error_kind=bad_request and never advance the request counter or touch the
-// pool; only a valid CONNECT does both.
-func (s *Server) serveConn(conn net.Conn) {
-	defer s.untrackConn(conn)
-	defer conn.Close() //nolint:errcheck // relay shutdown handles write failure
-
-	// The deadline covers greeting, request, and reply framing — the whole
-	// retry chain included; the success path re-arms it for the reply and
-	// clears it before relaying.
-	deadline := time.Now().Add(inboundHandshakeTimeout)
-	conn.SetDeadline(deadline) //nolint:errcheck // best-effort hardening
-
-	// One pooled reader frames the whole inbound exchange: the greeting and
-	// CONNECT frame then cost one or two socket reads instead of one per
-	// field, and bytes the client pipelined behind the frame stay available
-	// for the relay instead of being dropped.
-	br := inboundBufPool.Get().(*bufio.Reader)
-	br.Reset(conn)
-	defer func() {
-		br.Reset(nil)
-		inboundBufPool.Put(br)
-	}()
-
-	req, err := readSocksRequest(br, conn, s.account)
-	if err != nil {
-		// A rejected credential is a terminal failure an operator who armed
-		// authentication needs to see; every other framing reject stays flow
-		// detail at debug. Neither line carries credential bytes.
-		if errors.Is(err, errInboundAuth) {
-			s.log.Warn().Str("error_kind", "auth_rejected").Msg("socks authentication rejected")
-			return
-		}
-		s.log.Debug().Str("error_kind", "bad_request").Str("error", socksRejectLogValue(err)).Msg("socks request rejected")
-		return
-	}
-	if req.cmd != socksCmdConnect {
-		writeSocksReply(conn, socksReplyCmdUnsupported) //nolint:errcheck // the connection closes either way
-		s.log.Debug().Str("error_kind", "bad_request").Msg("socks command not supported")
-		return
-	}
-
-	requestID := s.requests.Add(1)
-	log := s.log.With().Int64("request_id", int64(requestID)).Logger()
-	// A client that pipelined payload behind the CONNECT frame must have
-	// those bytes relayed, not dropped: they ride a prefix wrapper ahead of
-	// the socket reads.
-	client := conn
-	if n := br.Buffered(); n > 0 {
-		prefix := make([]byte, n)
-		if _, err := io.ReadFull(br, prefix); err != nil {
-			// The framing socket just failed; there is nothing to serve.
-			return
-		}
-		client = &prefixConn{Conn: conn, prefix: prefix}
-	}
-	s.serveTunnel(client, req.target, deadline, log)
-}
-
-// serveTunnel dials the target through the pool with the retry/exclude loop,
-// sends the success reply once, and relays until either side ends the stream.
-// It loads one generation for the whole session so route picks, health
-// reports, and the routing policy stay consistent across reloads — a
-// target's candidate set always comes from the same snapshot as the pool it
-// narrows. handshakeDeadline is the inbound framing window serveConn armed;
-// the retry chain must fit inside it.
-func (s *Server) serveTunnel(clientConn net.Conn, target socksdial.Target, handshakeDeadline time.Time, log zerolog.Logger) {
-	gen := s.generation()
-	settings := generationSettings(gen)
-	start := time.Now()
-	// host:port is the pool-state and log identity; target.Type is the wire
-	// address type the outbound CONNECT carries. Both descend from the
-	// inbound frame, retries included.
-	targetAddr := target.Addr()
-	logTarget := socksTargetLogValue(targetAddr)
-	log.Debug().Str("target", logTarget).Msg("tunnel start")
-
-	// Routing resolves the target before the first pick, against this
-	// request's own generation: the match returns the candidate names and
-	// Pool.Scope binds them to concrete routes in one frozen pass. A nil
-	// set means no routing policy applies: the listener's kind filter
-	// alone, the historical path with no per-request allocation. A non-nil
-	// scope — empty included — is the complete candidate set for the whole
-	// request: the pool stays the sole authority on health, cooldown, and
-	// order, but only routes in the scope can be picked. The closure is
-	// built once per tunnel and reused by every attempt, so a fallback
-	// never leaves the target's routing scope — and because membership is
-	// pointer identity against a resolution taken at request start, a
-	// reload that renames or moves route labels mid-request re-scopes only
-	// requests that load the new generation, never this one.
-	candidates := gen.Pool.Scope(gen.Router.Match(target))
-	allow := s.allow
-	if candidates != nil {
-		restricted, listenerAllow := candidates, s.allow
-		allow = func(p *pool.Proxy) bool {
-			_, ok := restricted[p]
-			return ok && (listenerAllow == nil || listenerAllow(p))
-		}
-	}
-
-	exclude := map[*pool.Proxy]bool{}
-	var upstream net.Conn
-	var chosen *pool.Proxy
-	var attempts int
-	// exhausted distinguishes why the chain ended with no tunnel. true means
-	// the retry budget ran out while the pool could still supply routes; the
-	// loop breaks on the *next* pick when the cap is already reached, so a
-	// final attempt that succeeded or failed in-band is never misread as an
-	// untried leftover. false means the last pick itself came back nil — no
-	// eligible untried route remained.
-	exhausted := false
-	for attempt := 0; ; attempt++ {
-		// A retry dials again under the inbound handshake window. Once that
-		// window is gone — a slow retry chain, most plausibly a vanished
-		// client — further attempts would spend route health on a client
-		// that can no longer be answered.
-		if attempt > 0 && !time.Now().Before(handshakeDeadline) {
-			writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the client is gone either way
-			log.Warn().Str("target", logTarget).Int("attempts", attempts).
-				Str("error_kind", errorKindSetup).Str("duration", logDuration(time.Since(start))).
-				Msg("inbound handshake deadline expired before the next attempt")
-			return
-		}
-		// The budget ends the chain before picking: a pick would have
-		// succeeded -- eligible routes remain -- so this is retry exhaustion,
-		// not route exhaustion.
-		if attempt >= settings.maxRetries {
-			exhausted = true
-			break
-		}
-		// Both exits above end the iteration before this pick, so neither can
-		// leave an in-flight hold behind: a hold exists only between the pick
-		// below and the release that closes out the same attempt — an explicit
-		// release on every pre-tunnel failure, or the deferred one the winner
-		// registers further down.
-		p := gen.Pool.PickFor(exclude, allow, targetAddr)
-		if p == nil {
-			break
-		}
-		attempts = attempt + 1
-		if log.Debug().Enabled() {
-			ev := log.Debug().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
-				Int("attempt", attempts).Int("excluded", len(exclude))
-			// route_id names the pick only when routing narrowed this
-			// target; the legacy path keeps its exact historical shape.
-			if candidates != nil {
-				ev = ev.Str("route_id", p.RouteID())
-			}
-			// A pick from the all-cooling fallback arrives with cooldown left;
-			// the size of that bet is the whole point of the line.
-			if cd := gen.Pool.CoolingFor(p, targetAddr); cd > 0 {
-				ev = ev.Str("cooldown_remaining", logDuration(cd))
-			}
-			ev.Msg("route selected")
-		}
-		up, err := s.dialWarmFirst(s.baseCtx, p, target, settings.dialTimeout)
-		if err != nil {
-			// This attempt never established a tunnel, so its in-flight hold
-			// ends here — classified and reported first, then released, at the
-			// same point the route is excluded. Carrying the hold any further
-			// would make the route look busy to a rotation drain, and to
-			// /status, for as long as a later attempt's tunnel lives.
-			switch {
-			case isProxyDialError(err):
-				cooldown := gen.Pool.ReportFailure(p, err)
-				exclude[p] = true
-				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
-					Int("attempt", attempts).Str("error_kind", errorKindProxyConnect).
-					Str("error", logErrorValue(err)).Str("cooldown", cooldown.String()).
-					Msg("upstream dial failed")
-				p.Release()
-			case isConnectTargetError(err):
-				// The endpoint answered CONNECT itself: the route works and
-				// only the (route, target) pair is refused, so the cooldown
-				// lands on the pair and the route stays eligible for every
-				// other target. Same retry treatment as socks_connect.
-				cooldown := gen.Pool.ReportTargetFailure(p, targetAddr, err)
-				exclude[p] = true
-				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
-					Int("attempt", attempts).Str("error_kind", errorKindConnectTarget).
-					Str("error", logErrorValue(err)).Str("cooldown", cooldown.String()).
-					Msg("upstream refused connect target")
-				p.Release()
-			case isSocksHandshakeError(err):
-				cooldown := gen.Pool.ReportFailure(p, err)
-				exclude[p] = true
-				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
-					Int("attempt", attempts).Str("error_kind", errorKindSocksConnect).
-					Str("error", logErrorValue(err)).Str("cooldown", cooldown.String()).
-					Msg("upstream handshake failed")
-				p.Release()
-			case isProxyAuthError(err):
-				gen.Pool.ReportAuthBlocked(p, err)
-				exclude[p] = true
-				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
-					Int("attempt", attempts).Str("error_kind", errorKindAuthRoute).
-					Str("error", logErrorValue(err)).
-					Msg("upstream auth failed")
-				p.Release()
-			default:
-				writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the connection closes either way
-				log.Warn().Str("target", logTarget).Str("upstream", upstreamLogValue(p)).
-					Int("attempt", attempts).Str("error_kind", logErrorKind(err)).Str("error", logErrorValue(err)).
-					Str("duration", logDuration(time.Since(start))).
-					Msg("upstream setup failed")
-				p.Release()
-				return
-			}
-			// A fallback is a real handoff to another attempt; the final
-			// attempt's failure is terminal, not a fallback.
-			if attempt+1 < settings.maxRetries {
-				s.failovers.Add(1)
-			}
-			continue
-		}
-		gen.Pool.ReportSuccess(p, targetAddr)
-		upstream, chosen = up, p
-		break
-	}
-	if upstream == nil {
-		kind := errorKindNoRoute
-		if exhausted {
-			kind = errorKindRetryExhausted
-		}
-		writeSocksReply(clientConn, socksReplyGeneral) //nolint:errcheck // the connection closes either way
-		// The three counts read as one funnel: the pool's whole size, the
-		// listener's kind view of it, and — when routing restricts this
-		// target — the candidate scope the policy left open. routing_candidates
-		// absent means no routing block is configured; 0 present is the
-		// fail-closed unmatched target.
-		ev := log.Warn().Str("target", logTarget).Int("attempts", attempts).
-			Int("pool_size", gen.Pool.Size()).Int("kind_routes", gen.Pool.CountAllowed(s.allow)).
-			Int("excluded", len(exclude)).
-			Str("error_kind", kind).Str("duration", logDuration(time.Since(start)))
-		if candidates != nil {
-			ev = ev.Int("routing_candidates", len(candidates))
-		}
-		ev.Msg("tunnel failed")
-		return
-	}
-	// The winning pick — the one attempt that really established a tunnel —
-	// holds its in-flight slot for the tunnel's whole lifetime, and this
-	// deferred release is the single thing that ends the hold: the relay has
-	// returned and the close record is written by the time serveTunnel exits.
-	// A failed attempt's hold never reaches here; it was released at its own
-	// failure point above.
-	defer chosen.Release()
-	// Framing gets a fresh inbound window: the original deadline may be
-	// nearly spent after a retry chain, and the established tunnel must not
-	// inherit a deadline from its handshake.
-	clientConn.SetDeadline(time.Now().Add(inboundHandshakeTimeout)) //nolint:errcheck // best-effort hardening
-	writeSocksReply(clientConn, socksReplySuccess)                  //nolint:errcheck // relay shutdown handles write failure
-	// Established tunnels carry no timeouts.
-	clientConn.SetDeadline(time.Time{}) //nolint:errcheck // best-effort hardening
-	log.Info().Str("target", logTarget).Str("upstream", upstreamLogValue(chosen)).
-		Int("attempts", attempts).Str("duration", logDuration(time.Since(start))).
-		Msg("tunnel")
-
-	// Relay until both directions end. Established tunnels carry no health or
-	// retry semantics; the close record is the only trace of which side ended
-	// the stream first and why.
-	closes := make(chan relayResult, 2)
-	// relayDone closes only after the response relay armed its teardown
-	// options and closed the client side, so the handler's own deferred
-	// client close can never race ahead of an armed reset.
-	relayDone := make(chan struct{})
-	go func() {
-		defer close(relayDone)
-		n, err := copyToClient(clientConn, upstream)
-		// Send before teardown: whichever result lands first is the cause;
-		// the one our own closes unblock is the artifact.
-		closes <- relayResult{direction: relayToClient, bytes: n, err: err}
-		if isUpstreamBreak(err) {
-			// A broken upstream must not masquerade as a clean end of stream:
-			// reset the client side so a truncated stream stays truncated.
-			// tcpConnOf looks through the pipelining prefix wrapper, so the
-			// reset reaches the socket for pipelining clients too.
-			if tc := tcpConnOf(clientConn); tc != nil {
-				// Best-effort: a failed SO_LINGER still leaves the close to
-				// end the stream, just with a FIN instead of a RST.
-				_ = tc.SetLinger(0)
-				log.Debug().Msg("upstream broke the tunnel; client side set to reset on close")
-			}
-		}
-		_ = clientConn.Close() // unblocks the client-to-upstream direction
-	}()
-	n, err := copyWithPooledBuffer(upstream, clientConn)
-	if err == nil {
-		// A clean end of the client-to-upstream direction is a client
-		// half-close: one direction ended while the response direction may
-		// still carry bytes. Propagate the FIN to the upstream and keep
-		// relaying until the response ends on its own — the gateway never
-		// terminates a tunnel the client still has open. A full client close
-		// is indistinguishable here and gets the same relay: a write to a
-		// vanished client fails by itself, ending the response direction.
-		if cw, ok := upstream.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite() //nolint:errcheck // best-effort FIN propagation
-		}
-		// The response relay's result is guaranteed queued once relayDone
-		// closes (it defers after its send), so waiting there — not on the
-		// shared channel, which would hand back this direction's own result
-		// — is what keeps the session alive until the response truly ends.
-		select {
-		case <-relayDone:
-		case <-s.baseCtx.Done():
-			// Shutdown's force-close already closed the client side; unblock
-			// the response relay the way an abort teardown does, so the
-			// session cannot linger on a parked upstream.
-			_ = upstream.Close()
-			<-relayDone
-		}
-		second := <-closes
-		_ = upstream.Close() //nolint:errcheck // best-effort: the response direction ended
-		recordTunnelClose(log, logTarget, chosen, start,
-			relayResult{direction: relayToUpstream, bytes: n}, second)
-		return
-	}
-	closes <- relayResult{direction: relayToUpstream, bytes: n, err: err}
-	upstream.Close()   //nolint:errcheck // best-effort teardown
-	clientConn.Close() //nolint:errcheck // unblocks the other direction
-	first := <-closes
-	second := <-closes // the forced close of the remaining side is an artifact
-	<-relayDone        // the reset, when armed, lands before this returns
-	recordTunnelClose(log, logTarget, chosen, start, first, second)
-}
-
-// socksRequest is one parsed inbound CONNECT-able request: the target, whose
-// address type is the inbound frame's own ATYP (the wire truth the outbound
-// CONNECT must reproduce), and the requested command.
-type socksRequest struct {
-	target socksdial.Target
-	cmd    byte
-}
-
-// readSocksRequest performs the RFC 1928 greeting and reads one request. With
-// a nil account the only accepted method is NO AUTHENTICATION REQUIRED; with
-// an account configured the only accepted method is username/password
-// (RFC 1929) — a configured credential is mandatory, not offered as an
-// alternative to 0x00. Reads come from br so a buffered framing captures the
-// whole exchange in as few socket reads as possible; protocol replies are
-// written to w. Parse failures return an error and the connection must simply
-// close: the RFC defines no reply for a request the server could not parse,
-// and an unknown address type makes the frame length unknowable. Parseable
-// but unsupported commands (BIND, UDP ASSOCIATE) return with the command so
-// the caller can answer 0x07.
-func readSocksRequest(br *bufio.Reader, w io.Writer, account *inboundAccount) (socksRequest, error) {
-	// Greeting: VER NMETHODS METHODS...
-	head := make([]byte, 2)
-	if _, err := io.ReadFull(br, head); err != nil {
-		return socksRequest{}, fmt.Errorf("read greeting: %w", err)
-	}
-	if head[0] != socksVersion {
-		return socksRequest{}, fmt.Errorf("unexpected SOCKS version 0x%02x", head[0])
-	}
-	if head[1] == 0 {
-		return socksRequest{}, errors.New("empty method list")
-	}
-	methods := make([]byte, head[1])
-	if _, err := io.ReadFull(br, methods); err != nil {
-		return socksRequest{}, fmt.Errorf("read methods: %w", err)
-	}
-	var want byte = socksAuthNone
-	if account != nil {
-		want = socksAuthUserPass
-	}
-	offered := false
-	for _, m := range methods {
-		if m == want {
-			offered = true
-			break
-		}
-	}
-	if !offered {
-		w.Write([]byte{socksVersion, socksAuthUnaccepted}) //nolint:errcheck // the connection closes either way
-		return socksRequest{}, errors.New("no acceptable authentication method")
-	}
-	if _, err := w.Write([]byte{socksVersion, want}); err != nil {
-		return socksRequest{}, fmt.Errorf("write method selection: %w", err)
-	}
-	if account != nil {
-		if err := readUserPassAuth(br, w, account); err != nil {
-			return socksRequest{}, err
-		}
-	}
-
-	// Request: VER CMD RSV ATYP DST.ADDR DST.PORT
-	req := make([]byte, 4)
-	if _, err := io.ReadFull(br, req); err != nil {
-		return socksRequest{}, fmt.Errorf("read request: %w", err)
-	}
-	if req[0] != socksVersion {
-		return socksRequest{}, fmt.Errorf("unexpected request version 0x%02x", req[0])
-	}
-	if req[2] != 0x00 {
-		return socksRequest{}, fmt.Errorf("non-zero reserved byte 0x%02x", req[2])
-	}
-	switch atyp := req[3]; atyp {
-	case socksAtypIPv4:
-		addr := make([]byte, 6)
-		if _, err := io.ReadFull(br, addr); err != nil {
-			return socksRequest{}, fmt.Errorf("read IPv4 target: %w", err)
-		}
-		target, err := socksTarget(socksdial.AddrIPv4, addr[:4], addr[4:])
-		if err != nil {
-			return socksRequest{}, err
-		}
-		return socksRequest{target: target, cmd: req[1]}, nil
-	case socksAtypDomain:
-		lenByte := make([]byte, 1)
-		if _, err := io.ReadFull(br, lenByte); err != nil {
-			return socksRequest{}, fmt.Errorf("read domain length: %w", err)
-		}
-		if lenByte[0] == 0 {
-			return socksRequest{}, errors.New("empty domain name")
-		}
-		name := make([]byte, lenByte[0])
-		if _, err := io.ReadFull(br, name); err != nil {
-			return socksRequest{}, fmt.Errorf("read domain target: %w", err)
-		}
-		portBytes := make([]byte, 2)
-		if _, err := io.ReadFull(br, portBytes); err != nil {
-			return socksRequest{}, fmt.Errorf("read domain port: %w", err)
-		}
-		target, err := socksTarget(socksdial.AddrDomain, name, portBytes)
-		if err != nil {
-			return socksRequest{}, err
-		}
-		return socksRequest{target: target, cmd: req[1]}, nil
-	case socksAtypIPv6:
-		addr := make([]byte, 18)
-		if _, err := io.ReadFull(br, addr); err != nil {
-			return socksRequest{}, fmt.Errorf("read IPv6 target: %w", err)
-		}
-		target, err := socksTarget(socksdial.AddrIPv6, addr[:16], addr[16:])
-		if err != nil {
-			return socksRequest{}, err
-		}
-		return socksRequest{target: target, cmd: req[1]}, nil
-	default:
-		return socksRequest{}, fmt.Errorf("unsupported address type 0x%02x", atyp)
-	}
-}
-
-// readUserPassAuth performs the RFC 1929 username/password subnegotiation:
-// VER ULEN UNAME PLEN PASSWD in, VER STATUS back. A mismatch writes the
-// failure reply and returns errInboundAuth — the caller closes, never logs
-// credential bytes. Malformed frames (bad version, truncation) return an
-// error with no reply, the same close-silently doctrine as the rest of the
-// inbound framing.
-func readUserPassAuth(br *bufio.Reader, w io.Writer, account *inboundAccount) error {
-	ver := make([]byte, 2) // VER, ULEN
-	if _, err := io.ReadFull(br, ver); err != nil {
-		return fmt.Errorf("read auth version: %w", err)
-	}
-	if ver[0] != authUPVersion {
-		return fmt.Errorf("unexpected auth version 0x%02x", ver[0])
-	}
-	uname := make([]byte, ver[1])
-	if _, err := io.ReadFull(br, uname); err != nil {
-		return fmt.Errorf("read auth username: %w", err)
-	}
-	plen := make([]byte, 1)
-	if _, err := io.ReadFull(br, plen); err != nil {
-		return fmt.Errorf("read auth password length: %w", err)
-	}
-	passwd := make([]byte, plen[0])
-	if _, err := io.ReadFull(br, passwd); err != nil {
-		return fmt.Errorf("read auth password: %w", err)
-	}
-	// Constant-time across the pair: the handshake is the one place a timing
-	// side channel would discriminate between a known-username/wrong-password
-	// guess and a wrong username.
-	if !credentialsMatch(account, uname, passwd) {
-		w.Write([]byte{authUPVersion, authUPFailure}) //nolint:errcheck // the connection closes either way
-		return errInboundAuth
-	}
-	if _, err := w.Write([]byte{authUPVersion, authUPSuccess}); err != nil {
-		return fmt.Errorf("write auth reply: %w", err)
-	}
-	return nil
-}
-
-// credentialsMatch compares presented RFC 1929 credentials against the
-// configured account without leaking which field mismatched or either side's
-// field lengths. Every field is reduced to a fixed-length digest first —
-// subtle.ConstantTimeCompare returns immediately on a length mismatch, so
-// comparing the variable-length fields directly would expose the configured
-// lengths — and both comparisons always execute; their results are combined
-// with & and returned, so the caller branches once on the pair and a wrong
-// username can never skip the password comparison (and vice versa).
-func credentialsMatch(account *inboundAccount, username, password []byte) bool {
-	usernameSum := credentialDigest(username)
-	passwordSum := credentialDigest(password)
-	userOK := subtle.ConstantTimeCompare(usernameSum[:], account.usernameSum[:])
-	passOK := subtle.ConstantTimeCompare(passwordSum[:], account.passwordSum[:])
-	return userOK&passOK == 1
-}
-
-// socksTarget builds the request target from one inbound frame's address
-// bytes: the port is validated, the host is rendered as the host:port
-// identity pool state and logs key on, and the address type is the frame's
-// own ATYP — carried through to the outbound CONNECT, never re-inferred from
-// the host string. A zero port is a parse failure: there is no meaningful
-// CONNECT target without one.
-func socksTarget(atyp socksdial.AddrType, host, portBytes []byte) (socksdial.Target, error) {
-	port := binary.BigEndian.Uint16(portBytes)
-	if port == 0 {
-		return socksdial.Target{}, errors.New("zero target port")
-	}
-	var hostStr string
-	switch atyp {
-	case socksdial.AddrDomain:
-		hostStr = string(host)
-	case socksdial.AddrIPv4, socksdial.AddrIPv6:
-		// The canonical text of the frame's own address bytes; encoding at the
-		// outbound route round-trips these bytes exactly.
-		hostStr = net.IP(host).String()
-	}
-	return socksdial.Target{Host: hostStr, Port: port, Type: atyp}, nil
-}
-
-// writeSocksReply writes a full SOCKS reply with a zero IPv4 BND.ADDR/PORT.
-// The gateway cannot know the upstream bound address; RFC 1928 clients must
-// ignore it in a CONNECT success reply.
-func writeSocksReply(w io.Writer, code byte) error {
-	_, err := w.Write([]byte{socksVersion, code, 0x00, socksAtypIPv4, 0, 0, 0, 0, 0, 0})
-	return err
-}
-
-// copyBufPool lends 64KiB relay buffers. Relaying is the hot path for
-// established tunnels, and io.Copy's implicit 32KiB buffer would be allocated
-// per relay; the pool keeps one larger buffer per in-flight copy instead.
-var copyBufPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, 64<<10)
-		return &buf
-	},
-}
-
-func copyWithPooledBuffer(dst io.Writer, src io.Reader) (int64, error) {
-	bufp := copyBufPool.Get().(*[]byte)
-	n, err := io.CopyBuffer(dst, src, *bufp)
-	copyBufPool.Put(bufp)
-	return n, err
-}
-
-// upstreamBreakError marks a relay failure raised on the upstream side of the
-// response direction: a read from the upstream conn failed, so the response
-// stream itself broke mid-flight. Failures raised on the client side of the
-// same relay — writes to a vanished client — stay bare and must never be
-// treated as an upstream break.
-type upstreamBreakError struct{ err error }
-
-func (e *upstreamBreakError) Error() string { return e.err.Error() }
-func (e *upstreamBreakError) Unwrap() error { return e.err }
-
-// isUpstreamBreak reports whether err is a genuine upstream-side failure of
-// the response relay: not a clean end of stream, not the artifact of the
-// gateway's own teardown close, and not a client-side write failure.
-func isUpstreamBreak(err error) bool {
-	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-		return false
-	}
-	var brk *upstreamBreakError
-	return errors.As(err, &brk)
-}
-
-// copyToClient relays the response direction, upstream to client, and keeps
-// the failing end distinguishable: an upstream read failure comes back wrapped
-// in upstreamBreakError, while a client write failure stays bare. The
-// reset-on-upstream-break decision and the close record's broken-tunnel
-// classification both key on that difference.
-func copyToClient(client, upstream net.Conn) (int64, error) {
-	bufp := copyBufPool.Get().(*[]byte)
-	defer copyBufPool.Put(bufp)
-	buf := *bufp
-	var total int64
-	for {
-		n, rerr := upstream.Read(buf)
-		if n > 0 {
-			m, werr := client.Write(buf[:n])
-			total += int64(m)
-			if werr != nil {
-				return total, fmt.Errorf("write to client: %w", werr)
-			}
-			if m < n {
-				return total, io.ErrShortWrite
-			}
-		}
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				return total, nil
-			}
-			return total, &upstreamBreakError{err: rerr}
-		}
-	}
-}
-
-// tcpConnOf looks through the pipelining prefix wrapper for the client
-// socket's *net.TCPConn, so teardown socket options reach the real socket
-// even when the framing reader handed the relay a wrapped conn. Non-TCP
-// client conns (tests) return nil.
-func tcpConnOf(c net.Conn) *net.TCPConn {
-	if pc, ok := c.(*prefixConn); ok {
-		c = pc.Conn
-	}
-	tc, _ := c.(*net.TCPConn)
-	return tc
-}
-
-// inboundBufPool lends the buffered readers that frame inbound SOCKS5
-// exchanges. Greeting and CONNECT frame together stay under 300 bytes, so
-// one 4KiB fill usually captures the whole exchange in a single socket read
-// where field-by-field ReadFulls cost four to six.
-const inboundBufSize = 4 << 10
-
-var inboundBufPool = sync.Pool{
-	New: func() any { return bufio.NewReaderSize(nil, inboundBufSize) },
-}
-
-// prefixConn serves the bytes a client pipelined behind its CONNECT frame —
-// already pulled into the framing reader — before falling through to the
-// socket. It is the inbound mirror of socksdial's upstream-side prefix
-// handling: a pipelining client's bytes must be relayed, not dropped.
-type prefixConn struct {
-	net.Conn
-	prefix []byte
-}
-
-func (c *prefixConn) Read(b []byte) (int, error) {
-	if len(c.prefix) > 0 {
-		n := copy(b, c.prefix)
-		c.prefix = c.prefix[n:]
-		return n, nil
-	}
-	return c.Conn.Read(b)
-}
-
-// relayResult is the outcome of one direction of an established tunnel relay.
-type relayResult struct {
-	direction string
-	bytes     int64
-	err       error
-}
-
-const (
-	relayToClient   = "upstream_to_client"
-	relayToUpstream = "client_to_upstream"
-)
-
-// recordTunnelClose logs which side ended an established tunnel first and how
-// much each direction carried. An upstream-side error is a broken tunnel — the
-// client's stream died mid-flight — and logs at warn; every other close is
-// routine flow detail at debug. Tunnel closes never mutate route health.
-// recordTunnelClose classifies the tunnel's end. The direction that ended
-// first is the cause; the other direction's result is normally the artifact
-// of the teardown close. A genuine upstream break must surface as broken
-// (warn) whichever way it orders: first, behind a client-side failure, or
-// behind a clean client half-close — while teardown artifacts (the gateway's
-// own closes) and client-side write failures stay routine closes.
-func recordTunnelClose(log zerolog.Logger, target string, p *pool.Proxy, start time.Time, first, second relayResult) {
-	toClient, toUpstream := second, first
-	if first.direction == relayToClient {
-		toClient, toUpstream = first, second
-	}
-	msg, reason, cause := "tunnel closed", "client_closed", first.err
-	switch {
-	case first.direction == relayToClient && isUpstreamBreak(first.err):
-		msg, reason = "tunnel broken", "upstream_broken"
-	case second.direction == relayToClient && isUpstreamBreak(second.err):
-		msg, reason, cause = "tunnel broken", "upstream_broken", second.err
-	case first.direction == relayToClient && first.err == nil:
-		reason = "upstream_closed"
-	case first.err != nil:
-		reason = "client_aborted"
-	}
-	ev := log.Debug()
-	if msg == "tunnel broken" {
-		ev = log.Warn()
-	}
-	ev.Str("target", target).Str("upstream", upstreamLogValue(p)).
-		Str("duration", logDuration(time.Since(start))).
-		Int64("client_to_upstream_bytes", toUpstream.bytes).
-		Int64("upstream_to_client_bytes", toClient.bytes).
-		Str("close_reason", reason)
-	if cause != nil {
-		ev = ev.Str("error", logErrorValue(cause))
-	}
-	ev.Msg(msg)
 }
 
 func (s *Server) untrackConn(c net.Conn) {

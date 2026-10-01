@@ -1,8 +1,8 @@
 # rotation-proxy-gateway
 
-Go SOCKS5 proxy (RFC 1928 inbound) that routes `CONNECT` requests through a
-health-aware pool of **SOCKS5-only** outbound routes. It runs three inbound
-SOCKS5 proxy listener views over one shared route-health pool:
+Go HTTP forward proxy that routes `CONNECT` and absolute-form HTTP requests
+through a health-aware pool of **SOCKS5-only** outbound routes. It runs three
+inbound HTTP proxy listener views over one shared route-health pool:
 
 - mixed egress (`30121` by default): v4 and v6 routes
 - v4 egress (`30122` by default): `kind: v4` routes only
@@ -11,6 +11,8 @@ SOCKS5 proxy listener views over one shared route-health pool:
 The always-on admin listener defaults to `0.0.0.0:30120`; operators control
 network exposure through Docker port publishing, network policy, and firewalls.
 The authoritative behavior contract lives under [`docs/`](docs/);
+[`docs/architecture.md`](docs/architecture.md) is the cross-cutting map of the
+request path, generation publication, rotation, and warm pool; and
 [`README.md`](README.md) is the entry point.
 
 ## Build and test
@@ -47,11 +49,11 @@ Environment variables are bootstrap-only and require restart:
 | ------------------------ | --------------: | ------------------------------------------------------- |
 | `RPGW_CONFIG_FILE`       |   `config.yaml` | Runtime YAML path                                       |
 | `RPGW_ADMIN_ADDR`        | `0.0.0.0:30120` | Admin (HTTP) listener; network policy controls exposure |
-| `RPGW_MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress SOCKS5 listener                      |
-| `RPGW_V4_LISTEN_ADDR`    |        `:30122` | IPv4-egress-only SOCKS5 listener                        |
-| `RPGW_V6_LISTEN_ADDR`    |        `:30123` | IPv6-egress-only SOCKS5 listener                        |
+| `RPGW_MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress HTTP proxy listener                  |
+| `RPGW_V4_LISTEN_ADDR`    |        `:30122` | IPv4-egress-only HTTP proxy listener                    |
+| `RPGW_V6_LISTEN_ADDR`    |        `:30123` | IPv6-egress-only HTTP proxy listener                    |
 | `RPGW_SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown         |
-| `RPGW_ACCOUNT`           |         _unset_ | Require RFC 1929 auth on proxy listeners                |
+| `RPGW_ACCOUNT`           |         _unset_ | Require `Proxy-Authorization` on proxy listeners        |
 
 Empty proxy listener addresses disable their listener, but at least one proxy
 listener must remain enabled. All enabled addresses must be valid host:port
@@ -95,7 +97,7 @@ changing failure classification.
   auth state are visible through both dedicated and mixed listeners. The
   optional routing block narrows selection to the target's candidate set
   (first-match-wins domain rules, `*.` label-boundary wildcards, domain targets
-  only, `default-routes` or fail-closed `05 01`); the pool stays the sole
+  only, `default-routes` or fail-closed `503`); the pool stays the sole
   authority on health and order, retries stay inside the candidate set, and
   routing never reads or writes health nor inspects tunnel bytes.
 - Endpoint DNS/TCP failure is `proxy_connect`: cooldown then a distinct
@@ -109,14 +111,15 @@ changing failure classification.
   but the cooldown is scoped to the (route, target) pair—same base→max curve,
   bounded per-route tracking (1024, expired-then-soonest eviction), summary
   counts only in `/status`—so one refused target cannot cool the route for
-  other targets. Local SOCKS request errors and post-tunnel errors are
+  other targets. Local inbound request errors and post-tunnel errors are
   `setup`; picking finds no eligible untried route is `no_route`, while
   spending the `max-retries` budget with eligible routes still untried is
   `retry_exhausted`.
 - Errors after the SOCKS tunnel is established—including target reads/writes,
   malformed target content, cancellation, and broken tunnel—and local inbound
-  request errors (malformed target encoding, oversized configured
-  credentials, invalid target) do not alter health and are not retried.
+  request errors (malformed request target, origin-form on a proxy listener,
+  absent or inconsistent authority, zero port, oversized configured
+  credentials) do not alter health and are not retried.
 - The optional `warm-pool` block (default off) keeps bounded half-established
   upstream connections — TCP + greeting + auth, never a target `CONNECT` —
   that requests borrow before cold-dialing; a miss falls through cold and
@@ -135,29 +138,62 @@ changing failure classification.
 - The kind filter applies to ordinary LRU selection and all-cooling fallback;
   v4/v6 listeners must never leak into the other kind. A pool containing only
   one family is valid: mixed uses it, while a dedicated listener without a
-  matching route remains live and replies `05 01` (general failure) on
-  `no_route`.
-- Inbound protocol is SOCKS5 (RFC 1928). Without `RPGW_ACCOUNT`, only NO
-  AUTHENTICATION REQUIRED is accepted; a client offering no `0x00` method
-  gets `05 ff`. With `RPGW_ACCOUNT=username:password` set, every proxy
-  listener requires RFC 1929 username/password auth: negotiation selects
-  `0x02` when offered — a greeting without `0x02`, `0x00`-only included, gets
-  `05 ff` — wrong credentials get the RFC 1929 failure reply and a close, and
-  a malformed auth frame closes without a reply; the comparison is
+  matching route remains live and replies `503` on `no_route`.
+- Inbound protocol is HTTP forward proxying. Exactly two request shapes are
+  accepted: `CONNECT host:port HTTP/1.1` (authority-form target, `Host`
+  optional and authoritative) and absolute-form `GET http://host/path
+HTTP/1.1`. An origin-form target on a proxy listener is a request for a
+  local resource that does not exist and gets `400`; a target with no path
+  forwards as `/`; only `http` is proxied (`501` otherwise), a version other
+  than 1.1 gets `505`, and an absolute-form method outside `GET`/`HEAD`/`POST`
+  gets `405`. A malformed or absent authority gets `400`. An
+  absolute-form request is rewritten to origin-form before forwarding — never
+  forwarded unchanged. Malformed request lines get `400` without a tunnel.
+  Domain targets are forwarded as names: DNS happens at the outbound route
+  (socks5h), never in the gateway. Hop-by-hop headers, `Proxy-Authorization`,
+  and every `x-ecoma-*` control header — named or not — are removed before
+  forwarding; request bodies stream. A 30s read deadline bounds reading the
+  request — including the whole retry chain of outbound attempts — and is
+  cleared once the tunnel is established; established tunnels have no timeouts.
+  One `CONNECT` tunnel is one client connection's payload; keep-alive/reuse is
+  the client's choice.
+  Without `RPGW_ACCOUNT`, no `Proxy-Authorization` is required and one that
+  arrives anyway is consumed and stripped. With `RPGW_ACCOUNT=username:password`
+  set, every request on every proxy listener must carry
+  `Proxy-Authorization: Basic base64(username:password)`; a missing, malformed,
+  non-`Basic`, or wrong-credential header gets `407` plus
+  `Proxy-Authenticate: Basic realm="rotation-proxy-gateway"`. The comparison is
   constant-time, auth failures are pre-selection local errors that never
-  advance `requests` nor touch route health. Only `CONNECT` is
-  supported; `BIND` and `UDP ASSOCIATE` get `05 07`. Success replies `05 00`
-  with a zero BND.ADDR/BND.PORT that clients must ignore. Malformed or
-  truncated frames close without a reply. Domain targets are forwarded as
-  names: DNS happens at the outbound route (socks5h), never in the gateway. A
-  30s read deadline bounds the greeting, the auth exchange, and the request,
-  and is cleared once the tunnel is established; established tunnels have no
-  timeouts. One client connection carries one tunnel; keep-alive/reuse is the
-  client's choice. Userinfo and the inbound account must never appear in
-  logs, `/status`, errors, or responses.
+  advance `requests` nor touch route health, and a correct header is stripped
+  before forwarding. The env var name and its `user:pass` value format are
+  unchanged from the SOCKS5 era; only the wire form changed. Userinfo and the
+  inbound account must never appear in logs, `/status`, errors, or responses.
+- Two gateway-private `x-ecoma-*` control headers are read on ingress, stripped
+  before forwarding, and absent from route identity. `x-ecoma-proxy-family`
+  takes `v4`, `v6`, or `mixed` (absent = `mixed`): a request-scoped
+  route-selection constraint that narrows eligible routes exactly as a
+  listener's kind filter and the routing block do, composes with both by
+  intersection, and never binds a socket, resolves a name, or changes the
+  outbound SOCKS5 `CONNECT` target. A v4-only route can never serve a `v6`
+  request on any listener — including when every route is cooling, because
+  `PickFor` applies the same composed predicate to the all-cooling fallback.
+  Two requests differing only in this header hit the same `pool.Proxy` objects.
+  A value outside the closed set, an empty value, or a repeated header is
+  refused with `400` before route selection, as a local `setup`/`bad_request`
+  error that never advances `requests` nor touches route health — refusing
+  rather than falling back to `mixed`, because a client that asked for IPv6
+  egress and silently got IPv4 has no way to see it. `x-ecoma-request-id` is a
+  client correlation id: resolved once before selection, bounded to 64 bytes
+  inside `[A-Za-z0-9-_.:]`, replaced by a `r-`-prefixed id from `crypto/rand`
+  when absent, repeated, over-long, or carrying anything else, and preserved
+  across every retry of one chain. Both are specified in
+  [`docs/inbound-http.md`](docs/inbound-http.md).
 - Logs contain process-local `request_id` and `listener`; `target` and
-  `upstream` are host-only. `debug` shows flow, `info` terminal successes, and
-  `warn` fallback/terminal failures. Established tunnels log a close record
+  `upstream` are host-only. `request_id` stays the process-local ordinal,
+  because it is what the per-listener `/status` `requests` figure reports;
+  a client's `x-ecoma-request-id` travels beside it as `correlation_id`, and
+  the two are never conflated. `debug` shows flow, `info` terminal successes,
+  and `warn` fallback/terminal failures. Established tunnels log a close record
   (lifetime, per-direction byte counts, which side ended first) at `debug`; a
   tunnel broken by an upstream error logs at `warn` and resets the client
   connection.
@@ -201,7 +237,7 @@ RPGW_ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 ```
 
 `failovers` counts in-band route fallbacks (a listener metric); a listener's
-`requests` counts valid `CONNECT` commands that reached route selection
+`requests` counts valid proxy requests that reached route selection
 (protocol rejects never advance it); `rotations` counts completed manual-route
 rotations that observed a changed egress IP.
 
@@ -216,8 +252,8 @@ curl http://127.0.0.1:30120/status
 ```
 
 `compose.yaml` publishes host 30120/30121/30122/30123 for the admin/mixed/v4/v6
-listeners (admin is HTTP; the proxy listeners are SOCKS5) on all host
-interfaces. It bind-mounts `config.yaml` read-only; hot
+listeners (admin is the status/health API; the proxy listeners are HTTP
+forward proxies) on all host interfaces. It bind-mounts `config.yaml` read-only; hot
 reload polls content, so in-place host edits apply without restart, while an
 atomic replace across the single-file mount stays invisible (see
 [`docs/configuration.md`](docs/configuration.md) "Reload behavior"). Compose defaults to bounded `json-file` logs and uses the
@@ -227,13 +263,13 @@ binary `healthcheck` subcommand (no shell in the scratch image).
 
 - `internal/config` — bootstrap environment, Viper YAML validation, route parsing (auto + manual), rotation settings, routing-block compilation, content-hash change poller
 - `internal/pool` — LRU filtering, cooldown/auth state, in-flight work, rotation state, immutable generation snapshots (config + pool + routing policy as one unit)
-- `internal/routing` — the compiled domain-routing policy: it resolves one inbound CONNECT target to its candidate route set and never selects, never reads or writes health
-- `internal/proxyserver` — inbound SOCKS5 (RFC 1928) server plus the admin mux
+- `internal/routing` — the compiled domain-routing policy: it resolves one inbound target to its candidate route set and never selects, never reads or writes health
+- `internal/proxyserver` — inbound HTTP forward proxy: request parsing, `Proxy-Authorization`, the `x-ecoma-*` control headers (`x-ecoma-proxy-family` route constraint, `x-ecoma-request-id` correlation id), the protocol-agnostic route-selection and relay engine they feed, plus the admin mux
 - `internal/socksdial` — the shared SOCKS5 dialer used by the proxy server and the rotation probes; `DialHalf` parks a half-handshake (TCP + greeting + auth) the warm pool completes later with `CompleteConnect`
 - `internal/warmpool` — background pool of half-established upstream connections, bounded per route and process-wide, epoch-invalidated by rotation, borrowed on the serving path
 - `internal/rotation` — manual-route rotation engine: scheduling under the concurrency cap, drain, probes, rotate calls, verification, backoff
 - `cmd/rotation-proxy-gateway` — lifecycle, signals, watcher, admin endpoints
-- `docs` — the behavior-contract pages (configuration, rotation, warm pool, failure and route health, inbound SOCKS5, observability, deployment)
+- `docs` — the behavior-contract pages (configuration, rotation, warm pool, failure and route health, inbound HTTP forward proxy, observability, deployment)
 - `e2e` — black-box tests and benchmarks driving the real binary as a
   subprocess with SOCKS5/HTTP/trace/rotate-API simulators; `go test ./e2e/`
   (skip with `-short`), baselines in `e2e/BENCH.md`

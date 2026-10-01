@@ -61,7 +61,7 @@ body:
       options:
         - Route pool — selection, cooldown, auth state (internal/pool)
         - Rotation engine — drain, probes, rotate calls, backoff (internal/rotation)
-        - SOCKS5 listeners — inbound protocol, CONNECT handling (internal/proxyserver)
+        - Proxy listeners — inbound HTTP forward-proxy behavior, CONNECT/absolute-form handling (internal/proxyserver)
         - SOCKS dialer (internal/socksdial)
         - Config + hot reload (internal/config)
         - E2E suite (e2e)

@@ -135,8 +135,8 @@ func TestE2E_TunnelOpenedDuringHeadStartIsServed(t *testing.T) {
 // An in-flight tunnel is drained, not cut: under a generous grace it runs to
 // completion with real relays at both ends, and under a tiny one the same
 // fixture is force-closed rather than left hanging. Both halves use the same
-// SOCKS5 simulator and the same HTTP target, so nothing about the fixture
-// differs between them but the budget.
+// SOCKS5H route simulator and the same HTTP target, so nothing about the
+// fixture differs between them but the budget.
 func TestE2E_InFlightTunnelDrainedThenForceClosed(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")

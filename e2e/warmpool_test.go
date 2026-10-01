@@ -65,7 +65,7 @@ func waitSimLive(t *testing.T, sim *SocksSim, what string, want int64, timeout t
 // the mixed listener to target succeeds.
 func tunnelOnce(t *testing.T, g *Gateway, target string) {
 	t.Helper()
-	conn, err := dialSocksTunnel(context.Background(), g.MixedAddr, target)
+	conn, err := connectTunnel(context.Background(), g.MixedAddr, target)
 	if err != nil {
 		t.Fatalf("CONNECT %s through mixed listener: %v\nlogs:\n%s", target, err, g.Logs())
 	}
@@ -326,7 +326,7 @@ func TestE2E_WarmBorrowedRefusedConnectStaysPairScoped(t *testing.T) {
 		t.Fatalf("parked conns sent %d CONNECT frames, want none", got)
 	}
 
-	failedSocksTunnel(t, g.MixedAddr, "blocked.example:80")
+	failedTunnel(t, g.MixedAddr, "blocked.example:80")
 
 	// The refusal traveled through the borrowed connection: exactly one
 	// CONNECT frame reached the endpoint and the pool recorded one borrow.

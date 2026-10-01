@@ -15,9 +15,8 @@ body:
         decision, not restate the wish):
 
         - Non-SOCKS5 upstream routes (HTTP/HTTPS proxies).
-        - Reintroducing an HTTP proxy inbound listener — the inbound protocol
-          is SOCKS5 (RFC 1928) by design; the removed `global` block keys
-          (`target-tls-insecure`, `max-body-buffer`) are not coming back.
+        - The removed `global` block keys (`target-tls-insecure`,
+          `max-body-buffer`) are not coming back.
         - Manual reload triggers (SIGHUP, filesystem events) — the 1s
           content-hash poller is a design, not a gap; see
           [Reload behavior](../../blob/main/docs/configuration.md#reload-behavior)

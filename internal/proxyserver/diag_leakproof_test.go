@@ -127,7 +127,7 @@ func TestStatusAndLogsStayCleanAfterServingFailures(t *testing.T) {
 	}
 	addr := startServer(t, s)
 
-	conn := socksDialVia(t, addr, startRawEchoTarget(t))
+	conn := httpDialVia(t, addr, startRawEchoTarget(t))
 	readBanner(t, conn)
 	_ = conn.Close()
 

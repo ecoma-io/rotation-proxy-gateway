@@ -1,11 +1,13 @@
 package proxyserver
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -16,34 +18,6 @@ import (
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/socksdial"
 )
-
-// parkClient connects to the gateway, completes the greeting, sends one
-// CONNECT, and returns without reading a reply — the session is now parked
-// wherever the server's dial seam puts it. The caller owns closing.
-func parkClient(t *testing.T, addr, target string) net.Conn {
-	t.Helper()
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("dial gateway: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.Close() })
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := conn.Write(socksGreetingFrame(socksAuthNone)); err != nil {
-		t.Fatalf("write greeting: %v", err)
-	}
-	method := make([]byte, 2)
-	if _, err := io.ReadFull(conn, method); err != nil {
-		t.Fatalf("read method selection: %v", err)
-	}
-	frame, err := socksRequestFrame(socksCmdConnect, target)
-	if err != nil {
-		t.Fatalf("encode request: %v", err)
-	}
-	if _, err := conn.Write(frame); err != nil {
-		t.Fatalf("write request: %v", err)
-	}
-	return conn
-}
 
 // When the grace budget expires, Shutdown must cancel upstream dials still in
 // flight: the session unwinds through the canceled dial — classified as a
@@ -64,7 +38,7 @@ func TestShutdownCancelsPendingUpstreamDial(t *testing.T) {
 		return nil, ctx.Err()
 	}
 	addr := startServer(t, s)
-	conn := parkClient(t, addr, "example.test:80")
+	conn, _ := parkClient(t, addr, "example.test:80")
 
 	select {
 	case <-dialStarted:
@@ -186,14 +160,10 @@ func TestLastAttemptFailureIsNotAFailover(t *testing.T) {
 	}
 	addr := startServer(t, s)
 
-	conn := parkClient(t, addr, "example.test:80")
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		t.Fatalf("read reply: %v", err)
-	}
-	if reply[1] != socksReplyGeneral {
-		t.Fatalf("reply = 0x%02x, want general failure 0x01", reply[1])
+	conn, br := parkClient(t, addr, "example.test:80")
+	t.Cleanup(func() { _ = conn.Close() })
+	if status := readParkedReply(t, br); status != http.StatusServiceUnavailable {
+		t.Fatalf("reply = %d, want 503", status)
 	}
 	if status := s.ListenerStatus(); status.Requests != 1 || status.Failovers != 0 {
 		t.Fatalf("listener status = %+v, want the single failed attempt not counted as a fallback", status)
@@ -230,17 +200,25 @@ func TestServeTunnelStopsRetryingAfterHandshakeDeadline(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		s.serveTunnel(server, socksdial.Target{Host: "example.test", Port: 80, Type: socksdial.AddrDomain}, time.Now().Add(-time.Second), captureLogger(&logs))
+		s.serveTunnel(
+			server,
+			socksdial.Target{Host: "example.test", Port: 80, Type: socksdial.AddrDomain},
+			requestScope{family: familyMixed, log: captureLogger(&logs)},
+			time.Now().Add(-time.Second),
+			&connectReplier{conn: server, failureStatus: http.StatusBadGateway},
+			func(net.Conn, *pool.Proxy, time.Time, string) {},
+		)
 	}()
-	// Drain the general-failure reply the cut chain writes to the client;
-	// a synchronous pipe would otherwise block the handler forever.
+	// Drain the 502 the cut chain writes to the client; a synchronous pipe would
+	// otherwise block the handler forever.
 	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(client, reply); err != nil {
+	resp, err := http.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
 		t.Fatalf("read cut-chain reply: %v", err)
 	}
-	if reply[1] != socksReplyGeneral {
-		t.Fatalf("cut-chain reply = 0x%02x, want general failure 0x01", reply[1])
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("cut-chain reply = %d, want 502", resp.StatusCode)
 	}
 
 	select {

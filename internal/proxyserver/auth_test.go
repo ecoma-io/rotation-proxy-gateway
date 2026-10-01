@@ -5,9 +5,10 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
-	"errors"
+	"encoding/base64"
 	"io"
-	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -15,201 +16,92 @@ import (
 	"rotation-proxy-gateway/internal/pool"
 )
 
-// userPassAuthFrame encodes one RFC 1929 client frame: VER ULEN UNAME PLEN
-// PASSWD.
-func userPassAuthFrame(username, password string) []byte {
-	u, p := []byte(username), []byte(password)
-	frame := []byte{authUPVersion, byte(len(u))}
-	frame = append(frame, u...)
-	frame = append(frame, byte(len(p)))
-	return append(frame, p...)
-}
-
-// authIngressRequest drives readSocksRequest over a pipe with account armed:
-// greeting exchange, RFC 1929 exchange, then one CONNECT frame. It returns the
-// method selection, the auth status reply (nil when none arrived before the
-// close), and the parser outcome.
-func authIngressRequest(t *testing.T, account *inboundAccount, greeting []byte, authFrame, request []byte) (method, authStatus []byte, req socksRequest, err error) {
-	t.Helper()
-	serverSide, clientSide := net.Pipe()
-	defer func() { _ = serverSide.Close(); _ = clientSide.Close() }()
-	type outcome struct {
-		req socksRequest
-		err error
-	}
-	results := make(chan outcome, 1)
-	go func() {
-		req, err := readSocksRequest(bufio.NewReader(serverSide), serverSide, account)
-		results <- outcome{req: req, err: err}
-		// Closing unblocks a client read waiting for a reply the malformed
-		// paths never write (the silent-close doctrine).
-		_ = serverSide.Close()
-	}()
-	if _, werr := clientSide.Write(greeting); werr != nil {
-		t.Fatal(werr)
-	}
-	method = make([]byte, 2)
-	if _, rerr := io.ReadFull(clientSide, method); rerr != nil {
-		t.Fatalf("read method selection: %v", rerr)
-	}
-	if authFrame != nil {
-		if _, werr := clientSide.Write(authFrame); werr != nil {
-			t.Fatal(werr)
-		}
-		// The failure and success paths both answer two bytes; a silent
-		// close (malformed frame) ends this read with an error or a
-		// deadline, never a hang.
-		authStatus = make([]byte, 2)
-		_ = clientSide.SetReadDeadline(time.Now().Add(time.Second))
-		if _, rerr := io.ReadFull(clientSide, authStatus); rerr != nil {
-			authStatus = nil
-		}
-		_ = clientSide.SetReadDeadline(time.Time{})
-	}
-	if request != nil {
-		if _, werr := clientSide.Write(request); werr != nil {
-			t.Fatal(werr)
-		}
-	} else {
-		// No request follows: unblock a server still waiting for frame
-		// bytes (the truncated-frame case) so the parser outcome arrives.
-		_ = clientSide.Close()
-	}
-	select {
-	case got := <-results:
-		return method, authStatus, got.req, got.err
-	case <-time.After(2 * time.Second):
-		t.Fatal("readSocksRequest did not finish")
-	}
-	return nil, nil, socksRequest{}, nil
-}
-
 var testAccount = newInboundAccount([]byte("gw-user"), []byte("gw-pass"))
 
-func connectFrame(t *testing.T, target string) []byte {
-	t.Helper()
-	frame, err := socksRequestFrame(socksCmdConnect, target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return frame
+// proxyAuthorization renders the Proxy-Authorization field an armed listener
+// demands. The empty-value form is deliberately reachable: a client may present
+// no field at all, which is the case a no-auth client exercises.
+func proxyAuthorization(username, password string) string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
 }
 
-// An armed account must switch the accepted method to username/password, and
-// a client offering both methods must see 0x02 selected — 0x00 alongside 0x02
-// is not permission to skip authentication.
-func TestReadSocksRequestUserPassAuth(t *testing.T) {
+// checkProxyAuthorization is the pure verdict behind the 407: it decodes before
+// comparing, keeps the configured field bounds for untrusted input, and accepts
+// exactly the one header value a conforming client sends.
+func TestCheckProxyAuthorization(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		greeting []byte
+		name    string
+		account *inboundAccount // nil runs against testAccount
+		// values is the exact Proxy-Authorization field list to present. More
+		// than one value is ambiguous and must be refused even when one of them
+		// is correct.
+		values    []string
+		wantAllow bool
 	}{
-		{"both methods offered", socksGreetingFrame(socksAuthNone, socksAuthUserPass)},
-		{"only userpass offered", socksGreetingFrame(socksAuthUserPass)},
+		{name: "correct pair", values: []string{proxyAuthorization("gw-user", "gw-pass")}, wantAllow: true},
+		{name: "wrong password", values: []string{proxyAuthorization("gw-user", "other")}},
+		{name: "wrong username", values: []string{proxyAuthorization("other", "gw-pass")}},
+		{name: "both wrong", values: []string{proxyAuthorization("other", "other")}},
+		{name: "no header at all"},
+		{name: "empty header value", values: []string{""}},
+		{name: "lowercase scheme", values: []string{strings.Replace(proxyAuthorization("gw-user", "gw-pass"), "Basic", "basic", 1)}, wantAllow: true},
+		{name: "mixed-case scheme", values: []string{strings.Replace(proxyAuthorization("gw-user", "gw-pass"), "Basic", "bAsIc", 1)}, wantAllow: true},
+		{name: "wrong scheme", values: []string{"Bearer Z3ctdXNlcjpnd3ctcGFzcw=="}},
+		{name: "scheme with no credentials", values: []string{"Basic"}},
+		{name: "trailing space after scheme", values: []string{"Basic Z3ctdXNlcjpnd3ctcGFzcw== "}},
+		{name: "credentials with an embedded space", values: []string{"Basic Z3ctdXNlcjpn dy"}},
+		{name: "base64 without a colon", values: []string{"Basic " + base64.StdEncoding.EncodeToString([]byte("gw-user"))}},
+		{name: "empty username", values: []string{proxyAuthorization("", "gw-pass")}},
+		{name: "empty password", values: []string{proxyAuthorization("gw-user", "")}},
+		{name: "username above the field bound", values: []string{proxyAuthorization(strings.Repeat("u", 256), "gw-pass")}},
+		{name: "password above the field bound", values: []string{proxyAuthorization("gw-user", strings.Repeat("p", 256))}},
+		{name: "not base64", values: []string{"Basic !!!not-base64!!!"}},
+		{name: "two header values, one correct", values: []string{
+			proxyAuthorization("gw-user", "gw-pass"), proxyAuthorization("gw-user", "gw-pass")}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			method, authStatus, req, err := authIngressRequest(t,
-				testAccount, tc.greeting, userPassAuthFrame("gw-user", "gw-pass"), connectFrame(t, "example.test:443"))
+			req, err := http.NewRequest(http.MethodConnect, "http://example.test:443", nil)
 			if err != nil {
-				t.Fatalf("readSocksRequest: %v", err)
+				t.Fatal(err)
 			}
-			if method[0] != socksVersion || method[1] != socksAuthUserPass {
-				t.Fatalf("method selection = %#02x %#02x, want 05 02", method[0], method[1])
+			for _, value := range tc.values {
+				req.Header.Add("Proxy-Authorization", value)
 			}
-			if authStatus == nil || authStatus[0] != authUPVersion || authStatus[1] != authUPSuccess {
-				t.Fatalf("auth reply = %v, want 01 00", authStatus)
+			account := tc.account
+			if account == nil {
+				account = testAccount
 			}
-			if req.cmd != socksCmdConnect || req.target.Addr() != "example.test:443" {
-				t.Fatalf("request = %+v, want CONNECT example.test:443", req)
+			if got := checkProxyAuthorization(req, account); got != tc.wantAllow {
+				t.Fatalf("checkProxyAuthorization(%v) = %v, want %v", tc.values, got, tc.wantAllow)
 			}
 		})
 	}
 }
 
-func TestReadSocksRequestUserPassWrongCredentials(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		user string
-		pass string
-	}{
-		{"wrong password", "gw-user", "other"},
-		{"wrong username", "other", "gw-pass"},
-		{"wrong username length", "gw-use", "gw-pass"},
+// An unarmed listener is a historical unauthenticated deployment: the ingress
+// must accept any request, including one that presents a credential the gateway
+// was never configured with.
+func TestCheckProxyAuthorizationNilAccountAcceptsEverything(t *testing.T) {
+	for _, values := range [][]string{
+		nil,
+		{""},
+		{"Bearer whatever"},
+		{proxyAuthorization("gw-user", "gw-pass")},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, authStatus, _, err := authIngressRequest(t,
-				testAccount, socksGreetingFrame(socksAuthUserPass), userPassAuthFrame(tc.user, tc.pass), nil)
-			if !errors.Is(err, errInboundAuth) {
-				t.Fatalf("error = %v, want errInboundAuth", err)
-			}
-			if authStatus == nil || authStatus[0] != authUPVersion || authStatus[1] != authUPFailure {
-				t.Fatalf("auth reply = %v, want 01 ff", authStatus)
-			}
-			// The rejection must not echo what the client presented.
-			if err != nil && (strings.Contains(err.Error(), tc.user) || strings.Contains(err.Error(), tc.pass)) {
-				t.Fatalf("error carries credential bytes: %v", err)
-			}
-		})
+		req, err := http.NewRequest(http.MethodConnect, "http://example.test:443", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range values {
+			req.Header.Add("Proxy-Authorization", value)
+		}
+		if !checkProxyAuthorization(req, nil) {
+			t.Fatalf("checkProxyAuthorization(%v) on an unarmed listener = false, want true", values)
+		}
 	}
 }
 
-// A configured account makes authentication mandatory: NO AUTHENTICATION
-// REQUIRED alone is no longer an acceptable method.
-func TestReadSocksRequestAccountRejectsNoAuthClient(t *testing.T) {
-	method, authStatus, _, err := authIngressRequest(t,
-		testAccount, socksGreetingFrame(socksAuthNone), nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "no acceptable authentication method") {
-		t.Fatalf("error = %v, want no acceptable authentication method", err)
-	}
-	if method[0] != socksVersion || method[1] != socksAuthUnaccepted {
-		t.Fatalf("method selection = %#02x %#02x, want 05 ff", method[0], method[1])
-	}
-	if authStatus != nil {
-		t.Fatalf("auth reply = %v, want none", authStatus)
-	}
-}
-
-// Without an account the historical handshake holds: username/password alone
-// is unacceptable — the unset deployment never advertises RFC 1929.
-func TestReadSocksRequestNilAccountRejectsUserPassClient(t *testing.T) {
-	method, _, _, err := authIngressRequest(t,
-		nil, socksGreetingFrame(socksAuthUserPass), nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "no acceptable authentication method") {
-		t.Fatalf("error = %v, want no acceptable authentication method", err)
-	}
-	if method[1] != socksAuthUnaccepted {
-		t.Fatalf("method selection = %#02x, want ff", method[1])
-	}
-}
-
-// Malformed RFC 1929 frames close without a reply — the same silent-close
-// doctrine as the rest of the inbound framing.
-func TestReadSocksRequestUserPassMalformedClosesSilently(t *testing.T) {
-	t.Run("wrong subnegotiation version", func(t *testing.T) {
-		bad := userPassAuthFrame("gw-user", "gw-pass")
-		bad[0] = 0x02
-		_, authStatus, _, err := authIngressRequest(t,
-			testAccount, socksGreetingFrame(socksAuthUserPass), bad, nil)
-		if err == nil || errors.Is(err, errInboundAuth) {
-			t.Fatalf("error = %v, want a framing error", err)
-		}
-		if authStatus != nil {
-			t.Fatalf("auth reply = %v, want none", authStatus)
-		}
-	})
-	t.Run("truncated password", func(t *testing.T) {
-		frame := []byte{authUPVersion, 0x01, 'a', 0x05, 'p'} // PLEN says 5, one byte arrives
-		_, authStatus, _, err := authIngressRequest(t,
-			testAccount, socksGreetingFrame(socksAuthUserPass), frame, nil)
-		if err == nil || errors.Is(err, errInboundAuth) {
-			t.Fatalf("error = %v, want a framing error", err)
-		}
-		if authStatus != nil {
-			t.Fatalf("auth reply = %v, want none", authStatus)
-		}
-	})
-}
-
-// credentialsMatch is the pure comparison behind the RFC 1929 exchange: both
+// credentialsMatch is the pure comparison behind the Basic exchange: both
 // presented fields are digested to a fixed length and both constant-time
 // comparisons run before the combined result exists.
 func TestCredentialsMatch(t *testing.T) {
@@ -234,6 +126,8 @@ func TestCredentialsMatch(t *testing.T) {
 		{name: "password empty", username: "gw-user", password: "", want: false},
 		{name: "password longer", username: "gw-user", password: strings.Repeat("p", 255), want: false},
 		{
+			// Basic splits on the first colon only, so colons in the password
+			// survive the round trip while a truncated password does not.
 			name:     "colons in the configured password, correct pair",
 			account:  newInboundAccount([]byte("gw-user"), []byte("se:cr:et:pa:ss")),
 			username: "gw-user",
@@ -264,8 +158,8 @@ func TestCredentialsMatch(t *testing.T) {
 			want:     false,
 		},
 		{
-			// A zero-byte password is a legal configured pair (RFC 1929 allows
-			// 0-255) and must match only its empty presentation.
+			// An empty password is a legal configured pair and must match only
+			// its empty presentation.
 			name:     "empty configured password, empty presented",
 			account:  newInboundAccount([]byte("gw-user"), []byte("")),
 			username: "gw-user",
@@ -294,8 +188,8 @@ func TestCredentialsMatch(t *testing.T) {
 
 // credentialDigest must be a MAC under the process-wide random key, not an
 // unkeyed hash: an unkeyed fast digest of a credential would hand a
-// memory-disclosure reader an offline brute-force target. Recomputing the
-// HMAC independently pins both the keying and the digest form.
+// memory-disclosure reader an offline brute-force target. Recomputing the HMAC
+// independently pins both the keying and the digest form.
 func TestCredentialDigestIsKeyedMAC(t *testing.T) {
 	key := credentialDigestKey()
 	mac := hmac.New(sha256.New, key[:])
@@ -343,52 +237,50 @@ func TestCredentialsMatchCombinedResult(t *testing.T) {
 	}
 }
 
-// authConnectReply performs the full account-gated handshake against a live
-// server and returns the connection with the RFC 1929 status (0x00 success)
-// before the CONNECT exchange continues.
-func authConnectReply(t *testing.T, gatewayAddr, username, password, target string) (net.Conn, byte) {
+// The 407 is the one protocol answer that names the accepted scheme, so it
+// must carry the challenge — and it must stay bodyless, because the only useful
+// information to a client is where to present a credential next.
+func TestRequireProxyAuthorizationShape(t *testing.T) {
+	var wire strings.Builder
+	requireProxyAuthorization(&wire)
+	// Connection: close is set inside WriteHeader and the header block is
+	// written through http.Header.Write, so fields come out in canonical
+	// (alphabetical) order.
+	want := "HTTP/1.1 407 Proxy Authentication Required\r\n" +
+		"Connection: close\r\n" +
+		"Content-Length: 0\r\n" +
+		`Proxy-Authenticate: Basic realm="rotation-proxy-gateway"` + "\r\n\r\n"
+	if wire.String() != want {
+		t.Fatalf("requireProxyAuthorization wrote %q, want %q", wire.String(), want)
+	}
+}
+
+// authConnectStatus performs a full account-gated request against a live server
+// and returns the status the client saw. A nil credential presents no
+// Proxy-Authorization field at all, which is the no-auth client.
+func authConnectStatus(t *testing.T, gatewayAddr string, credential *string, target string) int {
 	t.Helper()
-	conn, err := net.Dial("tcp", gatewayAddr)
-	if err != nil {
-		t.Fatalf("dial gateway: %v", err)
+	conn := dialGateway(t, gatewayAddr)
+	headers := []string{"Host: " + target}
+	if credential != nil {
+		headers = append(headers, "Proxy-Authorization: "+*credential)
 	}
-	t.Cleanup(func() { _ = conn.Close() })
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	// Offer both methods the way real clients do; the armed account must
-	// select 0x02.
-	if _, err := conn.Write(socksGreetingFrame(socksAuthNone, socksAuthUserPass)); err != nil {
-		t.Fatalf("write greeting: %v", err)
+	if _, err := conn.Write(connectRequestWithHeaders(target, headers...)); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
 	}
-	method := make([]byte, 2)
-	if _, err := io.ReadFull(conn, method); err != nil {
-		t.Fatalf("read method selection: %v", err)
+	return readIngressResponse(t, bufio.NewReader(conn), http.MethodConnect).StatusCode
+}
+
+// connectRequestWithHeaders renders a CONNECT request with exactly the headers
+// the test supplies, so a test can omit Host or add a credential.
+func connectRequestWithHeaders(target string, headers ...string) []byte {
+	var frame strings.Builder
+	frame.WriteString("CONNECT " + target + " HTTP/1.1\r\n")
+	for _, header := range headers {
+		frame.WriteString(header + "\r\n")
 	}
-	if method[0] != socksVersion || method[1] != socksAuthUserPass {
-		t.Fatalf("method selection = %#02x %#02x, want 05 02", method[0], method[1])
-	}
-	if _, err := conn.Write(userPassAuthFrame(username, password)); err != nil {
-		t.Fatalf("write auth: %v", err)
-	}
-	status := make([]byte, 2)
-	if _, err := io.ReadFull(conn, status); err != nil {
-		t.Fatalf("read auth reply: %v", err)
-	}
-	if status[1] != authUPSuccess {
-		return conn, status[1]
-	}
-	frame, err := socksRequestFrame(socksCmdConnect, target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := conn.Write(frame); err != nil {
-		t.Fatalf("write connect: %v", err)
-	}
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		t.Fatalf("read SOCKS reply: %v", err)
-	}
-	_ = conn.SetDeadline(time.Time{})
-	return conn, reply[1]
+	frame.WriteString("\r\n")
+	return []byte(frame.String())
 }
 
 // The account gates the whole server: valid credentials reach an established
@@ -403,40 +295,35 @@ func TestInboundAccountGatesServing(t *testing.T) {
 	addr := startServer(t, s)
 	target := startRawEchoTarget(t)
 
-	conn, code := authConnectReply(t, addr, "gw-user", "gw-pass", target)
-	if code != socksReplySuccess {
-		t.Fatalf("CONNECT reply = %#02x, want success", code)
+	correct := proxyAuthorization("gw-user", "gw-pass")
+	wrong := proxyAuthorization("gw-user", "wrong")
+	conn := dialGateway(t, addr)
+	if _, err := conn.Write(connectRequestWithHeaders(target, "Host: "+target, "Proxy-Authorization: "+correct)); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
 	}
-	if banner := readBanner(t, conn); banner != "banner\n" {
+	tunnel := bufio.NewReader(conn)
+	if status := readIngressResponse(t, tunnel, http.MethodConnect).StatusCode; status != http.StatusOK {
+		t.Fatalf("authenticated CONNECT = %d, want 200", status)
+	}
+	if banner := readBanner(t, tunnel); banner != "banner\n" {
 		t.Fatalf("banner = %q", banner)
 	}
 	_ = conn.Close()
 
-	// Wrong password: RFC 1929 failure reply and a close, before any route
-	// selection — the listener request counter must not move.
-	if _, status := authConnectReply(t, addr, "gw-user", "wrong", target); status != authUPFailure {
-		t.Fatalf("auth status = %#02x, want ff", status)
+	// Wrong credentials are answered 407 and the connection closes, before any
+	// route selection: the listener request counter must not move.
+	if status := authConnectStatus(t, addr, &wrong, target); status != http.StatusProxyAuthRequired {
+		t.Fatalf("wrong credentials = %d, want 407", status)
 	}
 
-	// A no-auth client is refused at method negotiation.
-	noAuth, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = noAuth.Close() })
-	_ = noAuth.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := noAuth.Write(socksGreetingFrame(socksAuthNone)); err != nil {
-		t.Fatal(err)
-	}
-	method := make([]byte, 2)
-	if _, err := io.ReadFull(noAuth, method); err != nil {
-		t.Fatalf("read method selection: %v", err)
-	}
-	if method[0] != socksVersion || method[1] != socksAuthUnaccepted {
-		t.Fatalf("method selection = %#02x %#02x, want 05 ff", method[0], method[1])
+	// A client that presents no credential at all is refused the same way.
+	if status := authConnectStatus(t, addr, nil, target); status != http.StatusProxyAuthRequired {
+		t.Fatalf("no credential = %d, want 407", status)
 	}
 
-	output := waitForRecord(t, &logs, map[string]string{"msg": "socks authentication rejected", "level": "warn", "error_kind": "auth_rejected"})
+	output := waitForRecord(t, &logs, map[string]string{
+		"msg": "HTTP proxy authentication rejected", "level": "warn", "error_kind": "auth_rejected",
+	})
 	if status := s.ListenerStatus(); status.Requests != 1 || status.Failovers != 0 {
 		t.Fatalf("listener status = %+v, want exactly the one authenticated request", status)
 	}
@@ -444,9 +331,115 @@ func TestInboundAccountGatesServing(t *testing.T) {
 	if len(snap) != 1 || snap[0].Successes != 1 || snap[0].Failures != 0 || !snap[0].Available {
 		t.Fatalf("route state = %+v, want one success and a healthy route", snap)
 	}
+	// A 407 must never echo the presented credential back, and neither may any
+	// log line: the reject is pre-selection and post-secret-consumption.
 	for _, secret := range []string{"gw-user", "gw-pass", "wrong"} {
 		if strings.Contains(output, secret) {
 			t.Errorf("logs leaked %q:\n%s", secret, output)
 		}
 	}
+}
+
+// An armed account applies to the absolute-form shape too: the credential
+// boundary is the ingress, not one request shape, and a rejected forward
+// request must not reach its origin or advance the request counter.
+func TestInboundAccountGatesForwardRequests(t *testing.T) {
+	var reached bool
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		_, _ = io.WriteString(w, "origin")
+	}))
+	t.Cleanup(origin.Close)
+	originHost := strings.TrimPrefix(origin.URL, "http://")
+
+	route := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(route.URL), 30*time.Second, time.Minute)
+	s := newRuntimeServer(pl, defaultRuntime(), testLogger())
+	s.UseInboundAccount([]byte("gw-user"), []byte("gw-pass"))
+	addr := startServer(t, s)
+
+	correct := proxyAuthorization("gw-user", "gw-pass")
+	resp := httpForward(t, addr, httpForwardRequest(http.MethodGet, "http://"+originHost+"/thing",
+		"Host: "+originHost, "Proxy-Authorization: "+correct), http.MethodGet)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated forward request = %d, want the origin's own 200", resp.StatusCode)
+	}
+	if !reached {
+		t.Fatal("the authenticated forward request never reached the origin")
+	}
+
+	resp = httpForward(t, addr, httpForwardRequest(http.MethodGet, "http://"+originHost+"/thing",
+		"Host: "+originHost), http.MethodGet)
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Fatalf("unauthenticated forward request = %d, want 407", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Proxy-Authenticate"); got == "" {
+		t.Error("the forward-shape 407 did not name the accepted scheme")
+	}
+	// Only the authenticated request counted.
+	if status := s.ListenerStatus(); status.Requests != 1 {
+		t.Fatalf("listener status = %+v, want exactly the one authenticated request", status)
+	}
+}
+
+// The consumed credential is removed from the outbound request before either
+// accepted shape reaches its target, and the reserved control namespace gets
+// the same explicit treatment. stripEcomaControlHeaders is case-insensitive
+// because HTTP field names are.
+func TestStripEcomaControlHeadersIsCaseInsensitive(t *testing.T) {
+	header := http.Header{
+		"X-Ecoma-Probe":       []string{"one"},
+		"x-ecoma-other":       []string{"two"},
+		"X-ECOMA-Third":       []string{"three"},
+		"X-Ecomable":          []string{"kept"},
+		"Proxy-Authorization": []string{"kept"},
+		"Accept":              []string{"kept"},
+	}
+	stripEcomaControlHeaders(header)
+	for _, name := range []string{"X-Ecoma-Probe", "x-ecoma-other", "X-ECOMA-Third"} {
+		if len(header.Values(name)) != 0 {
+			t.Errorf("stripEcomaControlHeaders kept %q", name)
+		}
+	}
+	// The namespace boundary is the whole x-ecoma- prefix, not an exact list.
+	for _, name := range []string{"X-Ecomable", "Proxy-Authorization", "Accept"} {
+		if len(header.Values(name)) != 1 {
+			t.Errorf("stripEcomaControlHeaders dropped %q, which is outside the reserved namespace", name)
+		}
+	}
+}
+
+// A tunnel is established without any handshake reply the client must consume
+// beyond the 200: the credential is a header, so nothing about the tunnel
+// depends on how the client framed the exchange before it.
+func TestAuthenticatedTunnelCarriesBytesAfterThe200(t *testing.T) {
+	route := startSocks5Proxy(t, socksOptions{})
+	pl := pool.NewRoutes(mixedRoutes(route.URL), 30*time.Second, time.Minute)
+	s := newRuntimeServer(pl, defaultRuntime(), testLogger())
+	s.UseInboundAccount([]byte("gw-user"), []byte("gw-pass"))
+	addr := startServer(t, s)
+	target := startRawEchoTarget(t)
+
+	conn := dialGateway(t, addr)
+	payload := []byte("authenticated-payload")
+	frame := connectRequestWithHeaders(target, "Host: "+target,
+		"Proxy-Authorization: "+proxyAuthorization("gw-user", "gw-pass"))
+	if _, err := conn.Write(append(frame, payload...)); err != nil {
+		t.Fatalf("write burst: %v", err)
+	}
+	br := bufio.NewReader(conn)
+	if status := readIngressResponse(t, br, http.MethodConnect).StatusCode; status != http.StatusOK {
+		t.Fatalf("authenticated CONNECT = %d, want 200", status)
+	}
+	if got := readBanner(t, br); got != "banner\n" {
+		t.Fatalf("banner = %q", got)
+	}
+	echo := make([]byte, len(payload))
+	if _, err := io.ReadFull(br, echo); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if string(echo) != string(payload) {
+		t.Fatalf("echo = %q, want %q", echo, payload)
+	}
+	_ = conn.Close()
 }

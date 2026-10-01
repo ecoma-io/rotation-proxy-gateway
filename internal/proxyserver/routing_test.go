@@ -19,8 +19,8 @@ import (
 // The routing tests pin the serving-path contract: the router narrows which
 // routes a target may use, the pool stays the sole authority on health and
 // order, failures retry inside the candidate set, and tunnel bytes stay
-// opaque to health. Domain targets are used throughout because only
-// ATYP=DOMAIN can match a rule; "localhost" is the one name that resolves
+// opaque to health. Hostname targets are used throughout because only a target
+// carrying a domain can match a rule; "localhost" is the one name that resolves
 // locally, so fake upstreams can dial it for real when a test needs a live
 // target behind the CONNECT.
 
@@ -57,7 +57,7 @@ func deadAddr(t *testing.T) string {
 // TestRoutingCandidateIsolation pins the core promise: a rule-scoped target
 // rotates only inside its candidate set and never touches the other set's
 // routes; an unmatched target with no default routes fails closed with the
-// ordinary general-failure reply; an IP target never matches a rule.
+// ordinary 503; an IP target never matches a rule.
 func TestRoutingCandidateIsolation(t *testing.T) {
 	openaiA := startSocks5Proxy(t, socksOptions{connectRaw: connectSuccessRaw})
 	openaiB := startSocks5Proxy(t, socksOptions{connectRaw: connectSuccessRaw})
@@ -78,9 +78,9 @@ func TestRoutingCandidateIsolation(t *testing.T) {
 
 	// The openai pair serves the openai target; round-robin visits both.
 	for range 4 {
-		conn, code := socksConnectReply(t, addr, "api.openai.com:80", socksCmdConnect)
-		if code != socksReplySuccess {
-			t.Fatalf("CONNECT reply = 0x%02x, want success", code)
+		conn, _, status := httpConnectReply(t, addr, "api.openai.com:80")
+		if status != http.StatusOK {
+			t.Fatalf("CONNECT status = %d, want 200", status)
 		}
 		_ = conn.Close()
 	}
@@ -98,12 +98,12 @@ func TestRoutingCandidateIsolation(t *testing.T) {
 		t.Fatalf("kilo route hit %d times from an openai-scoped target", got)
 	}
 
-	// The unmatched domain fails closed: general failure, no upstream contact,
-	// no_route with the empty candidate count.
-	conn, code := socksConnectReply(t, addr, "unmatched.example:80", socksCmdConnect)
+	// The unmatched domain fails closed: 503, no upstream contact, no_route
+	// with the empty candidate count.
+	conn, _, status := httpConnectReply(t, addr, "unmatched.example:80")
 	_ = conn.Close()
-	if code != socksReplyGeneral {
-		t.Fatalf("unmatched CONNECT reply = 0x%02x, want general failure", code)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("unmatched CONNECT status = %d, want 503", status)
 	}
 	if got := len(kiloC.hits) + len(openaiA.hits) + len(openaiB.hits); got != 4 {
 		t.Fatalf("unmatched target contacted an upstream (%d total hits), want none new", got)
@@ -118,10 +118,10 @@ func TestRoutingCandidateIsolation(t *testing.T) {
 
 	// An IPv4 literal target carries no hostname, so it can never match the
 	// rule: it lands in the (empty) default set and fails closed too.
-	conn, code = socksConnectReply(t, addr, "127.0.0.1:80", socksCmdConnect)
+	conn, _, status = httpConnectReply(t, addr, "127.0.0.1:80")
 	_ = conn.Close()
-	if code != socksReplyGeneral {
-		t.Fatalf("IP-target CONNECT reply = 0x%02x, want general failure", code)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("IP-target CONNECT status = %d, want 503", status)
 	}
 
 	// None of the failures mutated route health.
@@ -168,9 +168,9 @@ func TestRoutingTwoRouteServingSets(t *testing.T) {
 		if i >= 3 {
 			target = "api.kilo.ai:80"
 		}
-		conn, code := socksConnectReply(t, addr, target, socksCmdConnect)
-		if code != socksReplySuccess {
-			t.Fatalf("CONNECT reply = 0x%02x, want success", code)
+		conn, _, status := httpConnectReply(t, addr, target)
+		if status != http.StatusOK {
+			t.Fatalf("CONNECT status = %d, want 200", status)
 		}
 		_ = conn.Close()
 	}
@@ -215,7 +215,7 @@ func TestRoutingFallbackStaysInCandidateSet(t *testing.T) {
 	srv := newRuntimeServer(pl, rt, captureLogger(&logs))
 	addr := startServer(t, srv)
 
-	conn := socksDialVia(t, addr, "api.openai.com:80")
+	conn := httpDialVia(t, addr, "api.openai.com:80")
 	_ = conn.Close()
 
 	snap := pl.Snapshot()
@@ -255,13 +255,13 @@ func TestRoutingConnectTargetRetriesInSet(t *testing.T) {
 	rt.Routing = mustCompileRouter(t, routing.Spec{
 		Rules: []routing.RuleSpec{{Domains: []string{"localhost"}, Routes: []string{"openai-a", "openai-b"}}},
 	})
-	_, addr := newSocksServer(t, pl, rt, testLogger())
+	_, addr := newProxyServer(t, pl, rt, testLogger())
 
 	_, port, err := net.SplitHostPort(target)
 	if err != nil {
 		t.Fatalf("split echo target: %v", err)
 	}
-	conn := socksDialVia(t, addr, net.JoinHostPort("localhost", port))
+	conn := httpDialVia(t, addr, net.JoinHostPort("localhost", port))
 	_ = conn.Close()
 
 	snap := pl.Snapshot()
@@ -314,11 +314,11 @@ func TestRoutingTunnelHTTP429NeverMutatesHealth(t *testing.T) {
 	rt.Routing = mustCompileRouter(t, routing.Spec{
 		Rules: []routing.RuleSpec{{Domains: []string{"localhost"}, Routes: []string{"openai-a", "openai-b"}}},
 	})
-	srv, addr := newSocksServer(t, pl, rt, testLogger())
+	srv, addr := newProxyServer(t, pl, rt, testLogger())
 
 	getVia := func(wantA, wantB int) {
 		t.Helper()
-		conn := socksDialVia(t, addr, net.JoinHostPort("localhost", port))
+		conn := httpDialVia(t, addr, net.JoinHostPort("localhost", port))
 		req := fmt.Sprintf("GET / HTTP/1.1\r\nHost: localhost:%s\r\nConnection: close\r\n\r\n", port)
 		if _, err := conn.Write([]byte(req)); err != nil {
 			t.Fatalf("write request: %v", err)
@@ -388,21 +388,21 @@ func TestRoutingIntersectsWithListenerKind(t *testing.T) {
 	srv := NewRuntime(pool.NewStore(rt, pl), testLogger(), "test", "v4", config.EgressV4)
 	addr := startServer(t, srv)
 
-	conn, code := socksConnectReply(t, addr, "api.openai.com:80", socksCmdConnect)
+	conn, _, status := httpConnectReply(t, addr, "api.openai.com:80")
 	_ = conn.Close()
-	if code != socksReplySuccess {
-		t.Fatalf("openai CONNECT reply = 0x%02x, want success through the v4 candidate", code)
+	if status != http.StatusOK {
+		t.Fatalf("openai CONNECT status = %d, want 200 through the v4 candidate", status)
 	}
 	if got := len(kiloC.hits); got != 0 {
 		t.Fatalf("v6 route served a v4 listener %d times", got)
 	}
 
 	// The kilo rule names only the v6 route: the intersection is empty, and
-	// the request fails closed instead of leaking into the other kind.
-	conn, code = socksConnectReply(t, addr, "api.kilo.ai:80", socksCmdConnect)
+	// the request fails closed with 503 instead of leaking into the other kind.
+	conn, _, status = httpConnectReply(t, addr, "api.kilo.ai:80")
 	_ = conn.Close()
-	if code != socksReplyGeneral {
-		t.Fatalf("kilo CONNECT reply = 0x%02x, want general failure", code)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("kilo CONNECT status = %d, want 503", status)
 	}
 	if snap := pl.Snapshot()[1]; snap.Successes != 0 || snap.Failures != 0 {
 		t.Fatalf("v6 route state = %+v, want untouched", snap)
@@ -431,7 +431,7 @@ func TestRoutingReloadSwapsPolicyAtomically(t *testing.T) {
 	srv := NewRuntime(store, testLogger(), "test", "mixed")
 	addr := startServer(t, srv)
 
-	conn := socksDialVia(t, addr, "api.openai.com:80")
+	conn := httpDialVia(t, addr, "api.openai.com:80")
 	_ = conn.Close()
 	if got := len(openaiA.hits); got != 1 {
 		t.Fatalf("pre-reload hits on openai-a = %d, want 1", got)
@@ -447,7 +447,7 @@ func TestRoutingReloadSwapsPolicyAtomically(t *testing.T) {
 	})
 	store.Publish(after)
 
-	conn = socksDialVia(t, addr, "api.openai.com:80")
+	conn = httpDialVia(t, addr, "api.openai.com:80")
 	_ = conn.Close()
 	if got := len(openaiA.hits); got != 1 {
 		t.Fatalf("post-reload hits on openai-a = %d, want still 1", got)

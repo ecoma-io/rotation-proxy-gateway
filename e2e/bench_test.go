@@ -10,18 +10,18 @@ import (
 )
 
 // Benchmarks measure the gateway's end-to-end overhead with the real binary,
-// a real SOCKS5 hop, and a real HTTP target. Run:
+// a real SOCKS5H egress hop, and a real HTTP target. Run:
 //
 //	go test ./e2e/ -run=NONE -bench=. -benchmem -count=5
 //
 // Baselines are not recorded in the repo: hardware differs, so capture your
 // own before/after on this machine and compare with benchstat — workflow and
-// interpretation caveats in e2e/BENCH.md. The gateway is an inbound SOCKS5-only
-// server, so one request costs exactly one inbound SOCKS5 handshake plus one
-// outbound SOCKS5 handshake through the route pool; there is no HTTP parsing
-// and no body buffering in the gateway — a pure TCP relay once the tunnel is
-// up. The Direct vs Proxied delta is the cost those two handshakes add to a
-// plain HTTP exchange.
+// interpretation caveats in e2e/BENCH.md. The gateway is an inbound HTTP
+// forward proxy over SOCKS5H egress, so one absolute-form request costs one
+// inbound HTTP request line plus one outbound SOCKS5 handshake through the
+// route pool, and a CONNECT costs an inbound CONNECT plus the same outbound
+// handshake. The Direct vs Proxied delta is the cost those two handshakes add
+// to a plain HTTP exchange.
 
 func benchGateway(b *testing.B, routes []RouteConfig) *Gateway {
 	b.Helper()
@@ -30,11 +30,11 @@ func benchGateway(b *testing.B, routes []RouteConfig) *Gateway {
 	return NewGateway(b, cfg)
 }
 
-// proxiedClient returns an HTTP client whose transport dials one inbound
-// SOCKS5 tunnel per request (keep-alives off), so every iteration is a fresh
-// tunnel — comparable to per-request behavior.
+// proxiedClient returns an HTTP client routed through one gateway listener as
+// an HTTP forward proxy. Keep-alives are disabled so every iteration has a
+// fresh connection and route pick — comparable to per-request behavior.
 func proxiedClient(proxyAddr string) *http.Client {
-	tr := socksTransport(proxyAddr, false)
+	tr := proxyTransport(proxyAddr, false)
 	tr.DisableKeepAlives = true
 	return &http.Client{Transport: tr, Timeout: 15 * time.Second}
 }
@@ -111,8 +111,8 @@ func BenchmarkProxied_SmallGETParallel(b *testing.B) {
 }
 
 // BenchmarkProxied_TunnelSetup isolates the setup half of a proxied request:
-// the inbound SOCKS5 negotiation, the route-pool pick, and the outbound SOCKS5
-// setup — then the tunnel is closed again, with no HTTP at all.
+// the inbound CONNECT, the route-pool pick, and the outbound SOCKS5 setup —
+// then the tunnel is closed again, with no HTTP at all.
 func BenchmarkProxied_TunnelSetup(b *testing.B) {
 	if testing.Short() {
 		b.Skip("e2e")
@@ -123,7 +123,7 @@ func BenchmarkProxied_TunnelSetup(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for b.Loop() {
-		conn, err := dialSocksTunnel(context.Background(), g.MixedAddr, target.Host)
+		conn, err := connectTunnel(context.Background(), g.MixedAddr, target.Host)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -142,7 +142,7 @@ func BenchmarkProxied_BulkGET_1MiB(b *testing.B) {
 	socks := NewSocksSim(b, SocksOK, "", "")
 	target := NewBulkBodyTarget(b, 1<<20)
 	g := benchGateway(b, []RouteConfig{{Proxy: socks.RouteValue(), Kind: "v4"}})
-	conn := socksTunnel(b, g.MixedAddr, target.Host)
+	conn := tunnelFor(b, g.MixedAddr, target.Host)
 	br := bufio.NewReader(conn)
 	get := []byte("GET /bench HTTP/1.1\r\nHost: " + target.Host + "\r\n\r\n")
 	b.ResetTimer()

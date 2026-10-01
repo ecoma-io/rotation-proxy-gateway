@@ -4,20 +4,42 @@ These benchmarks measure the gateway's end-to-end overhead with the real
 binary, a real SOCKS5 hop (`SocksSim`), and a real HTTP target. They exist so
 optimization work is grounded in measured deltas on the machine that matters.
 
-## What changed in the SOCKS5 migration
+## What changed in the HTTP-ingress migration
 
-These numbers were captured **after** the gateway's migration from an inbound
-HTTP forward proxy to an inbound SOCKS5-only server (RFC 1928 no-auth,
-CONNECT-only; a pure TCP relay once the tunnel is up). The HTTP-era benchmarks
-were deleted with the buffered/streaming body distinction that no longer
-exists.
+The ingress is an HTTP forward proxy: `CONNECT` for `https://` targets and
+absolute-form for `http://` ones. That is the mirror image of the previous
+migration, which went the other way and deleted the HTTP-era benchmarks along
+with the buffered/streaming body distinction that no longer exists.
 
-The per-request cost through the gateway is now **one inbound SOCKS5 handshake
-plus one outbound SOCKS5 handshake** per tunnel: no HTTP parsing, no body
-buffering, no request replay in the gateway. HTTP exists only at the two ends.
-Post-migration baselines must be captured fresh — the numbers are **not
-comparable** to the old HTTP-era benchmarks, which measured a different path
-(and the throughput expectations changed character entirely).
+The per-request cost through the gateway is again **one inbound HTTP exchange
+plus one outbound SOCKS5 handshake** per tunnel, with request bodies streamed
+rather than buffered and the request-target rewritten to origin-form before
+forwarding. For `CONNECT` — which is what every `TunnelSetup` iteration and
+every `https://` client uses — the inbound side is a request line, a `200`, and
+then a pure byte relay, so it is cheaper than the SOCKS5 greeting it replaced.
+Baselines must be captured fresh at the migration commit: the numbers are
+**not comparable** to the SOCKS5-era benchmarks, which measured a different
+path.
+
+## What changed with the control headers
+
+The two `x-ecoma-*` control headers add one header-parsing pass that is already
+inside the request the gateway had to read anyway: reading a header map and
+testing one value is not a measurable step next to an inbound HTTP exchange and
+an outbound SOCKS5 handshake. The absent-header case — every request that does
+not use them — allocates nothing beyond a nil candidate predicate, which is the
+path the benchmarks already exercise.
+
+Minting a correlation id (`x-ecoma-request-id` absent, repeated, or unusable)
+costs one 16-byte `crypto/rand` read per request, which is on the order of a few
+hundred nanoseconds on Linux and is measured inside the same request. It is on
+the data path by necessity — the id has to exist before route selection so the
+whole attempt chain shares it — and it does not add a syscall or a lock beyond
+what the dial that follows already performs.
+
+**No committed baseline is invalidated by this change**, and the HTTP-ingress
+baselines above still stand. The same before/after `benchstat` workflow applies
+if you want to measure the delta rather than assume it.
 
 ## Workflow
 
@@ -44,22 +66,22 @@ Before optimizing:
 
 ## What each benchmark measures
 
-| Benchmark                             | Path exercised                                                                         | What it isolates                                  |
-| ------------------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------- |
-| `BenchmarkDirect_SmallGET`            | client → target with no proxy: the floor                                               | pure HTTP baseline                                |
-| `BenchmarkProxied_SmallGET`           | client → gateway → SOCKS5 → target, small GET                                          | setup latency + relay for one full request        |
-| `BenchmarkProxied_SmallGETParallel`   | same, fresh tunnel per request, `GOMAXPROCS` workers                                   | per-request setup under concurrency               |
-| `BenchmarkProxied_TunnelSetup`        | inbound SOCKS5 greet/CONNECT → route pick → outbound SOCKS5 setup, then close; no HTTP | setup-latency floor: the double handshake alone   |
-| `BenchmarkProxied_BulkGET_1MiB`       | one tunnel reused, 1MiB HTTP response relayed per iteration (`SetBytes` reports MB/s)  | relay throughput, setup excluded                  |
-| `BenchmarkHA_SingleProxyDowntime`     | 4 routes, continuous load; one route down 2.5s mid-window, back at 5s                  | availability and tail latency across one failure  |
-| `BenchmarkHA_ConcurrentDowntime`      | same, but two of four routes fail at the same instant                                  | fallback behavior under concurrent failures       |
-| `BenchmarkHA_RotationUnderTraffic`    | 2 manual routes rotating every 1.5s under continuous load                              | what rotation windows cost a serving pool         |
-| `BenchmarkHA_BurstExhaust`            | 2-worker steady load → 32-worker burst → steady load again, all on 4 routes            | burst absorption and post-burst recovery          |
-| `BenchmarkWarmAB_SteadyTunnels`       | paired gateways (warm off vs on), 2 workers, fresh tunnel + small GET per op           | steady-state latency effect of borrowing          |
-| `BenchmarkWarmAB_TunnelSetupOnly`     | paired gateways, 1 worker, tunnels opened and closed with no payload                   | pure setup cost a parked connection removes       |
-| `BenchmarkWarmAB_BurstExhaust`        | paired gateways: low → 32-worker burst → low, on 4 routes                              | burst fallback and post-burst recovery under warm |
-| `BenchmarkWarmHA_SingleProxyDowntime` | paired gateways over the HA single-failure scenario, warm off vs on                    | failure-window behavior with parked connections   |
-| `BenchmarkWarmHA_ConcurrentDowntime`  | paired gateways over the concurrent-failure scenario, warm off vs on                   | discard/fallback when half the pool dies          |
+| Benchmark                             | Path exercised                                                                        | What it isolates                                  |
+| ------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `BenchmarkDirect_SmallGET`            | client → target with no proxy: the floor                                              | pure HTTP baseline                                |
+| `BenchmarkProxied_SmallGET`           | client → gateway → SOCKS5 → target, small GET                                         | setup latency + relay for one full request        |
+| `BenchmarkProxied_SmallGETParallel`   | same, fresh tunnel per request, `GOMAXPROCS` workers                                  | per-request setup under concurrency               |
+| `BenchmarkProxied_TunnelSetup`        | inbound CONNECT → route pick → outbound SOCKS5 setup, then close; no target HTTP      | setup-latency floor: the double handshake alone   |
+| `BenchmarkProxied_BulkGET_1MiB`       | one tunnel reused, 1MiB HTTP response relayed per iteration (`SetBytes` reports MB/s) | relay throughput, setup excluded                  |
+| `BenchmarkHA_SingleProxyDowntime`     | 4 routes, continuous load; one route down 2.5s mid-window, back at 5s                 | availability and tail latency across one failure  |
+| `BenchmarkHA_ConcurrentDowntime`      | same, but two of four routes fail at the same instant                                 | fallback behavior under concurrent failures       |
+| `BenchmarkHA_RotationUnderTraffic`    | 2 manual routes rotating every 1.5s under continuous load                             | what rotation windows cost a serving pool         |
+| `BenchmarkHA_BurstExhaust`            | 2-worker steady load → 32-worker burst → steady load again, all on 4 routes           | burst absorption and post-burst recovery          |
+| `BenchmarkWarmAB_SteadyTunnels`       | paired gateways (warm off vs on), 2 workers, fresh tunnel + small GET per op          | steady-state latency effect of borrowing          |
+| `BenchmarkWarmAB_TunnelSetupOnly`     | paired gateways, 1 worker, tunnels opened and closed with no payload                  | pure setup cost a parked connection removes       |
+| `BenchmarkWarmAB_BurstExhaust`        | paired gateways: low → 32-worker burst → low, on 4 routes                             | burst fallback and post-burst recovery under warm |
+| `BenchmarkWarmHA_SingleProxyDowntime` | paired gateways over the HA single-failure scenario, warm off vs on                   | failure-window behavior with parked connections   |
+| `BenchmarkWarmHA_ConcurrentDowntime`  | paired gateways over the concurrent-failure scenario, warm off vs on                  | discard/fallback when half the pool dies          |
 
 The gap between `Direct` and `Proxied` small GET is the full per-request cost
 of one gateway hop plus one SOCKS5 hop: the per-tunnel inbound and outbound
@@ -182,7 +204,7 @@ provider's or a middlebox's, the remedy is the same).
 
 - The setup-latency benchmarks (`SmallGET`, `SmallGETParallel`, `TunnelSetup`)
   are dominated by **connection setup, not copying**: each test iteration opens
-  a fresh inbound SOCKS5 tunnel through the gateway plus a fresh outbound SOCKS5
+  a fresh inbound tunnel through the gateway plus a fresh outbound SOCKS5
   tunnel through the route, and closes it. Copy-path optimizations cannot move
   these numbers; connection reuse would be a behavior change, not a tuning knob
   (keep-alives are deliberately disabled so every iteration is one new tunnel).
@@ -199,7 +221,7 @@ provider's or a middlebox's, the remedy is the same).
   iteration) and `internal/pool` (`BenchmarkPickFor`
   — pick, report, release under full parallelism). Loopback e2e `ns/op` is
   handshake-RTT-dominated and routinely cannot resolve a real few-percent
-  gateway win; a pinned unit test (for example the inbound framing read
+  gateway win; a pinned unit test (for example the inbound request-parsing
   budget) can prove a deterministic improvement the benchmark cannot see.
 - The echo/bulk body target (a prebuilt `[]byte` written per request) and the
   in-process SOCKS sim contribute their own allocations to proxied benchmarks;

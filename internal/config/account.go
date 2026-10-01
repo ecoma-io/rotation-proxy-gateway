@@ -6,10 +6,10 @@ import (
 )
 
 // InboundAccount is the validated RPGW_ACCOUNT pair: the username and
-// password every proxy listener demands from clients via RFC 1929
-// username/password authentication. A nil *InboundAccount keeps the
-// documented no-authentication handshake. Bytes rather than strings so the
-// handshake compares them constant-time without a per-session conversion.
+// password every proxy listener demands from clients as HTTP
+// Proxy-Authorization: Basic credentials. A nil *InboundAccount keeps the
+// documented no-authentication default. Bytes rather than strings so the
+// comparison is constant-time without a per-request conversion.
 type InboundAccount struct {
 	Username []byte
 	Password []byte
@@ -18,9 +18,9 @@ type InboundAccount struct {
 // parseAccount validates a raw RPGW_ACCOUNT value. The shape is
 // "username:password" split at the first colon, so a password may itself
 // contain colons; the username is 1-255 bytes and the password 0-255 bytes —
-// the RFC 1929 field limits. Errors are static on purpose: the offending
-// value is a credential, and quoting it would leak into boot logs, the same
-// discipline checkPort applies to route lines.
+// the RFC 1929 field limits this configuration inherited. Errors are static
+// on purpose: the offending value is a credential, and quoting it would leak
+// into boot logs, the same discipline checkPort applies to route lines.
 func parseAccount(raw string) (*InboundAccount, error) {
 	user, pass, ok := strings.Cut(raw, ":")
 	if !ok {

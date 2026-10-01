@@ -48,7 +48,7 @@ func TestE2E_ExhaustedPoolNoRouteWithCooldownDoubling(t *testing.T) {
 		{3, 20 * time.Second},
 	}
 	for i, step := range steps {
-		failedSocksTunnel(t, g.MixedAddr, target.Host)
+		failedTunnel(t, g.MixedAddr, target.Host)
 
 		st, err := g.Status()
 		if err != nil {
@@ -83,7 +83,8 @@ func TestE2E_ExhaustedPoolNoRouteWithCooldownDoubling(t *testing.T) {
 // The terminal record must reflect which condition ended the chain: a true
 // pool exhaustion logs no_route — the issue #39 case of pool==max-retries
 // covers that — while stopping at the retry cap with eligible routes still
-// untried logs retry_exhausted. The client still gets 05 01 in both cases.
+// untried logs retry_exhausted. The client still gets a gateway reject in both
+// cases.
 func TestE2E_RetryCapExhaustionLogsDistinctKind(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e")
@@ -97,7 +98,7 @@ func TestE2E_RetryCapExhaustionLogsDistinctKind(t *testing.T) {
 	cfg.MaxRetries = 2 // three routes, the cap stops the chain with one untried
 	g := NewGateway(t, cfg)
 
-	failedSocksTunnel(t, g.MixedAddr, target.Host)
+	failedTunnel(t, g.MixedAddr, target.Host)
 
 	// The cap ends the chain after two attempts: eligible routes remained.
 	waitForLogRecord(t, g, map[string]string{
@@ -143,7 +144,7 @@ func TestE2E_TunnelSurvivesReload(t *testing.T) {
 		{Proxy: socksA.RouteValue(), Kind: "v4"},
 	}))
 
-	conn := socksTunnel(t, g.MixedAddr, target.Host)
+	conn := tunnelFor(t, g.MixedAddr, target.Host)
 	br := bufio.NewReader(conn)
 
 	// Grow and shrink the pool while the tunnel stays open.
@@ -183,7 +184,7 @@ func TestE2E_TunnelBreakDoesNotMutateHealth(t *testing.T) {
 	cfg.LogLevel = "debug" // tunnel close records are flow detail
 	g := NewGateway(t, cfg)
 
-	conn := socksTunnel(t, g.MixedAddr, target.Host)
+	conn := tunnelFor(t, g.MixedAddr, target.Host)
 	br := bufio.NewReader(conn)
 
 	// Tear the target down under the live tunnel, then push a request through:
@@ -533,18 +534,10 @@ func TestE2E_ShutdownGraceBoundsStuckDial(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second)) // the whole fixture may wait out a grace cycle
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		t.Fatal(err)
-	}
-	choice := make([]byte, 2)
-	if _, err := io.ReadFull(conn, choice); err != nil {
-		t.Fatal(err)
-	}
-	req, err := socksConnectRequestBytes("example.test:80")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := conn.Write(req); err != nil {
+	// The CONNECT answer cannot come back: the gateway is still dialing the
+	// black hole. Writing it and then polling for the upstream accept is
+	// enough — nothing needs to be read on this side of the fixture.
+	if _, err := conn.Write([]byte("CONNECT example.test:80 HTTP/1.1\r\nHost: example.test:80\r\n\r\n")); err != nil {
 		t.Fatal(err)
 	}
 	select {

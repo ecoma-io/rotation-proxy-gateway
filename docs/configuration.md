@@ -7,15 +7,15 @@ live in a YAML file that is validated and hot-reloaded every second.
 
 ## Bootstrap environment (restart only)
 
-| Variable                 |         Default | Meaning                                                        |
-| ------------------------ | --------------: | -------------------------------------------------------------- |
-| `RPGW_CONFIG_FILE`       |   `config.yaml` | Runtime YAML file path                                         |
-| `RPGW_ADMIN_ADDR`        | `0.0.0.0:30120` | Always-on admin listener; network policy controls exposure     |
-| `RPGW_MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress listener                                    |
-| `RPGW_V4_LISTEN_ADDR`    |        `:30122` | v4-egress-only listener                                        |
-| `RPGW_V6_LISTEN_ADDR`    |        `:30123` | v6-egress-only listener                                        |
-| `RPGW_SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown                |
-| `RPGW_ACCOUNT`           |         _unset_ | `username:password` — require RFC 1929 auth on proxy listeners |
+| Variable                 |         Default | Meaning                                                                |
+| ------------------------ | --------------: | ---------------------------------------------------------------------- |
+| `RPGW_CONFIG_FILE`       |   `config.yaml` | Runtime YAML file path                                                 |
+| `RPGW_ADMIN_ADDR`        | `0.0.0.0:30120` | Always-on admin listener; network policy controls exposure             |
+| `RPGW_MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress listener                                            |
+| `RPGW_V4_LISTEN_ADDR`    |        `:30122` | v4-egress-only listener                                                |
+| `RPGW_V6_LISTEN_ADDR`    |        `:30123` | v6-egress-only listener                                                |
+| `RPGW_SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown                        |
+| `RPGW_ACCOUNT`           |         _unset_ | `username:password` — require `Proxy-Authorization` on proxy listeners |
 
 [`.env.example`](../.env.example) lists them all with their defaults — copy it
 to `.env` (Git-ignored) and either export it before a bare-metal run
@@ -32,11 +32,14 @@ make an otherwise-running service unhealthy.
 
 When set, it must read `username:password`: split at the first colon (the
 password may itself contain colons), a username of 1-255 bytes and a password
-of 0-255 bytes — the RFC 1929 field limits. An empty value is the same as
-unset. Any other shape — no colon, an empty username, an oversized field —
-fails startup instead of silently serving without authentication. The inbound
+of 0-255 bytes — the field limits inherited from the SOCKS5 era's RFC 1929
+exchange, kept so an existing account keeps working. An empty value is the
+same as unset. Any other shape — no colon, an empty username, an oversized
+field — fails startup instead of silently serving without authentication. The
+credential is presented by clients as HTTP
+`Proxy-Authorization: Basic base64(username:password)`; the inbound
 authentication behavior it switches on is documented in
-[Inbound SOCKS5 behavior](inbound-socks5.md#authentication).
+[Inbound HTTP forward-proxy behavior](inbound-http.md#authentication).
 
 ### Retired unprefixed names
 
@@ -152,8 +155,8 @@ behind the operator's back.
 
 ### Request routing (`routing` block)
 
-The optional `routing` block scopes which routes each inbound CONNECT target
-may use. Without it (the default), every listener selects from the whole pool
+The optional `routing` block scopes which routes each inbound target may use.
+Without it (the default), every listener selects from the whole pool
 exactly as the rest of this document describes. With it, each target resolves
 to a **candidate set**, and the pool — still the sole authority on health,
 cooldown, order, and kind filtering — picks among exactly those candidates:
@@ -175,9 +178,10 @@ routing:
 - **First match wins.** Rules are evaluated in order against the target's
   hostname; the first rule whose patterns match decides the candidate set.
   Later rules never merge into an earlier match.
-- **Only domain targets match.** A CONNECT sent as ATYP=DOMAIN (`0x03`) is
-  matched against the rules; IPv4 and IPv6 targets carry no hostname, so they
-  always resolve to `default-routes`. The gateway never reverse-resolves an
+- **Only domain targets match.** A domain-name target — the authority of the
+  request target, sent upstream as SOCKS5 ATYP=DOMAIN (`0x03`) — is matched
+  against the rules; IPv4 and IPv6 targets carry no hostname, so they always
+  resolve to `default-routes`. The gateway never reverse-resolves an
   address to a name: routing follows what the client actually sent, not what
   DNS would say.
 - **Matching is normalized and label-bound.** Names compare case-insensitively
@@ -192,8 +196,8 @@ routing:
   slipping through an empty label. The wire target is never rewritten:
   whatever bytes arrive travel to the outbound CONNECT untouched.
 - **Unmatched targets resolve to `default-routes`.** Omit the key and an
-  unmatched target has no candidates at all: it receives the ordinary `05 01`
-  general failure and nothing else in the pool is contacted. An explicit empty
+  unmatched target has no candidates at all: it receives the ordinary `503`
+  and nothing else in the pool is contacted. An explicit empty
   `default-routes: []` is rejected — omit the key for the same, documented
   result.
 - **The block is deliberate.** A null `routing:` key means the block is absent
@@ -257,7 +261,7 @@ Each reload parses and validates a complete new configuration before changing
 any serving state. A syntax error, partial write, invalid route, or invalid
 runtime setting logs a sanitized warning and retains the last-known-good config
 and pool. Validated configuration and its reconfigured pool snapshot publish as
-one atomic generation: every request and CONNECT operation loads that generation
+one atomic generation: every request and proxy operation loads that generation
 once, while in-flight operations finish on their original snapshot.
 
 There is deliberately no signal-based fallback. SIGHUP is caught and ignored:

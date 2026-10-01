@@ -1,9 +1,11 @@
 package proxyserver
 
 import (
+	"bufio"
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 
@@ -13,14 +15,17 @@ import (
 // A client that half-closes its write side keeps the tunnel alive: the FIN is
 // propagated to the upstream, the response direction stays relayed, and a
 // reply that arrives only after the half-close is still delivered before a
-// clean close (issue #38).
+// clean close (issue #38). Over the HTTP ingress the tunnel begins after the
+// CONNECT 200, so the client must have consumed that reply before its FIN
+// reaches the relay.
 func TestTunnelHalfCloseDeliversDelayedResponse(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
-	s, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
+	s, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
-	conn := socksDialVia(t, addr, startHalfCloseTarget(t, 300*time.Millisecond, "late-banner\n"))
+	tunnel := httpDialVia(t, addr, startHalfCloseTarget(t, 300*time.Millisecond, "late-banner\n"))
+	conn := tunnel.Conn
 	tc, ok := conn.(*net.TCPConn)
 	if !ok {
 		t.Fatalf("client conn = %T, want *net.TCPConn for CloseWrite", conn)
@@ -29,7 +34,7 @@ func TestTunnelHalfCloseDeliversDelayedResponse(t *testing.T) {
 		t.Fatalf("CloseWrite: %v", err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	body, err := io.ReadAll(conn)
+	body, err := io.ReadAll(tunnel)
 	if err != nil {
 		t.Fatalf("read after half-close: %v", err)
 	}
@@ -57,7 +62,7 @@ func TestTunnelHalfCloseDeliversDelayedResponse(t *testing.T) {
 	}
 }
 
-// A pipelining client — greeting, CONNECT, and payload in one write, so the
+// A pipelining client — the CONNECT request and payload in one write, so the
 // relay sees the client conn through the prefix wrapper — must still get the
 // reset when the upstream breaks the tunnel mid-stream: the truncated stream
 // stays visibly truncated instead of reading as a clean EOF (issue #37).
@@ -65,37 +70,23 @@ func TestPipelinedBurstResetOnUpstreamBreak(t *testing.T) {
 	fs := startSocks5Proxy(t, socksOptions{})
 	pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 	var logs safeLogBuffer
-	_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
+	_, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	frame, err := socksRequestFrame(socksCmdConnect, startAbortTarget(t))
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn := dialGateway(t, addr)
 	payload := []byte("pipelined-before-break")
-	burst := append(socksGreetingFrame(socksAuthNone), frame...)
-	burst = append(burst, payload...)
+	frame := httpConnectRequest(startAbortTarget(t))
+	// One write: the CONNECT request and the first tunnel bytes together, the
+	// same single-socket-segment burst a SOCKS greeting+CONNECT+payload made.
+	burst := append(frame, payload...)
 	if _, err := conn.Write(burst); err != nil {
 		t.Fatalf("write burst: %v", err)
 	}
-	method := make([]byte, 2)
-	if _, err := io.ReadFull(conn, method); err != nil {
-		t.Fatalf("read method selection: %v", err)
-	}
-	reply := make([]byte, 10)
-	if _, err := io.ReadFull(conn, reply); err != nil {
-		t.Fatalf("read SOCKS reply: %v", err)
-	}
-	if reply[1] != socksReplySuccess {
-		t.Fatalf("CONNECT reply = 0x%02x, want success", reply[1])
+	br := bufio.NewReader(conn)
+	if status := readIngressResponse(t, br, http.MethodConnect).StatusCode; status != http.StatusOK {
+		t.Fatalf("CONNECT status = %d, want 200", status)
 	}
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := io.Copy(io.Discard, conn); err == nil || errors.Is(err, io.EOF) {
+	if _, err := io.Copy(io.Discard, br); err == nil || errors.Is(err, io.EOF) {
 		t.Fatalf("pipelined client saw a clean end (%v) after the upstream broke the tunnel", err)
 	}
 
@@ -126,11 +117,11 @@ func TestCleanTeardownNeverArmsReset(t *testing.T) {
 		fs := startSocks5Proxy(t, socksOptions{})
 		pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 		var logs safeLogBuffer
-		_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
+		_, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
 		// The target parks until the FIN reaches it, then ends without a
 		// reply: at client-close time the upstream direction is still live.
-		conn := socksDialVia(t, addr, startHalfCloseTarget(t, 0, ""))
+		conn := httpDialVia(t, addr, startHalfCloseTarget(t, 0, ""))
 		_ = conn.Close()
 
 		output := waitForRecord(t, &logs, map[string]string{"msg": "tunnel closed"})
@@ -151,7 +142,7 @@ func TestCleanTeardownNeverArmsReset(t *testing.T) {
 		fs := startSocks5Proxy(t, socksOptions{})
 		pl := pool.NewRoutes(mixedRoutes(fs.URL), time.Second, time.Minute)
 		var logs safeLogBuffer
-		_, addr := newSocksServer(t, pl, defaultRuntime(), captureLogger(&logs))
+		_, addr := newProxyServer(t, pl, defaultRuntime(), captureLogger(&logs))
 
 		// A target that answers once and closes cleanly.
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -172,9 +163,9 @@ func TestCleanTeardownNeverArmsReset(t *testing.T) {
 			}
 		}()
 
-		conn := socksDialVia(t, addr, ln.Addr().String())
-		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		body, err := io.ReadAll(conn)
+		tunnel := httpDialVia(t, addr, ln.Addr().String())
+		_ = tunnel.SetReadDeadline(time.Now().Add(5 * time.Second))
+		body, err := io.ReadAll(tunnel)
 		if err != nil {
 			// A spurious reset-on-close would surface here as ECONNRESET
 			// instead of the clean EOF a finished stream must produce.
@@ -183,7 +174,7 @@ func TestCleanTeardownNeverArmsReset(t *testing.T) {
 		if string(body) != "response\n" {
 			t.Fatalf("body = %q, want the target response", body)
 		}
-		_ = conn.Close()
+		_ = tunnel.Close()
 
 		output := waitForRecord(t, &logs, map[string]string{"close_reason": "upstream_closed"})
 		if _, ok := findRecord(output, map[string]string{

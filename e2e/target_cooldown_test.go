@@ -24,8 +24,8 @@ func TestE2E_ConnectTargetRefusalKeepsPoolAvailable(t *testing.T) {
 	}))
 
 	// Traffic to the refused target fails visibly — with a single route the
-	// pool exhausts to the no-route general-failure reply.
-	failedSocksTunnel(t, g.MixedAddr, "blocked.example:80")
+	// pool exhausts to a no-route gateway reject.
+	failedTunnel(t, g.MixedAddr, "blocked.example:80")
 
 	st := g.WaitForCondition(5*time.Second, "pair cooldown recorded", func(st *Status) bool {
 		return len(st.Pool) == 1 && st.Pool[0].TargetCooldowns == 1
@@ -50,7 +50,7 @@ func TestE2E_ConnectTargetRefusalKeepsPoolAvailable(t *testing.T) {
 	// is cooling, the sole route is handed out only by the all-cooling
 	// fallback, and the upstream sees the escalated retries bounded by the
 	// request's own retry chain — the route-level counters still never move.
-	failedSocksTunnel(t, g.MixedAddr, "blocked.example:80")
+	failedTunnel(t, g.MixedAddr, "blocked.example:80")
 	st = g.WaitForCondition(5*time.Second, "second refusal counted", func(st *Status) bool {
 		return len(st.Pool) == 1 && st.Pool[0].TargetFailures == 2
 	})
