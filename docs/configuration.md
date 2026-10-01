@@ -7,15 +7,18 @@ live in a YAML file that is validated and hot-reloaded every second.
 
 ## Bootstrap environment (restart only)
 
-| Variable                 |         Default | Meaning                                                                |
-| ------------------------ | --------------: | ---------------------------------------------------------------------- |
-| `RPGW_CONFIG_FILE`       |   `config.yaml` | Runtime YAML file path                                                 |
-| `RPGW_ADMIN_ADDR`        | `0.0.0.0:30120` | Always-on admin listener; network policy controls exposure             |
-| `RPGW_MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress listener                                            |
-| `RPGW_V4_LISTEN_ADDR`    |        `:30122` | v4-egress-only listener                                                |
-| `RPGW_V6_LISTEN_ADDR`    |        `:30123` | v6-egress-only listener                                                |
-| `RPGW_SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown                        |
-| `RPGW_ACCOUNT`           |         _unset_ | `username:password` — require `Proxy-Authorization` on proxy listeners |
+| Variable                  |         Default | Meaning                                                                   |
+| ------------------------- | --------------: | ------------------------------------------------------------------------- |
+| `RPGW_CONFIG_FILE`        |   `config.yaml` | Runtime YAML file path                                                    |
+| `RPGW_ADMIN_ADDR`         | `0.0.0.0:30120` | Always-on admin listener; network policy controls exposure                |
+| `RPGW_MIXED_LISTEN_ADDR`  |        `:30121` | Mixed v4/v6 egress listener                                               |
+| `RPGW_V4_LISTEN_ADDR`     |        `:30122` | v4-egress-only listener                                                   |
+| `RPGW_V6_LISTEN_ADDR`     |        `:30123` | v6-egress-only listener                                                   |
+| `RPGW_SHUTDOWN_GRACE`     |           `55s` | Total shared drain budget for graceful shutdown                           |
+| `RPGW_ACCOUNT`            |         _unset_ | `username:password` — require `Proxy-Authorization` on proxy listeners    |
+| `RPGW_CONFIG_STORE_DSN`   |         _unset_ | PostgreSQL DSN for the durable, revisioned configuration store            |
+| `RPGW_RECONCILE_INTERVAL` |         _unset_ | Optional positive Go duration for the durable-store reconcile period      |
+| `RPGW_ADMIN_TOKEN`        |         _unset_ | Opaque bearer token for `/control/*`; required when a store is configured |
 
 [`.env.example`](../.env.example) lists them all with their defaults — copy it
 to `.env` (Git-ignored) and either export it before a bare-metal run
@@ -27,6 +30,31 @@ host:port addresses, use a numeric port, and not overlap — including wildcard
 binds on the same port (ports compare numerically, so `:080` and `:80` collide).
 Docker Healthcheck uses only `RPGW_ADMIN_ADDR`; a bad runtime reload cannot
 make an otherwise-running service unhealthy.
+
+### `RPGW_CONFIG_STORE_DSN`, `RPGW_RECONCILE_INTERVAL`, and `RPGW_ADMIN_TOKEN`
+
+`RPGW_CONFIG_STORE_DSN` enables the durable configuration control plane. It is a
+secret — it may contain a database password — and is never logged, returned, or
+included in `/status`. With it unset, the gateway remains in its established
+file-seeded mode: `config.yaml` is the runtime authority and is polled for
+reloads. With it set, the local file is only the first revision's seed; durable
+revisions are the authority and the reconciler polls them at the default period
+(or the positive Go duration in `RPGW_RECONCILE_INTERVAL`).
+
+A durable store enables the configuration write surface, so it also requires a
+non-empty `RPGW_ADMIN_TOKEN`. Startup **fails closed** when a store is configured
+and the token is absent or empty; it does not silently start a control surface
+that is unauthenticated or missing. The token is an opaque byte string presented as
+`Authorization: Bearer <token>` to the paths in
+[Admin and observability](observability.md#authenticated-control-api). The
+process reduces it immediately to an HMAC-SHA-256 digest under its random
+process-local key and retains no plaintext reference in the bootstrap
+configuration. It must never be logged, committed, or put in a URL.
+
+`RPGW_ACCOUNT` continues to govern only the HTTP forward-proxy listeners.
+`RPGW_ADMIN_TOKEN` governs only the authenticated control API; its challenge is
+HTTP `401` with `WWW-Authenticate: Bearer realm="rotation-proxy-gateway"`, never
+proxy-authentication `407`.
 
 ### `RPGW_ACCOUNT`
 

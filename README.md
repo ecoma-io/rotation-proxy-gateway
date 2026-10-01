@@ -27,12 +27,21 @@ SOCKS5H route, never in the gateway.
 
 The process starts one admin listener and up to three proxy listeners:
 
-| Endpoint    |         Default | Protocol   | Purpose                                                              |
-| ----------- | --------------: | ---------- | -------------------------------------------------------------------- |
-| Admin       | `0.0.0.0:30120` | HTTP       | `/healthz`, `/readyz`, `/status`; operator controls network exposure |
-| Mixed proxy |        `:30121` | HTTP proxy | Selects both v4- and v6-egress routes                                |
-| IPv4 proxy  |        `:30122` | HTTP proxy | Selects only `kind: v4` routes                                       |
-| IPv6 proxy  |        `:30123` | HTTP proxy | Selects only `kind: v6` routes                                       |
+| Endpoint    |         Default | Protocol   | Purpose                                                                                                             |
+| ----------- | --------------: | ---------- | ------------------------------------------------------------------------------------------------------------------- |
+| Admin       | `0.0.0.0:30120` | HTTP       | `/healthz`, `/readyz`, `/status` (open); `/control/*` (bearer, when configured); operator controls network exposure |
+| Mixed proxy |        `:30121` | HTTP proxy | Selects both v4- and v6-egress routes                                                                               |
+| IPv4 proxy  |        `:30122` | HTTP proxy | Selects only `kind: v4` routes                                                                                      |
+| IPv6 proxy  |        `:30123` | HTTP proxy | Selects only `kind: v6` routes                                                                                      |
+
+`/healthz`, `/readyz`, and `/status` stay unauthenticated so orchestrator probes
+keep working. When `RPGW_CONFIG_STORE_DSN` is configured, the same admin
+listener also serves an authenticated control API beneath `/control`
+(`/proxies`, `/routes`, `/routing-rules`, `/rotations`, `/config`, `/analytics`)
+guarded by `Authorization: Bearer` with `RPGW_ADMIN_TOKEN`; a configured store
+with no token fails startup closed. See
+[configuration](docs/configuration.md#rpgw_config_store_dsn-rpgw_reconcile_interval-and-rpgw_admin_token)
+and [observability](docs/observability.md#authenticated-control-api).
 
 `kind` is the public egress IP family supplied by a proxy provider. It is not
 the upstream SOCKS endpoint address family and it does not impose an
@@ -100,7 +109,8 @@ bootstrap variable carries the `RPGW_` prefix;
   mapping per failure class, header handling, the handshake deadline, and
   tunnel ownership.
 - [Observability](docs/observability.md) — the admin listener, the `/status`
-  JSON contract, and the logging and redaction contract.
+  JSON contract and its `cluster`/`distributed`/`instance` scopes, the
+  authenticated control API, and the logging and redaction contract.
 - [Deployment](docs/deployment.md) — Docker and compose, migrating inbound
   clients to the HTTP forward proxy, build and verification, and shutdown
   sizing.

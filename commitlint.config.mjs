@@ -32,12 +32,21 @@ export default {
         // proxyserver and which the HTTP era gives its own seam: request
         // parsing, `Proxy-Authorization`, and the x-ecoma-* control headers are
         // ingress concerns, while proxyserver keeps the route-selection and
-        // relay engine they feed. The migration phases that follow add
-        // `store` (durable configuration and analytics), `coord` (Redis lease,
-        // fencing, and the distributed rotation epoch), and `api` (the admin
-        // resource endpoints); they are added when those packages land, so a
-        // scope never names a package that does not exist.
+        // relay engine they feed.
+        //
+        // `store` is the durable configuration and analytics substrate:
+        // `control` is the reconciler that materializes a committed revision
+        // into the local serving generation. The two are separate scopes
+        // because they fail for separate reasons — one cannot persist, the other
+        // cannot converge — and a bisect that reads "storage broke" when the
+        // reconciler did is a wasted hour.
+        //
+        // `coord` is reserved for the Redis lease, fencing, and the distributed
+        // rotation epoch, so a scope never names a package that does not exist.
         "inbound",
+        "store",
+        "control",
+        "api",
       ],
     ],
     "body-max-line-length": [0],

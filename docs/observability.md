@@ -63,19 +63,39 @@ contract the gateway speaks to a client, so it is plain text with no envelope.
 
 ## `/status` contract
 
-`GET /status` returns JSON with:
+`GET /status` is unauthenticated and returns an uncacheable JSON snapshot
+(`Cache-Control: no-store`). Its pre-control-API top-level keys remain present
+for backward compatibility, and the same facts are also grouped under three
+explicit scope objects. A client should use the scope objects for new work:
+their `scope` marker makes the ownership of every figure explicit rather than
+letting one replica's state look like a fleet-wide fact.
 
-| Field        | Meaning                                                                                                               |
-| ------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `version`    | Build version                                                                                                         |
-| `uptime`     | Process uptime (duration string, second precision)                                                                    |
-| `requests`   | Global `requests` sum over the proxy listeners                                                                        |
-| `failovers`  | Global `failovers` sum over the proxy listeners                                                                       |
-| `listeners`  | Per-listener object (`mixed`, `v4`, `v6` — enabled listeners only), each with `requests` and `failovers`              |
-| `pool`       | Array of redacted route states (below)                                                                                |
-| `rotations`  | Completed manual-route rotations that observed a changed egress IP (process-lifetime total)                           |
-| `ipRevisits` | Of those rotations, the ones that committed an egress IP the same route had already verified (process-lifetime total) |
-| `warmPool`   | Warm-pool view (below)                                                                                                |
+| Scope         | What it means                                                                                                                                                                                                    | Fields                                                                                                      |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `cluster`     | Durable/shared state that replicas converge on. `activeRevision` is the reconciler's **cached** last successful durable-pointer observation; it does not make a database query for this unauthenticated request. | `scope`, `configRevision` (this instance's serving revision), `storeConfigured`, `activeRevision`, `synced` |
+| `distributed` | Runtime figures meaningful only after aggregating every replica. One response is this instance's slice, not an invented fleet total.                                                                             | `scope`, `requests`, `failovers`, `rotations` and `ipRevisits` when the rotation engine is wired            |
+| `instance`    | State meaningful only for this process.                                                                                                                                                                          | `scope`, `version`, `uptime`, `pool`, and `warmPool` when the warm pool is wired                            |
+
+`cluster.synced` is true only when the reconciler's cached active durable
+revision equals the generation this process is serving. It is false during
+normal convergence and when the active revision cannot be materialized by this
+build; it is not a health or readiness signal. A temporarily unreachable store
+leaves the last cached observation intact rather than fabricating revision zero.
+
+The flat compatibility keys are:
+
+| Field            | Meaning                                                                                                           |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `version`        | Build version (instance-local; also under `instance`)                                                             |
+| `uptime`         | Process uptime (duration string, second precision; instance-local)                                                |
+| `requests`       | This instance's sum over proxy listeners; aggregate across replicas for a fleet total                             |
+| `failovers`      | This instance's sum over proxy listeners; aggregate across replicas for a fleet total                             |
+| `listeners`      | Per-listener object (`mixed`, `v4`, `v6` — enabled listeners only), each with `requests` and `failovers`          |
+| `pool`           | Array of redacted route states local to this process (below)                                                      |
+| `configRevision` | Durable revision this instance is serving, or zero in file-seeded mode                                            |
+| `rotations`      | Completed manual-route rotations that observed a changed egress IP (this process lifetime total)                  |
+| `ipRevisits`     | Of those rotations, ones that committed an egress IP the same route had already verified (process-lifetime total) |
+| `warmPool`       | Warm-pool view local to this process (below)                                                                      |
 
 Counter semantics:
 
@@ -132,6 +152,93 @@ that route's in-flight replenish dials) — upstream identities are `host:port`
 only, as everywhere else. See [warm upstream pool](warm-pool.md).
 
 Rotate-API headers, bodies, and URLs never appear anywhere in the output.
+
+## Authenticated control API
+
+When `RPGW_CONFIG_STORE_DSN` is configured, the same admin listener also mounts
+an authenticated control surface beneath `/control`. Its token is configured by
+`RPGW_ADMIN_TOKEN`; see
+[configuration](configuration.md#rpgw_config_store_dsn-rpgw_reconcile_interval-and-rpgw_admin_token)
+for the fail-closed startup rule. `/healthz`, `/readyz`, and `/status` remain
+unauthenticated so orchestrator probes keep working exactly as before.
+
+Every control endpoint requires **exactly one**
+`Authorization: Bearer <token>` header. The bearer scheme is case-insensitive;
+the opaque presented token is limited to 512 bytes before it is HMACed and
+constant-time compared to the configured token's digest. Missing, malformed,
+non-Bearer, wrong, over-long, or repeated `Authorization` headers all return:
+
+```http
+401 Unauthorized
+WWW-Authenticate: Bearer realm="rotation-proxy-gateway"
+Cache-Control: no-store
+```
+
+This is intentionally `401`, not the proxy listeners' `407`. `407` and
+`Proxy-Authorization` remain exclusively for `RPGW_ACCOUNT` on the HTTP
+forward-proxy listeners. Every control response is JSON and
+`Cache-Control: no-store`.
+
+`x-ecoma-request-id` is accepted on a control call under the proxy listeners'
+same grammar (one value, 1–64 bytes, `[A-Za-z0-9-_.:]`) and echoed on the
+response only when accepted. All `x-ecoma-*` request headers are consumed at
+the boundary; no endpoint forwards them. The correlation id is not an
+authorization credential.
+
+### Resources
+
+All paths below are relative to `/control`.
+
+| Method and path      | What it honestly serves                                                                                                                                                                                                                                                 |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /proxies`       | The active **durable** revision's configured route inventory and its revision. It reports endpoints as `host:port`, never route userinfo. An unreadable or empty store is `503`; an active document this build cannot decode is `503`, not an invented empty inventory. |
+| `GET /routes`        | This instance's serving generation (`configRevision`) and its redacted, live pool health snapshot. It is deliberately not a claim about another replica.                                                                                                                |
+| `GET /routing-rules` | The routing policy this instance is actually applying. `configured:false` means no routing block (unrestricted policy); an empty configured block remains distinguishable as the fail-closed policy.                                                                    |
+| `GET /rotations`     | This instance's manual-route rotation state, safe settings, and process-lifetime aggregates. It reports the resolved concurrency cap, not provider secrets. Rotation aggregates are omitted when no engine is wired rather than invented as zero.                       |
+| `GET /config`        | The active durable revision's credential-free declared view, with `editable:false`. It is deliberately not a round-trippable document: returning masked route credentials or rotate-API material would either leak them or make a client overwrite them.                |
+| `PUT /config`        | A validated operator-supplied durable document, committed with optimistic concurrency (below). It never echoes the submitted document or a validation error that could quote a secret.                                                                                  |
+| `GET /analytics`     | `501 Not Implemented` with `{"error":"not_available","available":false}`. This build has no durable analytics source, so it refuses rather than inventing an empty series or a plausible number.                                                                        |
+
+No control response, error response, or control log contains route userinfo, the
+inbound `RPGW_ACCOUNT`, the admin bearer token, rotate-API URLs/headers/bodies,
+or the rotation IP-check URL. Provider rotation is rendered only as
+`rotateAPIConfigured: true|false`; public rotation IPs are canonicalized with
+IPv4-mapped addresses unmapped before they leave the process.
+
+### `PUT /config` concurrency
+
+The body is a strict JSON envelope:
+
+```json
+{
+  "expected_revision": 42,
+  "author": "operator@example.com",
+  "note": "explain the change",
+  "document": { "version": 1 }
+}
+```
+
+`document` must be a complete valid runtime document, including the credentials
+an operator who writes it already holds. It is bounded to the durable document
+ceiling before parsing; unknown envelope fields and malformed JSON are `400`.
+
+The conditional pointer move is made by the durable store, not by a
+read-then-write check in HTTP. The response distinguishes two precondition
+failures deliberately:
+
+- **`428 Precondition Required`** — `expected_revision` is absent, zero, or
+  negative. The request made no usable conditional write; retrying it unchanged
+  would remain unsafe.
+- **`412 Precondition Failed`** — an expectation was supplied but did not match
+  the active pointer when the store committed. The response includes
+  `currentRevision` and `readable`; when `readable:true`, read that revision,
+  rebase intentionally, and retry. When the store could not be read,
+  `readable:false` and revision `0` say to wait/re-read rather than pretend zero
+  is a real active revision.
+
+A successful commit returns `200` with the newly appended durable `revision` and
+`accepted:true`. Acceptance is not a claim that every replica has materialized
+it yet; use `/status`'s `cluster` scope on each replica to observe convergence.
 
 ## Logging
 

@@ -451,6 +451,30 @@ func TestLoadBootstrapDefaultsAndConflicts(t *testing.T) {
 	}
 }
 
+// AdminToken is bootstrap-only: it is read once before the control surface is
+// mounted, never becomes part of RuntimeConfig, and an empty value remains
+// distinguishable from an operator-configured token so main can fail closed when
+// the durable store is configured.
+func TestLoadBootstrapReadsAdminTokenExactly(t *testing.T) {
+	t.Setenv("RPGW_ADMIN_TOKEN", "operator-token-not-for-logs")
+	cfg, err := LoadBootstrap()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdminToken != "operator-token-not-for-logs" {
+		t.Errorf("AdminToken = %q, want the configured value", cfg.AdminToken)
+	}
+
+	t.Setenv("RPGW_ADMIN_TOKEN", "")
+	cfg, err = LoadBootstrap()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdminToken != "" {
+		t.Errorf("empty RPGW_ADMIN_TOKEN became %q, want empty", cfg.AdminToken)
+	}
+}
+
 func TestValidListenerHostname(t *testing.T) {
 	for _, host := range []string{"proxy.example", "localhost", "localhost-1", "127.0.0.1"} {
 		if host != "127.0.0.1" && !validListenerHostname(host) {

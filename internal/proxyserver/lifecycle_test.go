@@ -78,7 +78,7 @@ func TestReadyzReportsLifecycleState(t *testing.T) {
 	// body; while ready it is 200 "ok\n" and nothing else.
 	store := pool.NewStore(defaultRuntime(), pool.NewRoutes(nil, time.Second, time.Minute))
 	lc := NewLifecycle()
-	admin := httptest.NewServer(AdminMux("test", time.Now(), store, nil, nil, nil, nil, lc))
+	admin := httptest.NewServer(AdminMux(AdminOptions{Version: "test", Started: time.Now(), Store: store, Lifecycle: lc}))
 	defer admin.Close()
 
 	probe := func(method string) (*http.Response, string) {
@@ -166,7 +166,7 @@ func probe2(t *testing.T, url string) *http.Response {
 // an orchestrator reading it would kill a process that is stopping correctly.
 func TestHealthzStaysUnconditionalThroughDrain(t *testing.T) {
 	lc := NewLifecycle()
-	admin := httptest.NewServer(AdminMux("test", time.Now(), pool.NewStore(defaultRuntime(), pool.NewRoutes(nil, time.Second, time.Minute)), nil, nil, nil, nil, lc))
+	admin := httptest.NewServer(AdminMux(AdminOptions{Version: "test", Started: time.Now(), Store: pool.NewStore(defaultRuntime(), pool.NewRoutes(nil, time.Second, time.Minute)), Lifecycle: lc}))
 	defer admin.Close()
 	lc.MarkReady()
 	for _, phase := range []string{"ready", "draining", "stopped"} {
