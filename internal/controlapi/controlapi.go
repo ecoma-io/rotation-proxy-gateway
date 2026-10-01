@@ -192,7 +192,7 @@ func (a *api) guard(next http.HandlerFunc) http.HandlerFunc {
 				r.Header.Del(name)
 			}
 		}
-		if !a.opts.Auth.Authorized(r) {
+		if !a.authorized(r) {
 			// No detail about which part of the credential was wrong: a challenge
 			// that distinguishes "malformed" from "wrong" is an oracle for probing
 			// a token. 401 with the bearer challenge, never 407 — see
@@ -210,6 +210,17 @@ func (a *api) guard(next http.HandlerFunc) http.HandlerFunc {
 			Str("correlation_id", correlation).Msg("control request")
 		next(w, r)
 	}
+}
+
+// authorized asks the authenticator whether this request may proceed.
+//
+// The nil check is the point of the method rather than an incidental guard: the
+// Authenticator is an interface, and calling a method on a nil interface value
+// panics rather than returning false. Without this a control surface handed no
+// authenticator would crash on its first request instead of refusing it, which is
+// the opposite of the fail-closed direction this package documents.
+func (a *api) authorized(r *http.Request) bool {
+	return a.opts.Auth != nil && a.opts.Auth.Authorized(r)
 }
 
 // generation returns the configuration this instance is serving right now.

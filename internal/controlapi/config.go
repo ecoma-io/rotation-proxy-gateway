@@ -292,11 +292,21 @@ func (a *api) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	current, activeErr := a.opts.ConfigStore.Active(r.Context())
+	// A store that answered "nothing is active yet" is a readable store with no
+	// revision. ErrNoActiveRevision is the one read failure that is not a failure
+	// of the store, so it is normalized here rather than at every use: a client
+	// being told the cluster is unreadable when in fact nobody has written to it
+	// would wait for a revision that never arrives.
+	readable := activeErr == nil
+	if errors.Is(activeErr, configstore.ErrNoActiveRevision) {
+		activeErr = nil
+		readable = true
+	}
 
 	if req.ExpectedRevision <= 0 {
 		a.failPrecondition(w, statusPreconditionNeeded,
 			"PUT /config requires expected_revision naming the revision it replaces",
-			current, activeErr)
+			current, activeErr, readable)
 		return
 	}
 
@@ -335,9 +345,15 @@ func (a *api) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, configstore.ErrRevisionMismatch):
 		// The pointer moved between this client's read and its write, or between
 		// its last successful write and now. Name where it is now.
+		//
+		// activeErr is passed through rather than nil. The commit reported a
+		// mismatch and the earlier read is the only source this handler has for
+		// where the pointer is; if that read failed, there is no revision to name,
+		// and reporting readable:true alongside a revision of 0 would tell the
+		// client to rebase onto something this instance never managed to read.
 		a.failPrecondition(w, statusPreconditionFailed,
 			"the active configuration revision is not the one this write expected",
-			current, nil)
+			current, activeErr, readable)
 	case errors.Is(err, configstore.ErrDocumentTooLarge):
 		a.fail(w, http.StatusRequestEntityTooLarge, "body_too_large",
 			"the document is larger than a configuration document may be")
@@ -356,16 +372,19 @@ func (a *api) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 // is the failure mode these two statuses exist to prevent. The `readable` flag
 // says so explicitly — a false there is the signal to re-read before retrying,
 // not to retry blind.
-func (a *api) failPrecondition(w http.ResponseWriter, status int, message string, current configstore.Active, activeErr error) {
+//
+// readable is passed separately from activeErr because "the store answered and
+// nothing is active" and "the store did not answer" both present as a
+// zero-valued Active with a nil-able error, and only the second is a store
+// failure. Deriving readable from the error would conflate them.
+func (a *api) failPrecondition(w http.ResponseWriter, status int, message string, current configstore.Active, activeErr error, readable bool) {
+	// A revision the store named is the revision, whatever its number. The first
+	// write of a cluster's life commits revision 1, so a test here for "greater
+	// than some bound" rather than "valid" would one day let a real, named
+	// revision be reported as absent — and a client rebasing onto a revision that
+	// does not exist is the failure this response exists to prevent.
 	revision := int64(0)
-	switch {
-	case activeErr != nil:
-		// Zero stays zero, and readable:false tells the client the store could not
-		// be asked rather than that the cluster is at revision zero.
-	case !current.Revision.IsValid():
-		// The store answered and names nothing. That is a real empty state, not an
-		// unreadable one, and it is what a first-ever write should be given.
-	default:
+	if activeErr == nil && current.Revision.IsValid() {
 		revision = int64(current.Revision)
 	}
 	a.writeJSON(w, status, map[string]any{
@@ -373,7 +392,7 @@ func (a *api) failPrecondition(w http.ResponseWriter, status int, message string
 		"message": message,
 		// CurrentRevision is what a retry must name, or 0 when nothing is active.
 		"currentRevision": revision,
-		"readable":        activeErr == nil,
+		"readable":        readable,
 	})
 }
 
