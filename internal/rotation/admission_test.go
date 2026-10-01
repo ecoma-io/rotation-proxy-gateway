@@ -527,13 +527,13 @@ func TestSeamlessHoldbackBelongsToOneChangeover(t *testing.T) {
 	attempt := p.RotationEpoch()
 	s.HoldTraffic(p, discardLogger())
 
-	if s.releaseHold(p, attempt+1) {
+	if s.Settle(p, attempt+1, discardLogger()) {
 		t.Fatal("a foreign attempt released a live holdback")
 	}
-	if !s.releaseHold(p, attempt) {
+	if !s.Settle(p, attempt, discardLogger()) {
 		t.Fatal("the changeover's own attempt could not release its holdback")
 	}
-	if s.releaseHold(p, attempt) {
+	if s.Settle(p, attempt, discardLogger()) {
 		t.Fatal("a settled changeover released a holdback twice")
 	}
 }

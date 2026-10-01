@@ -69,6 +69,13 @@ type TrafficAdmissionPolicy interface {
 	// can never be held open by continuous load.
 	ShouldContinue(p *pool.Proxy, now, deadline time.Time) (keep bool, until time.Time)
 
+	// Settle closes whatever HoldTraffic announced once the changeover is
+	// settled — a candidate committed or verification given up — and reports
+	// whether it actually released a hold. attempt is the route's rotation
+	// epoch as of Admit, so a changeover can only ever be closed by the
+	// procedure that opened it. A mode that holds nothing back reports false.
+	Settle(p *pool.Proxy, attempt uint64, log zerolog.Logger) bool
+
 	// Readmit returns a route to service when a procedure ends without a
 	// terminal rotation state of its own — shutdown, or a reload that removed
 	// or replaced the route. Transitions that do record an outcome (a verified
@@ -266,14 +273,14 @@ func (s *seamlessPolicy) seamStateLocked(p *pool.Proxy) *seamState {
 	return st
 }
 
-// releaseHold clears p's holdback when the changeover is complete, and reports
-// whether it was still held.
+// Settle closes the holdback this procedure opened, and reports whether it was
+// still held.
 //
-// It is called with seams untouched by Readmit and only under s.mu, so the
-// attempt check is race-free against a concurrent changeover. An attempt number
-// that has moved on means the hold being tested is not the one this changeover
-// opened: the current one is left exactly as it is rather than released early.
-func (s *seamlessPolicy) releaseHold(p *pool.Proxy, attempt uint64) bool {
+// The attempt check is what makes a changeover belong to one procedure: it runs
+// under s.mu against the seam state, so an attempt number that has moved on
+// means the hold being tested is not the one this procedure opened — a newer
+// changeover's hold is left exactly as it is rather than released early.
+func (s *seamlessPolicy) Settle(p *pool.Proxy, attempt uint64, _ zerolog.Logger) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.seams[p]
@@ -304,6 +311,10 @@ func (disruptivePolicy) HoldTraffic(*pool.Proxy, zerolog.Logger) {}
 func (disruptivePolicy) ShouldContinue(_ *pool.Proxy, now, deadline time.Time) (bool, time.Time) {
 	return now.Before(deadline), deadline
 }
+
+// Settle reports no changeover to close: a disruptive rotation held nothing
+// back, so there is no hold to release and no attempt stamp to check.
+func (disruptivePolicy) Settle(_ *pool.Proxy, _ uint64, _ zerolog.Logger) bool { return false }
 
 // Readmit returns the route to service. The state is chosen from what the
 // route already knew — a route whose last rotation did not change its IP goes

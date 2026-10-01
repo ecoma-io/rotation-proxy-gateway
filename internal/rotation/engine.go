@@ -323,8 +323,7 @@ type RotationProcedure struct {
 	gone   func() bool // procedure must stop: shutdown, or the route left the pool
 
 	log     zerolog.Logger
-	seam    *seamlessPolicy // the seamless policy, nil in any other mode
-	attempt uint64          // the route's rotation epoch when this procedure began
+	attempt uint64 // the route's rotation epoch when this procedure began
 }
 
 // run executes the procedure and reports that it aborted without reaching a
@@ -337,7 +336,6 @@ func (rp *RotationProcedure) run(ctx context.Context) bool {
 		Str("kind", string(p.Kind)).
 		Str("mode", policy.Name()).
 		Logger()
-	rp.seam, _ = policy.(*seamlessPolicy)
 	log := rp.log
 
 	// Phase transitions carry how long the previous phase took and how far
@@ -470,11 +468,8 @@ func (rp *RotationProcedure) run(ctx context.Context) bool {
 	changed := e.verify(ctx, rp.gen, rp.spec, p, baseline, verified, settings, apiErr != nil, log, commit)
 
 	// Admission point 3: the changeover is settled — either a candidate was
-	// committed or verification gave up. A seamless route closes its
-	// holdback here, so the connections it held back dial warm again, and only
-	// once: the attempt stamp means a second procedure's changeover can never
-	// release this one's hold.
-	if rp.seam != nil && rp.seam.releaseHold(p, rp.attempt) {
+	// committed or verification gave up.
+	if policy.Settle(p, rp.attempt, log) {
 		log.Debug().Str("traffic", "warm again").Msg("seamless changeover complete; connections resume borrowing")
 	}
 
