@@ -165,11 +165,21 @@ func warnUnavailableKindListeners(log zerolog.Logger, cfg *config.RuntimeConfig,
 }
 
 // controlPlane is the opened durable configuration substrate: the store, the
-// reconciler that materializes revisions into the local generation, and the
-// revision the first serving generation came from.
+// generation store the reconciler publishes into, the reconciler that
+// materializes revisions into it, and the revision the first generation came
+// from.
+//
+// generations and reconciler.pool are the same *pool.Store, and that identity is
+// the substrate's central invariant: the reconciler publishes a durable revision
+// into the one generation store the proxy listeners, the admin mux, the rotation
+// engine and the warm pool all read. A reconciler publishing into a store nothing
+// serves would still apply every process-global effect of a revision — the log
+// level, the "configuration reloaded" line — which is what made the broken
+// wiring self-concealing: the logs announced a revision the gateway never served.
 type controlPlane struct {
-	store      configstore.Repository
-	reconciler *control.Reconciler
+	store       configstore.Repository
+	generations *pool.Store
+	reconciler  *control.Reconciler
 }
 
 // servedRevision names the durable revision the first generation was built
@@ -226,12 +236,16 @@ func openControlPlane(ctx context.Context, bootstrap *config.BootstrapConfig) (*
 	log := setupDynamicLogger(seed.LogLevel)
 	log.Info().Int("schema_version", version).Msg("config store schema ready")
 
-	// The reconciler publishes into a throwaway generation store purely to
-	// materialize the boot configuration; the process builds its real store from
-	// the result. A pool with zero routes is enough for a publication and can
-	// never serve, because nothing binds until this returns.
-	boot := pool.NewStore(seed, pool.NewRoutes(nil, seed.CooldownBase, seed.CooldownMax))
-	reconciler := control.NewReconciler(repo, boot, log, control.Options{Interval: bootstrap.ReconcileInterval})
+	// The reconciler publishes into this store, and this store is the one run()
+	// serves from — the boot generation is the serving generation, reconfigured
+	// in place as later revisions are materialized. It is built over the seed with
+	// a zero-route pool purely so it has a generation to publish into; Seed below
+	// replaces that pool with the materialized routes' own snapshot before
+	// anything binds, and PublishRevision's reconfigure retains route identity
+	// across the swap. Building a second store here and handing run() that one
+	// instead would strand every later revision in a store nothing serves.
+	generations := pool.NewStore(seed, pool.NewRoutes(nil, seed.CooldownBase, seed.CooldownMax))
+	reconciler := control.NewReconciler(repo, generations, log, control.Options{Interval: bootstrap.ReconcileInterval})
 
 	// Seed commits the first revision only when the store has none, and
 	// otherwise converges on the active one. It is also what validates: a
@@ -243,12 +257,15 @@ func openControlPlane(ctx context.Context, bootstrap *config.BootstrapConfig) (*
 		repo.Close()
 		return nil, nil, 0, err
 	}
-	materialized := boot.Load()
+	materialized := generations.Load()
 	if revision.IsValid() {
 		log.Info().Int64("revision", int64(revision)).Int("upstreams", len(materialized.Config.AllRoutes())).
 			Msg("serving durable configuration revision")
 	}
-	return &controlPlane{store: repo, reconciler: reconciler}, materialized.Config, revision, nil
+	// generations, not materialized.Config, is what the caller serves from: the
+	// config is only this generation's value, and it is the store that later
+	// revisions republish into.
+	return &controlPlane{store: repo, generations: generations, reconciler: reconciler}, materialized.Config, revision, nil
 }
 
 func run() error {
@@ -301,15 +318,7 @@ func run() error {
 	// snapshot). Handlers load it once per operation; a new revision builds the
 	// next pool snapshot and swaps the whole generation atomically. The pool
 	// serves both origins; manual routes additionally carry rotation state.
-	poolStore := pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.AllRoutes(), runtimeCfg.CooldownBase, runtimeCfg.CooldownMax))
-	// Stamp the revision the first generation came from, so /status reports the
-	// configuration that is actually serving rather than zero. It goes through
-	// the same publication path every later revision uses, so there is no second
-	// way for a generation to acquire a revision — and the reconfigure is a
-	// no-op on identity, retaining every route.
-	if served.IsValid() {
-		poolStore.PublishRevision(runtimeCfg, int64(served))
-	}
+	poolStore := selectServingStore(controlPlane, runtimeCfg, served)
 	engine := rotation.New(poolStore, log)
 	// The warm pool keeps half-established upstream connections ready for the
 	// serving path to borrow (one non-blocking pop per attempt, cold dial on
@@ -415,12 +424,15 @@ func run() error {
 	// file-mode operator that changes arrive "through the durable revision"
 	// would point them at a subsystem they are not running.
 	reloadAuthority := "configuration reloads are poller-driven, stop with SIGTERM"
-	cancelReload := context.CancelFunc(func() {})
+	// One context governs whichever source runs — exactly one of the two branches
+	// below starts one — and the select loop cancels it on the way out. Deriving
+	// it here rather than per branch keeps cancelReload defined on every path
+	// without a dead placeholder value; only one goroutine ever consumes it.
+	reloadCtx, cancelReload := context.WithCancel(context.Background())
+	defer cancelReload()
 	if controlPlane != nil {
 		reloadSource = "revision"
 		reloadAuthority = "configuration changes arrive through the durable revision, stop with SIGTERM"
-		reconcileCtx, cancelReconcile := context.WithCancel(context.Background())
-		cancelReload = cancelReconcile
 		// The subscriber receives only validated, already-published
 		// configurations, so the process-global effects can never run against a
 		// configuration the gateway refused to serve.
@@ -434,12 +446,9 @@ func run() error {
 		})
 		// Reconciled into the real store, so a revision committed by another
 		// instance reaches this one's serving generation.
-		go controlPlane.reconciler.Run(reconcileCtx)
+		go controlPlane.reconciler.Run(reloadCtx)
 	} else {
-		pollCtx, cancelPoll := context.WithCancel(context.Background())
-		cancelReload = cancelPoll
-		defer cancelPoll()
-		go watchConfigFile(pollCtx, bootstrap.ConfigFile, poolStore, reload, log)
+		go watchConfigFile(reloadCtx, bootstrap.ConfigFile, poolStore, reload, log)
 	}
 
 	// The rotation engine owns manual-route egress IP rotation. Its context is
@@ -500,6 +509,40 @@ func run() error {
 			reconfigure(next, reloadSource)
 		}
 	}
+}
+
+// selectServingStore returns the generation store run() serves from, and is the
+// single place that decision is made — which is why it is a named function with
+// its own regression test rather than four lines inline: the durable-revision
+// defect this guards against was invisible precisely because the choice was
+// spread between openControlPlane and run().
+//
+// In store mode it returns the very store the reconciler publishes into
+// (controlPlane.generations, the same *pool.Store handed to
+// control.NewReconciler). Returning a second store built here instead is the
+// original defect: the reconciler would keep publishing later revisions into a
+// store nothing serves, while still applying every process-global effect of the
+// revision — the log level, the "configuration reloaded" line — so the logs
+// announced a revision the gateway never served.
+//
+// It also stamps the boot generation with the revision it came from, so /status
+// reports the revision actually serving rather than zero. The stamp goes
+// through the same publication path every later revision uses, so there is no
+// second way for a generation to acquire a revision, and the reconfigure is a
+// no-op on identity, retaining every route's health and rotation state.
+//
+// In file mode controlPlane is nil: there is no durable store, the local YAML is
+// the whole configuration, and the poller republishes into the store built here.
+// Nothing is stamped, because a zero revision on the generation means exactly
+// "not from the durable store".
+func selectServingStore(cp *controlPlane, runtimeCfg *config.RuntimeConfig, served configstore.Revision) *pool.Store {
+	if cp != nil {
+		if served.IsValid() {
+			cp.generations.PublishRevision(runtimeCfg, int64(served))
+		}
+		return cp.generations
+	}
+	return pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.AllRoutes(), runtimeCfg.CooldownBase, runtimeCfg.CooldownMax))
 }
 
 // watchConfigFile is the file-seeded reload path: it publishes a changed runtime
