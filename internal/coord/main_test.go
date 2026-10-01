@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 )
 
@@ -100,6 +101,26 @@ func dropNamespace(t *testing.T, store *Store) {
 // quietLogger discards output, so a test's own assertions are the only thing
 // that reaches the test log.
 func quietLogger() zerolog.Logger { return zerolog.Nop() }
+
+// closedClient is a real client whose every call fails immediately, standing in
+// for an authority that has become unreachable.
+//
+// It is a closed go-redis client rather than a hand-written stub: a stub would
+// have to reimplement the error surface, and a test asserting on behaviour after
+// a coordination failure should fail because the client is unusable, not
+// because the stub returned the error the test author expected.
+func closedClient(t *testing.T) redis.UniversalClient {
+	t.Helper()
+	opt, err := redis.ParseURL(testAddr(t))
+	if err != nil {
+		t.Fatalf("parse the test Redis address: %v", err)
+	}
+	client := redis.NewClient(opt)
+	if err := client.Close(); err != nil {
+		t.Fatalf("close the client standing in for an unreachable authority: %v", err)
+	}
+	return client
+}
 
 // waitFor polls cond until it holds or the deadline passes. It exists for the
 // tests that must observe a *concurrent* event — a second instance taking over
