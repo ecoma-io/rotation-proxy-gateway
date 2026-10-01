@@ -16,6 +16,19 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// batchConn is the slice of pgx a Writer actually uses: opening a batch and
+// releasing it. A *pgxpool.Pool satisfies it unchanged, and a test can satisfy
+// it without a database.
+//
+// It exists so the writer's SQL-carrying code — the four write* methods and
+// execBatch — is reachable by a unit test at all. What proves the statements
+// and the migration agree is a live PostgreSQL, which a unit test cannot
+// provide; this seam covers the batching and error handling wrapped around
+// them, and it is deliberately the smallest one that does.
+type batchConn interface {
+	SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
+}
+
 // Writer bounds and batches every write this package makes. It is the only
 // component that talks SQL, and it runs entirely off the serving path: callers
 // hand it observations, it hands the database batches on a timer.
@@ -37,7 +50,9 @@ import (
 // Idempotency across a crash mid-flush therefore needs no bookkeeping table of
 // its own: the event tables' primary keys are the ledger.
 type Writer struct {
-	pool   *pgxpool.Pool
+	// pool is the batchConn the writer sends through: a *pgxpool.Pool in
+	// production, and the seam a unit test substitutes.
+	pool   batchConn
 	log    zerolog.Logger
 	opts   WriterOptions
 	ctx    context.Context
@@ -144,6 +159,21 @@ const (
 // NewWriter builds a Writer over an already-migrated pool. It does not start
 // the writer; call Start for that. The caller owns the pool.
 func NewWriter(pool *pgxpool.Pool, log zerolog.Logger, opts WriterOptions) *Writer {
+	// A typed nil would land in the batchConn as a non-nil interface, so the
+	// conversion goes through this helper and the nil stays nil.
+	return newWriter(connOrNil(pool), log, opts)
+}
+
+// connOrNil converts a possibly-nil pool to a possibly-nil batchConn without
+// producing a non-nil interface wrapping a nil pointer.
+func connOrNil(pool *pgxpool.Pool) batchConn {
+	if pool == nil {
+		return nil
+	}
+	return pool
+}
+
+func newWriter(pool batchConn, log zerolog.Logger, opts WriterOptions) *Writer {
 	opts.applyDefaults()
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Writer{
@@ -388,52 +418,45 @@ func (w *Writer) ObserveFailure(s FailureSample) bool {
 }
 
 // offerRotation enqueues a rotation attempt, evicting the oldest when full.
+// See offer for what the boolean means.
 func (w *Writer) offerRotation(a RotationAttempt) bool {
-	// Fast path: room in the queue.
-	select {
-	case w.rotations <- a:
-		return true
-	default:
-	}
-	// Full: evict the oldest to make room for the newest. The evicted attempt is
-	// lost, which the caller counts. A non-blocking receive guard means an empty
-	// queue (raced with the flusher) simply falls through to a second send
-	// attempt below.
-	select {
-	case <-w.rotations:
-		select {
-		case w.rotations <- a:
-			return true
-		default:
-			// The flusher drained the queue between the eviction and this send;
-			// the attempt is dropped rather than blocking.
-			return false
-		}
-	default:
-		select {
-		case w.rotations <- a:
-			return true
-		default:
-			return false
-		}
-	}
+	return offer(w.rotations, a)
 }
 
-// offer enqueues onto a channel, evicting the oldest when full. It mirrors
-// offerRotation and exists so the three same-shaped queues share one
-// implementation.
+// offer enqueues onto a channel, evicting the oldest when full.
+//
+// The boolean is "the value was queued", NOT "a value was lost". Evicting the
+// oldest and enqueueing the newest is the bounding behavior a full queue is
+// supposed to have — the newest observation is the one worth keeping — so that
+// path returns true. The alternative reading would make every overflow report a
+// drop while the queue in fact still holds the newest sample, and a caller that
+// increments its drop counter on false would then report losses that did not
+// happen while the evicted history stays invisible.
+//
+// It returns false only when the value could not be queued at all: the flusher
+// drained the queue between the eviction and this send, so the value was
+// dropped rather than blocking the caller.
 func offer[T any](ch chan T, value T) bool {
+	// Fast path: room in the queue.
 	select {
 	case ch <- value:
 		return true
 	default:
 	}
+	// Full: evict the oldest to make room for the newest. The evicted sample is
+	// lost and the caller cannot see it — that cost is the price of never
+	// blocking, and the writer's drop counters are the honest accounting for a
+	// writer that cannot keep up with its traffic, not a per-call signal.
+	// A non-blocking receive guard means an empty queue (raced with the flusher)
+	// simply falls through to a second send attempt below.
 	select {
 	case <-ch:
 		select {
 		case ch <- value:
 			return true
 		default:
+			// The flusher drained the queue between the eviction and this send;
+			// the value is dropped rather than blocking.
 			return false
 		}
 	default:

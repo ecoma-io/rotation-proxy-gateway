@@ -524,7 +524,7 @@ func run() error {
 	// file-mode operator that changes arrive "through the durable revision"
 	// would point them at a subsystem they are not running.
 	reloadAuthority := "configuration reloads are poller-driven, stop with SIGTERM"
-	// One context governs whichever source runs — exactly one of the two branches
+// One context governs whichever source runs — exactly one of the two branches
 	// below starts one — and the select loop cancels it on the way out. Deriving
 	// it here rather than per branch keeps cancelReload defined on every path
 	// without a dead placeholder value; only one goroutine ever consumes it.

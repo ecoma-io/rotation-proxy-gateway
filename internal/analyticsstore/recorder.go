@@ -145,7 +145,12 @@ func (r *Recorder) Instance() string {
 // accumulating in-process counters can label them with the bucket they belong
 // to without knowing the width.
 func (r *Recorder) BucketNow(t time.Time) time.Time {
-	if r == nil {
+	// A Recorder with no writer is the disabled configuration — NewRecorder
+	// returns nil, and callers hold the nil *Recorder — but the zero-value
+	// &Recorder{} is reachable too. Guarding only r would nil-dereference
+	// r.writer.opts, and bucketing needs no database, so an inert recorder must
+	// still hand back the instant it was given rather than take the caller down.
+	if r == nil || r.writer == nil {
 		return t
 	}
 	return bucketOf(t, r.writer.opts.BucketWidth)
