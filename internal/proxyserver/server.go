@@ -422,9 +422,18 @@ type AdminOptions struct {
 	// which is correct for a single-listener embedding that owns no drain
 	// sequence.
 	Lifecycle *Lifecycle
-	// Cluster is the cluster/durable scope of /status. Its zero value reports
-	// "no durable store configured", which is a supported deployment.
+	// Cluster is the cluster/durable scope of /status when it is static. Its zero
+	// value reports "no durable store configured", which is a supported
+	// deployment. ClusterSnapshot, when supplied, takes precedence so the binary
+	// can report the reconciler's cached active-pointer observation without a
+	// database query on every unauthenticated status request.
 	Cluster ClusterStatus
+	// ClusterSnapshot receives the one serving-generation revision /status already
+	// loaded. It must return only cached state — never make a store query here.
+	// Keeping the serving revision an argument makes the cluster scope internally
+	// consistent with the top-level pool snapshot even when a publication lands
+	// during a request.
+	ClusterSnapshot func(servingRevision int64) ClusterStatus
 	// Control, when non-nil, is the authenticated control API mounted behind
 	// this mux's unauthenticated endpoints.
 	//
@@ -476,8 +485,20 @@ func AdminMux(opts AdminOptions) *http.ServeMux {
 	}
 	mux.HandleFunc(ReadyPath, ready.serveReadyz)
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
-		writeStatus(w, opts.Version, opts.Started, opts.Store, opts.Listeners,
-			opts.Rotations, opts.IPRevisits, opts.Warm, opts.Cluster)
+		// One load owns this response. It supplies the top-level pool, the
+		// instance scope, and the serving revision given to the cached cluster
+		// observation, so a publication racing this request cannot make the
+		// response contradict itself.
+		gen := opts.Store.Load()
+		cluster := opts.Cluster
+		if opts.ClusterSnapshot != nil {
+			// This callback receives an already-loaded revision and returns only
+			// cached state; it must not turn the unauthenticated status handler
+			// into a database query path.
+			cluster = opts.ClusterSnapshot(gen.ConfigRevision)
+		}
+		writeStatus(w, opts.Version, opts.Started, gen, opts.Listeners,
+			opts.Rotations, opts.IPRevisits, opts.Warm, cluster)
 	})
 	if opts.Control != nil {
 		mux.Handle(ControlAPIMountPrefix+"/", http.StripPrefix(ControlAPIMountPrefix, opts.Control))

@@ -82,7 +82,7 @@ type ClusterStatus struct {
 // Every field is built here explicitly rather than reflected from the pool
 // snapshot, so adding a scope is a deliberate act: a new health counter becomes
 // instance-scoped because someone said so, not because it appeared on a struct.
-func writeStatus(w http.ResponseWriter, version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64, ipRevisits func() uint64, warm func() warmpool.Status, cluster ClusterStatus) {
+func writeStatus(w http.ResponseWriter, version string, started time.Time, gen *pool.Generation, listeners map[string]*Server, rotations func() uint64, ipRevisits func() uint64, warm func() warmpool.Status, cluster ClusterStatus) {
 	w.Header().Set("Content-Type", "application/json")
 	// Operational state and pool health describe a moving target, and /status is
 	// unauthenticated: a cached copy would be a wrong answer served as a right
@@ -97,8 +97,6 @@ func writeStatus(w http.ResponseWriter, version string, started time.Time, store
 		requests += status.Requests
 		failovers += status.Failovers
 	}
-	gen := store.Load()
-
 	status := map[string]any{
 		// The revision is read from the generation /status already loads, so
 		// reporting it costs no query against the control database and cannot

@@ -108,12 +108,16 @@ func TestControlAPIIsNotMountedWithoutADurableStore(t *testing.T) {
 func TestControlAPIMountsWithAStoreAndAToken(t *testing.T) {
 	generations, engine, cp := mountFixture(t)
 
-	handler, err := mountControlAPI(&config.BootstrapConfig{AdminToken: "an-operator-token"}, cp, generations, engine, zerolog.Nop())
+	bootstrap := &config.BootstrapConfig{AdminToken: "an-operator-token"}
+	handler, err := mountControlAPI(bootstrap, cp, generations, engine, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("mount: %v", err)
 	}
 	if handler == nil {
 		t.Fatal("a store and a token produced no control API")
+	}
+	if token := bootstrap.AdminToken; token != "" {
+		t.Errorf("the bootstrap configuration retained the control token as %q", token)
 	}
 
 	mux := proxyserver.AdminMux(proxyserver.AdminOptions{

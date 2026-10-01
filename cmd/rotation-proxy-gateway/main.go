@@ -304,6 +304,13 @@ func mountControlAPI(bootstrap *config.BootstrapConfig, cp *controlPlane, genera
 		return nil, errors.New("RPGW_CONFIG_STORE_DSN is set, so the control API is required, but RPGW_ADMIN_TOKEN is empty: set it to a bearer token, or unset RPGW_CONFIG_STORE_DSN to run without a control API")
 	}
 	auth := proxyserver.NewControlAuthenticator(bootstrap.AdminToken)
+	// Bootstrap config lives for the process lifetime, while the token must not.
+	// NewControlAuthenticator has reduced it to the fixed-size HMAC digest above,
+	// so clear the only plaintext field as soon as the conversion is complete.
+	// Strings cannot be zeroed in place, but replacing this reference makes the
+	// bootstrap object — which is what every later lifecycle path retains — stop
+	// owning it. The authenticator holds only tokenSum.
+	bootstrap.AdminToken = ""
 	// Belt and braces: the constructor returns nil for an empty token, and a nil
 	// authenticator refuses every request. Reaching this branch would mean the
 	// two facts above disagreed, and mounting a control API that answers 401 to
@@ -439,15 +446,22 @@ func run() error {
 			IPRevisits: engine.IPRevisits,
 			Warm:       warm.Snapshot,
 			Lifecycle:  lc,
-			// The cluster scope names what /status can say without a query. It
-			// reports the revision this instance serves from its own generation
-			// and the store's presence, and stops there: /status is
-			// unauthenticated, so every figure in it has to be free.
-			Cluster: proxyserver.ClusterStatus{
-				ConfigRevision:  poolStore.Load().ConfigRevision,
-				StoreConfigured: controlPlane != nil,
-				ActiveRevision:  poolStore.Load().ConfigRevision,
-				Synced:          true,
+			// The cluster scope names what /status can say without a query. The
+			// reconciler records the last active durable pointer in memory on every
+			// completed reconcile; paired with the generation loaded by the admin
+			// mux, it exposes a real convergence window without asking PostgreSQL
+			// on an unauthenticated request.
+			ClusterSnapshot: func(servingRevision int64) proxyserver.ClusterStatus {
+				if controlPlane == nil {
+					return proxyserver.ClusterStatus{ConfigRevision: servingRevision}
+				}
+				activeRevision := controlPlane.reconciler.ObservedRevision()
+				return proxyserver.ClusterStatus{
+					ConfigRevision:  servingRevision,
+					StoreConfigured: true,
+					ActiveRevision:  activeRevision,
+					Synced:          activeRevision == servingRevision,
+				}
 			},
 			Control: controlHandler,
 		}),

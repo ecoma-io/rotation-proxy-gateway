@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"rotation-proxy-gateway/internal/config"
@@ -86,6 +87,19 @@ type Reconciler struct {
 	// held, or a slow subscriber would stall every subsequent materialization.
 	notifyMu sync.Mutex
 	notify   func(*config.RuntimeConfig)
+
+	// observed is the durable store's last active-pointer observation. It is
+	// deliberately separate from pool.ConfigRevision: the latter says what this
+	// instance is serving, while this one says what the reconciler last saw the
+	// cluster point at. /status reads the two from memory so it can truthfully
+	// show a convergence window without turning its unauthenticated endpoint into
+	// a control-database query amplifier.
+	//
+	// It is written on every completed Active read — before Apply, including an
+	// invalid revision that Apply refuses — so an operator can tell "the cluster
+	// moved but this instance rejected it" from "the cluster did not move".
+	// NoRevision is represented as zero.
+	observed atomic.Int64
 }
 
 // Subscribe registers a callback invoked after each successful publication, with
@@ -103,6 +117,17 @@ func (r *Reconciler) Subscribe(fn func(*config.RuntimeConfig)) {
 	defer r.notifyMu.Unlock()
 	r.notify = fn
 }
+
+// ObservedRevision is the durable active revision this reconciler most recently
+// read, or zero when it has not observed an active revision yet.
+//
+// It is intentionally a cached observation rather than a store read. The
+// unauthenticated /status handler needs to distinguish the revision serving in
+// this process from the cluster pointer it is converging toward, but asking the
+// database on every status request would turn an operational endpoint into a
+// query amplifier. ReconcileOnce updates the observation on every completed
+// Active read, even when the candidate fails validation and cannot be served.
+func (r *Reconciler) ObservedRevision() int64 { return r.observed.Load() }
 
 // announce reports a published configuration to the subscriber, if any. It is
 // called with applyMu held but takes only notifyMu, which no other path holds
@@ -213,12 +238,20 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 		if errors.Is(err, configstore.ErrNoActiveRevision) {
 			// Nothing committed yet. The serving generation is whatever the seed
 			// produced, which is the correct thing to keep serving: an empty
-			// store is not a reason to stop proxying.
+			// store is not a reason to stop proxying. The zero observation tells
+			// /status there is no active cluster pointer to converge on.
+			r.observed.Store(0)
 			r.log.Debug().Msg("config store has no active revision; keeping the current generation")
 			return nil
 		}
 		return fmt.Errorf("read active config revision: %w", err)
 	}
+	// Publish the observation before validating and materializing it. A durable
+	// revision this binary cannot serve is still where the cluster points, and
+	// /status must show that the replica is behind rather than report a stale
+	// pointer as though it were current. This is one atomic memory write, never a
+	// database read on a status request.
+	r.observed.Store(int64(active.Revision))
 	return r.Apply(ctx, configstore.Document{Version: active.DocVersion, JSON: active.Document}, active.Revision)
 }
 
@@ -276,6 +309,10 @@ func (r *Reconciler) Seed(ctx context.Context, cfg *config.RuntimeConfig) (confi
 	switch {
 	case err == nil:
 		// Already seeded. Converge on what is there rather than overwriting it.
+		// Record the pointer first for the same reason ReconcileOnce does: a
+		// durable revision that cannot be materialized is still the cluster's
+		// active revision, and the status cache must not make it disappear.
+		r.observed.Store(int64(active.Revision))
 		if err := r.applyLocked(ctx, configstore.Document{Version: active.DocVersion, JSON: active.Document}, active.Revision); err != nil {
 			return active.Revision, err
 		}
@@ -297,6 +334,11 @@ func (r *Reconciler) Seed(ctx context.Context, cfg *config.RuntimeConfig) (confi
 	if err != nil {
 		return 0, fmt.Errorf("seed initial config revision: %w", err)
 	}
+	// The commit moved the durable pointer. Preserve that fact before applying:
+	// should validation ever reject the just-written document, /status must show
+	// the pointer this instance is behind rather than pretend it is still at the
+	// previous revision.
+	r.observed.Store(int64(record.Revision))
 	if err := r.applyLocked(ctx, doc, record.Revision); err != nil {
 		return record.Revision, err
 	}

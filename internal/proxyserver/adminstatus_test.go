@@ -217,6 +217,49 @@ func TestStatusPreservesEveryPreExistingTopLevelKey(t *testing.T) {
 	}
 }
 
+// The dynamic cluster snapshot receives the one generation /status loaded, and
+// its values are returned alongside that same snapshot. This is what lets the
+// binary compare a cached reconciler observation to what it is serving without a
+// second generation load or a database query on the unauthenticated endpoint.
+func TestStatusBuildsClusterScopeFromTheServingSnapshot(t *testing.T) {
+	cfg := &config.RuntimeConfig{
+		MaxRetries:   1,
+		DialTimeout:  time.Second,
+		CooldownBase: time.Second,
+		CooldownMax:  time.Minute,
+	}
+	generations := pool.NewStore(cfg, pool.NewRoutes(nil, cfg.CooldownBase, cfg.CooldownMax))
+	generations.PublishRevision(cfg, 21)
+	var received int64
+	admin := httptest.NewServer(AdminMux(AdminOptions{
+		Version: "test",
+		Started: time.Now(),
+		Store:   generations,
+		ClusterSnapshot: func(servingRevision int64) ClusterStatus {
+			received = servingRevision
+			return ClusterStatus{
+				ConfigRevision:  servingRevision,
+				StoreConfigured: true,
+				ActiveRevision:  22,
+				Synced:          false,
+			}
+		},
+	}))
+	t.Cleanup(admin.Close)
+
+	_, got := fetchStatus(t, admin)
+	if received != 21 {
+		t.Errorf("ClusterSnapshot received %d, want the one serving revision 21", received)
+	}
+	cluster := got[ScopeCluster].(map[string]any)
+	if cluster["configRevision"] != float64(21) || cluster["activeRevision"] != float64(22) || cluster["synced"] != false {
+		t.Errorf("cluster = %v, want the cached cluster pointer 22 beside serving revision 21", cluster)
+	}
+	if got["configRevision"] != float64(21) {
+		t.Errorf("top-level configRevision = %v, want the same serving snapshot", got["configRevision"])
+	}
+}
+
 // An unconfigured store is a supported deployment, and /status says so rather
 // than implying a fault or inventing a revision.
 func TestStatusReportsAnUnconfiguredStoreAsSuch(t *testing.T) {
