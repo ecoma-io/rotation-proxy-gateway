@@ -211,6 +211,24 @@ HTTP/1.1`. An origin-form target on a proxy listener is a request for a
   health entirely; rotate-API headers, bodies, and URLs must never reach logs,
   errors, or `/status`. `rotation.drain-timeout` (one route's pre-rotation
   quiesce) is unrelated to `RPGW_SHUTDOWN_GRACE` (whole-process listener drain).
+- Cluster coordination is **opt-in and off by default**: with
+  `RPGW_COORD_REDIS_ADDR` unset every instance rotates independently, exactly as
+  before this subsystem existed. Set, instances contend for a rotation lease
+  whose fencing token is issued by the authority and strictly increases on every
+  acquisition, so a holder that pauses past its TTL and resumes is refused at the
+  point of mutation instead of overwriting a peer's rotation. Fencing is enforced
+  inside the same Redis script that commits, together with the exactly-once
+  idempotency check — never as a client-side read-then-act. A successful rotation
+  bumps a cluster-wide epoch that every instance adopts onto its own routes,
+  which is what discards warm connections parked under an earlier generation.
+  Pub/sub only ever prompts a re-read; the periodic reconcile is the guarantee, so
+  a dropped message costs one interval and never correctness. No coordination
+  read or write is ever on the request path, and no credential, inbound account,
+  or rotate-API URL, header, or body ever reaches Redis. Both variables are
+  bootstrap-only and restart-required; an unreachable Redis fails startup rather
+  than degrading to un-coordinated rotation. The lease is released on clean
+  shutdown so a peer takes over at once, and deliberately not on a crash — see
+  [`docs/coordination.md`](docs/coordination.md).
 - Shutdown runs in a fixed order: `/readyz` goes `503` while every listener is
   still accepting, then a 5s readiness head start (drawn from the grace, capped
   at `grace/2`, covering all listeners plus admin), then the rotation engine,
@@ -267,9 +285,10 @@ binary `healthcheck` subcommand (no shell in the scratch image).
 - `internal/proxyserver` — inbound HTTP forward proxy: request parsing, `Proxy-Authorization`, the `x-ecoma-*` control headers (`x-ecoma-proxy-family` route constraint, `x-ecoma-request-id` correlation id), the protocol-agnostic route-selection and relay engine they feed, plus the admin mux
 - `internal/socksdial` — the shared SOCKS5 dialer used by the proxy server and the rotation probes; `DialHalf` parks a half-handshake (TCP + greeting + auth) the warm pool completes later with `CompleteConnect`
 - `internal/warmpool` — background pool of half-established upstream connections, bounded per route and process-wide, epoch-invalidated by rotation, borrowed on the serving path
+- `internal/coord` — cluster coordination authority: the fencing-token lease, the Lua scripts that enforce fencing and exactly-once atomically with the mutation, the cluster rotation epoch, the shared rotation record, and the pub/sub-plus-reconcile watcher
 - `internal/rotation` — manual-route rotation engine: scheduling under the concurrency cap, drain, probes, rotate calls, verification, backoff
 - `cmd/rotation-proxy-gateway` — lifecycle, signals, watcher, admin endpoints
-- `docs` — the behavior-contract pages (configuration, rotation, warm pool, failure and route health, inbound HTTP forward proxy, observability, deployment)
+- `docs` — the behavior-contract pages (configuration, rotation, warm pool, cluster coordination, failure and route health, inbound HTTP forward proxy, observability, deployment)
 - `e2e` — black-box tests and benchmarks driving the real binary as a
   subprocess with SOCKS5/HTTP/trace/rotate-API simulators; `go test ./e2e/`
   (skip with `-short`), baselines in `e2e/BENCH.md`

@@ -91,6 +91,9 @@ bootstrap variable carries the `RPGW_` prefix;
 - [Warm upstream pool](docs/warm-pool.md) — the optional bounded pool of
   half-established upstream connections: bounds, borrowing, and rotation
   isolation.
+- [Cluster coordination](docs/coordination.md) — the optional multi-instance
+  rotation lease, its fencing token, the cluster rotation epoch that invalidates
+  warm connections everywhere, and why pub/sub is only ever a hint.
 - [Failure and route health](docs/failure-and-health.md) — the failure
   classification contract (`proxy_connect`, `auth_route`, `socks_connect`,
   `connect_target`, `setup`, `no_route`, `retry_exhausted`), round-robin
