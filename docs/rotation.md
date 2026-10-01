@@ -57,16 +57,16 @@ rotation:
   retry-backoff-max: 15m
 ```
 
-| Setting             |          Default | Meaning                                                                                                                                                                                                                                 |
-| ------------------- | ---------------: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mode`              |     `disruptive` | How a route admits traffic while its own rotation runs. `disruptive` takes the route out of service for the procedure; `seamless` keeps serving and holds back only the changeover itself. See [Traffic admission](#traffic-admission). |
-| `max-concurrent`    |              `1` | Rotation procedures running at once: a fixed count, or `"NN%"` of the manual routes (a whole number 1-100, rounded up, at least 1, never more than the route count). Resolved fresh every scheduling cycle.                             |
-| `drain-timeout`     |            `55s` | How long a procedure waits for the route's in-flight requests to finish before force-rotating. Expiry does not wait longer; requests already in flight may continue on the old egress IP.                                               |
-| `rotate-on-start`   |          `false` | Rotate every manual route at process start, under the same cap and staggering, instead of waiting one interval.                                                                                                                         |
-| `ip-check-url`      | Cloudflare trace | HTTPS URL whose response body contains an `ip=` line. **Must be `https`.** The probe always verifies TLS independently of any route setting.                                                                                            |
-| `ip-check-timeout`  |            `20s` | Total window for one verification: how long a procedure watches for a changed IP before giving up on that attempt.                                                                                                                      |
-| `ip-check-interval` |             `2s` | Pause between verification probes inside that window; must not exceed `ip-check-timeout`.                                                                                                                                               |
-| `retry-backoff-max` |            `15m` | Ceiling of the same-IP retry backoff.                                                                                                                                                                                                   |
+| Setting             |          Default | Meaning                                                                                                                                                                                                                                           |
+| ------------------- | ---------------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`              |     `disruptive` | How a route admits traffic while its own rotation runs. `disruptive` takes the route out of service for the procedure; `seamless` keeps serving and takes it out of picks for the changeover itself. See [Traffic admission](#traffic-admission). |
+| `max-concurrent`    |              `1` | Rotation procedures running at once: a fixed count, or `"NN%"` of the manual routes (a whole number 1-100, rounded up, at least 1, never more than the route count). Resolved fresh every scheduling cycle.                                       |
+| `drain-timeout`     |            `55s` | How long a procedure waits for the route's in-flight requests to finish before force-rotating. Expiry does not wait longer; requests already in flight may continue on the old egress IP.                                                         |
+| `rotate-on-start`   |          `false` | Rotate every manual route at process start, under the same cap and staggering, instead of waiting one interval.                                                                                                                                   |
+| `ip-check-url`      | Cloudflare trace | HTTPS URL whose response body contains an `ip=` line. **Must be `https`.** The probe always verifies TLS independently of any route setting.                                                                                                      |
+| `ip-check-timeout`  |            `20s` | Total window for one verification: how long a procedure watches for a changed IP before giving up on that attempt.                                                                                                                                |
+| `ip-check-interval` |             `2s` | Pause between verification probes inside that window; must not exceed `ip-check-timeout`.                                                                                                                                                         |
+| `retry-backoff-max` |            `15m` | Ceiling of the same-IP retry backoff.                                                                                                                                                                                                             |
 
 `rotation.drain-timeout` and `RPGW_SHUTDOWN_GRACE` are unrelated budgets. The
 drain timeout bounds one route's pre-rotation quiesce; the shutdown grace bounds
@@ -81,25 +81,39 @@ procedure itself — drain, baseline probe, rotate call, verify, commit — is o
 code path, and the mode contributes a policy that is consulted at three points
 instead of a second engine.
 
-| Mode         | While the procedure runs                                                                                                                                                                                         | After verification                                    |
-| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| `disruptive` | The route takes no new picks from the first step until the last; requests already in flight finish on their existing tunnels.                                                                                    | The route returns to service.                         |
-| `seamless`   | The route keeps taking picks. The drain waits for in-flight work as before, but expiry is bounded by the changeover timeout instead of `drain-timeout`, and new picks are held back only across the verify step. | The route is already serving; nothing is re-admitted. |
+| Mode         | While the procedure runs                                                                                                                                                                                                                                                                     | After verification                                                                 |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `disruptive` | The route takes no new picks from the first step until the last; requests already in flight finish on their existing tunnels.                                                                                                                                                                | The route returns to service.                                                      |
+| `seamless`   | The route keeps taking picks through the drain, the baseline probe and the rotate call. Expiry is bounded by the changeover timeout instead of `drain-timeout` alone. Across the changeover itself the route takes no new picks, so nothing is opened against an egress IP that is mid-swap. | The route is already serving; the changeover hold closes and it takes picks again. |
 
 Both modes apply the same epoch step, so the invariant that a warm connection's
 epoch must equal its route's current epoch or it is discarded holds unchanged in
 either: a successful rotation retires the connections parked under the previous
-egress IP either way. What differs is eligibility — in `disruptive` the route's
-rotating flag is raised for the whole procedure and the pool stops selecting it;
-in `seamless` that flag is never raised, so the pool keeps selecting the route
-and only the changeover itself holds traffic back.
+egress IP either way. What differs is eligibility, and there is one mechanism for
+it. The pool reads a single predicate on both of `PickFor`'s paths — the ordinary
+candidate scan and the all-cooling fallback — and `disruptive` keeps that
+predicate true for the whole procedure by raising the route's rotating flag.
+`seamless` never raises the flag; it keeps the route selectable through the drain
+and opens a **changeover hold** across the swap, a bounded deadline on the same
+predicate. A held route is not picked on either path and reports
+`available: false` in `/status` while it is held.
+
+The hold is a deadline rather than a flag for one reason: it cannot outlive its
+window. The bound runs from the moment the procedure was admitted, so the drain,
+the baseline probe and the rotate call spend it rather than each getting their
+own copy, and a procedure that dies without closing the hold — shutdown, a reload
+that dropped the route — still returns the route to picks when the deadline
+passes. A changeover that opens after the budget is already spent therefore opens
+no hold at all, and the route serves through it.
 
 A seamless rotation therefore finishes on the egress IP it started with for work
 that was already in flight, and serves new work on the new IP once the changeover
-completes. That is the same upstream property the disruptive mode relies on when
-`drain-timeout` expires: in-flight requests finish on the tunnel they already
-have and are never broken. Neither mode reports a transition failure as a
-permanent route failure — an interrupted or failed rotation leaves the route
+completes. A pick arriving during the changeover is answered `503` (`05 01`) like
+any other request with no eligible route; it is never handed to a route whose
+egress IP is mid-swap. That is the same upstream property the disruptive mode
+relies on when `drain-timeout` expires: in-flight requests finish on the tunnel
+they already have and are never broken. Neither mode reports a transition failure
+as a permanent route failure — an interrupted or failed rotation leaves the route
 serving with its health state untouched, whether it was ever held out of picks or
 not.
 
@@ -109,7 +123,7 @@ Each attempt runs: **drain → baseline probe → rotate call → verify**.
 
 1. **Drain.** In `disruptive` mode the route stops receiving new picks
    immediately and stays ineligible for the whole procedure; in `seamless` mode
-   it keeps taking picks and only the changeover step below holds them back. The procedure waits for the route's
+   it keeps taking picks and only the changeover step below takes them away. The procedure waits for the route's
    in-flight connections to finish, bounded by `drain-timeout`; expiry proceeds
    anyway, and the in-flight requests keep running on their existing tunnels —
    they finish on the old egress IP, none are broken. Draining a route that
@@ -126,19 +140,27 @@ Each attempt runs: **drain → baseline probe → rotate call → verify**.
    with `Retry-After: N` raises the next attempt's wait to at least `N` seconds
    — still capped by `retry-backoff-max`, so one response cannot silence the
    route's retries for days.
-4. **Verify.** The gateway re-probes until `ip-check-timeout` elapses. The
+4. **Verify.** The changeover happens here: the rotate call has returned, and the
+   egress IP is about to change underneath anything the gateway opens next. In
+   `seamless` mode the route takes no new picks from this point until the
+   changeover settles — a hold bounded by the changeover timeout, measured from
+   the moment the attempt was admitted. In `disruptive` mode the route is already
+   out of picks and there is nothing to hold. Then the gateway re-probes until
+   `ip-check-timeout` elapses. The
    attempt **succeeds only if the reported IP differs from the baseline and is
    not the current IP of any other manual route** (a cross-route collision does
    not count). Every comparison is made under one canonical IP identity: two
    spellings of one address — IPv4 and its IPv4-mapped IPv6 form, expanded and
    compressed IPv6 — are one address, so a provider that switches spellings has
-   not rotated anything. Success records the new IP as the route's baseline and advances
+   not rotated anything. Success records the new IP as the route's baseline, closes
+   any changeover hold, and advances
    the route's `rotationCount` — plus its `ipRevisitCount` when the new address
    is one the route had already verified (see [states](#states)) — clears both
    dial-cooldown scopes learned against the old IP — the route-scope cooldown
    and every pair-scoped (route, target) cooldown, whose refusals were answered
    from the old address — and never clears an authentication block:
-   credentials did not rotate with the IP.
+   credentials did not rotate with the IP. The hold closes on any verify outcome,
+   including giving up.
 
 **An unchanged IP is not a failure of the route.** The route returns to serving
 immediately in the `stale` state, and the gateway retries forever — the next

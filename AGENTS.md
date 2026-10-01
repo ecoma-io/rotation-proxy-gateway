@@ -209,9 +209,11 @@ HTTP/1.1`. An origin-form target on a proxy listener is a request for a
   admitted to the route while its own procedure runs — one procedure, two
   policies, no second engine. `disruptive` (default) takes the route out of
   picks for the whole procedure and re-admits it after verification;
-  `seamless` keeps serving, bounding the drain and holding back only the
-  changeover so in-flight work finishes on the tunnel it already has while the
-  new IP is verified underneath it. Both modes advance the rotation epoch
+  `seamless` keeps serving, bounding the drain and taking the route out of picks
+  for the changeover only, so in-flight work finishes on the tunnel it already has
+  while the new IP is verified underneath it. The changeover hold is a bounded
+  deadline rather than a flag, so it cannot outlive its window even if the
+  procedure is cut short; both modes advance the rotation epoch
   exactly once per procedure, so a warm connection whose epoch no longer matches
   its route is discarded either way. A failed or interrupted rotation leaves the
   route serving with health untouched in both modes. An unchanged IP never takes the

@@ -51,6 +51,14 @@ type Proxy struct {
 	cooldownUntil atomic.Int64 // dial cooldown deadline, relNanos; 0 = none
 	authBlocked   atomic.Bool
 	rotating      atomic.Bool
+	// rotationHoldUntil is the deadline of a changeover hold: a rotation
+	// procedure that took the route out of picks for one bounded window rather
+	// than for its whole run (see HoldRotationUntil). relNanos, 0 = no hold.
+	// It is an atomic rather than p.mu state because the pick path of every
+	// request reads it. The terminal transitions clear it in the same p.mu
+	// section that clears the flag above, so a reader that sees a cleared
+	// rotating flag never also sees a hold still claiming the route.
+	rotationHoldUntil atomic.Int64
 	// rotationEpoch is the route's rotation generation counter: it advances
 	// exactly when a rotation procedure begins (BeginRotation), so state
 	// stamped with an older epoch — a parked upstream connection — provably
@@ -329,16 +337,50 @@ func (p *Proxy) coolingTargetPairs(nowNano int64) int {
 // negative nowNano, which compares consistently against stored deadlines.
 func (p *Proxy) availableAt(nowNano int64) bool {
 	cu := p.cooldownUntil.Load()
-	return !p.authBlocked.Load() && !p.rotating.Load() && (cu == 0 || nowNano >= cu)
+	return !p.authBlocked.Load() && !p.heldAt(nowNano) && (cu == 0 || nowNano >= cu)
+}
+
+// heldAt reports whether the route is out of picks at nowNano because a
+// rotation is running on it, or because a changeover hold is still within its
+// own bound. It is the single eligibility predicate both of PickFor's paths read
+// — the candidate scan through availableAt, the all-cooling fallback directly —
+// and both pass the pool's injected nowNano, so one pick decision is never made
+// against two clocks.
+//
+// The hold is a deadline, not a flag, so a hold cannot outlive the procedure
+// that opened it: a caller that passes a nowNano beyond the deadline — including
+// the pool's own clock, if the procedure is what failed to release it — sees the
+// route serving again.
+func (p *Proxy) heldAt(nowNano int64) bool {
+	if p.rotating.Load() {
+		return true
+	}
+	hu := p.rotationHoldUntil.Load()
+	return hu != 0 && nowNano < hu
 }
 
 func (p *Proxy) cooldownNano() int64 { return p.cooldownUntil.Load() }
 
 func (p *Proxy) authBlockedNow() bool { return p.authBlocked.Load() }
 
-// RotatingNow reports whether a rotation procedure currently holds the route
-// out of picks.
+// RotatingNow reports whether a rotation procedure is running on the route —
+// the BeginRotation flag alone, with no changeover hold folded in. It answers
+// "is a procedure in flight", which is what the route's display state and the
+// phase writes are about; whether the route may take a pick is heldAt, and
+// RotationHeld is that question on the real clock for callers off the pick path.
 func (p *Proxy) RotatingNow() bool { return p.rotating.Load() }
+
+// RotationHeld reports whether the route is out of picks for a rotation reason:
+// a procedure running on it, or a changeover hold still inside its bound.
+//
+// It is heldAt on the real clock, for callers outside the pick path that have no
+// injected one — the warm pool's replenish eligibility, which already excludes a
+// rotating route and must exclude a held one for the same reason. Every read
+// inside a pick decision goes through heldAt with the pool's own clock instead,
+// so one decision is never made against two clocks. A hold whose deadline has
+// passed is not held: the bound is the guarantee, and a reader that is late sees
+// the route serving.
+func (p *Proxy) RotationHeld() bool { return p.heldAt(relNanos(time.Now())) }
 
 // AuthBlockedNow reports whether the route is hard-blocked for failed
 // upstream authentication.
@@ -358,8 +400,6 @@ func (p *Proxy) CooldownActive() bool {
 func (p *Proxy) RotationEpoch() uint64 { return p.rotationEpoch.Load() }
 
 func (p *Proxy) recencyPass() uint64 { return p.pass.Load() }
-
-func (p *Proxy) rotatingNow() bool { return p.rotating.Load() }
 
 // Status is the exported health view of one proxy. Proxy is the redacted
 // host:port (credentials never leave the process). TargetCooldowns and
@@ -606,7 +646,7 @@ func (pl *Pool) PickFor(exclude map[*Proxy]bool, allow func(*Proxy) bool, target
 			avail = append(avail, e)
 			continue
 		}
-		if !e.authBlockedNow() && !e.rotatingNow() {
+		if !e.authBlockedNow() && !e.heldAt(nowNano) {
 			cu := e.effectiveCooldownNano(target)
 			if fallback == nil || cu < fallbackCooldown {
 				fallback, fallbackCooldown = e, cu
@@ -890,7 +930,7 @@ func (pl *Pool) Snapshot() []Status {
 			Kind:                e.Kind,
 			Origin:              string(e.Origin),
 			ID:                  pl.ids[e],
-			Available:           !e.authBlocked.Load() && !e.rotating.Load() && !cooling,
+			Available:           !e.authBlocked.Load() && !e.heldAt(nowNano) && !cooling,
 			InFlight:            int(e.inFlight.Load()),
 			ConsecutiveFailures: e.consecutiveFailures,
 			CooldownFor:         cooldown,

@@ -22,7 +22,7 @@
 //     pass's closes. The sweeper collects the live route-pointer set
 //     (RoutePointers takes the pool lock) BEFORE acquiring wp.mu, so the
 //     two never nest.
-//   - Borrow touches only Proxy atomics (RotatingNow and friends) and never
+//   - Borrow touches only Proxy atomics (RotationEpoch and friends) and never
 //     takes a pool lock.
 //   - The wake channel is never closed — a send racing a close would panic
 //     on the request path; workers exit on the context alone.
@@ -316,13 +316,14 @@ func (wp *Pool) sweep() {
 }
 
 // replenishEligibleLocked reports whether the route may receive new warm
-// dials right now. Rotating routes are mid-procedure; auth-broken ones cannot
-// authenticate a half handshake; cooling ones just produced request-path
-// failures, and their worker capacity is better spent elsewhere until the
-// cooldown lifts. Pausing replenish changes no cooldown value anywhere — the
-// warm pool never writes route health.
+// dials right now. A held route — mid-procedure, or inside a seamless
+// changeover hold — is on an egress IP that is about to change or has just
+// changed; auth-broken ones cannot authenticate a half handshake; cooling ones
+// just produced request-path failures, and their worker capacity is better spent
+// elsewhere until the cooldown lifts. Pausing replenish changes no cooldown
+// value anywhere — the warm pool never writes route health.
 func (wp *Pool) replenishEligibleLocked(p *pool.Proxy, b *routeBucket, now time.Time) bool {
-	if p.RotatingNow() || p.AuthBlockedNow() || p.CooldownActive() {
+	if p.RotationHeld() || p.AuthBlockedNow() || p.CooldownActive() {
 		return false
 	}
 	if b.authBroken || now.Before(b.backoffUntil) {
@@ -526,6 +527,14 @@ func (wp *Pool) runDial(t dialTask) {
 // and rotation-epoch check share one critical section, so a connection is
 // either handed out or invalidated — never both. A half connection handed
 // out here is single-use: CompleteConnect consumes it.
+//
+// The epoch check is the whole rotation guard, and it needs no second one: a
+// caller only reaches Borrow with a route PickFor returned, and PickFor returns
+// no route that is held for a rotation — mid-procedure or across a seamless
+// changeover — on either of its paths. A held route therefore has no request
+// here to borrow for, while the epoch retires the parked connections an earlier
+// procedure left behind, and replenishEligibleLocked pauses the dialers so the
+// bucket does not refill until the hold closes.
 func (wp *Pool) Borrow(p *pool.Proxy) *socksdial.HalfConn {
 	if p == nil {
 		return nil

@@ -3,6 +3,7 @@ package rotation
 import (
 	"context"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,13 +186,13 @@ func TestSeamlessServesTrafficAcrossTheRotation(t *testing.T) {
 		t.Fatal("procedure never reached the rotate API call")
 	}
 
-	// Through the drain and through the changeover alike: the policy never
-	// raised the flag PickFor reads, and it advanced the epoch regardless.
+	// Through the drain and up to the changeover: the policy raised no flag, and
+	// it advanced the epoch regardless.
 	if got := p.RotationEpoch(); got != 1 {
 		t.Fatalf("epoch mid-procedure = %d, want 1", got)
 	}
 	if p.RotatingNow() {
-		t.Fatal("seamless route was held out of picks during the changeover")
+		t.Fatal("seamless route raised the rotating flag before the changeover")
 	}
 	for _, target := range []string{"a.test:443", "b.test:443"} {
 		if got := s.pl.PickFor(nil, nil, target); got != p {
@@ -218,12 +219,17 @@ func TestSeamlessServesTrafficAcrossTheRotation(t *testing.T) {
 }
 
 // An epoch that moved without the route leaving service is exactly the seamless
-// case, and it must be the epoch alone: the rotating flag, which PickFor reads,
-// must stay clear or the mode is not doing what it claims. The bump also retires
-// warm connections established under the old egress IP — the warm pool discards
-// a parked connection whose stamp no longer matches, which
+// case, and it must be the epoch alone: the rotating flag, which PickFor reads
+// on both its paths, must stay clear, or the mode would report a rotation in
+// flight and the engine's own phase writes would start landing. The bump also
+// retires warm connections established under the old egress IP — the warm pool
+// discards a parked connection whose stamp no longer matches, which
 // TestAdmitRotationEpochInvalidatesWarmConnections pins in the warm pool itself.
-func TestSeamlessAdvancesEpochWithoutHoldingRouteOutOfPicks(t *testing.T) {
+//
+// The observation point matters: the rotate call is parked, so these assertions
+// run before HoldTraffic. What a pick does *after* the changeover opens is
+// TestSeamlessHoldsTheRouteOutOfPicksAcrossTheChangeover's subject.
+func TestSeamlessAdvancesEpochWithoutRaisingTheRotatingFlag(t *testing.T) {
 	ips := newIPServer(t, "203.0.113.7")
 	api := newAPIServer(t)
 	entered := make(chan struct{})
@@ -518,7 +524,8 @@ func TestSuccessfulRotationCommitsExactlyOnce(t *testing.T) {
 
 // The seamless holdback belongs to the changeover that opened it. A second
 // changeover for the same route must not release the first one's hold early,
-// and the hold must clear exactly once its own changeover settles.
+// and the hold must clear exactly once its own changeover settles — including
+// clearing the deadline it left in the pool, not just the bookkeeping.
 func TestSeamlessHoldbackBelongsToOneChangeover(t *testing.T) {
 	s := newSeamlessPolicy(time.Now)
 	p := &pool.Proxy{}
@@ -526,15 +533,254 @@ func TestSeamlessHoldbackBelongsToOneChangeover(t *testing.T) {
 	s.Admit(p, pool.RotationDraining, discardLogger())
 	attempt := p.RotationEpoch()
 	s.HoldTraffic(p, discardLogger())
+	if !p.RotationHeld() {
+		t.Fatal("HoldTraffic opened no hold on the route")
+	}
+	// The bound is the window, not the wall instant: the stored deadline is
+	// rebuilt through processStart and so arrives without its monotonic reading,
+	// which is why RotationHoldUntil documents that only its duration is exact.
+	until := p.RotationHoldUntil()
+	if d := time.Until(until); d > ChangeoverTimeout || d < ChangeoverTimeout-2*time.Second {
+		t.Fatalf("hold window = %s, want the changeover budget %s", d.Truncate(time.Millisecond), ChangeoverTimeout)
+	}
 
 	if s.Settle(p, attempt+1, discardLogger()) {
 		t.Fatal("a foreign attempt released a live holdback")
 	}
+	if !p.RotationHeld() {
+		t.Fatal("a foreign attempt closed the hold in the pool")
+	}
 	if !s.Settle(p, attempt, discardLogger()) {
 		t.Fatal("the changeover's own attempt could not release its holdback")
 	}
+	if p.RotationHeld() {
+		t.Fatal("the released holdback is still holding the route out of picks")
+	}
 	if s.Settle(p, attempt, discardLogger()) {
 		t.Fatal("a settled changeover released a holdback twice")
+	}
+}
+
+// Readmit is the abort path, and Settle does not run on it: a rotation cut short
+// by shutdown, or by a reload that dropped the route, must still return the
+// route to service rather than leaving it out of picks until the hold's
+// deadline.
+func TestSeamlessReadmitReleasesAnOpenHold(t *testing.T) {
+	s := newSeamlessPolicy(time.Now)
+	p := &pool.Proxy{}
+
+	s.Admit(p, pool.RotationDraining, discardLogger())
+	s.HoldTraffic(p, discardLogger())
+	if !p.RotationHeld() {
+		t.Fatal("HoldTraffic opened no hold on the route")
+	}
+
+	s.Readmit(p, discardLogger())
+	if p.RotationHeld() {
+		t.Fatal("Readmit left the route held out of picks")
+	}
+	if s.Settle(p, p.RotationEpoch(), discardLogger()) {
+		t.Fatal("a forgotten changeover reported a hold it no longer has")
+	}
+}
+
+// The hold ends at the one deadline that bounds the changeover, the same instant
+// ShouldContinue bounds the drain to, measured from the moment the procedure was
+// admitted. So the drain, the baseline probe, the rotate call and the hold spend
+// one budget rather than each getting their own, and a changeover that opens
+// after the budget is gone holds for nothing at all.
+func TestSeamlessHoldIsBoundedByTheChangeoverBudget(t *testing.T) {
+	admitted := time.Now()
+	p := &pool.Proxy{}
+
+	s := newSeamlessPolicy(func() time.Time { return admitted })
+	s.Admit(p, pool.RotationDraining, discardLogger())
+	s.HoldTraffic(p, discardLogger())
+
+	// The deadline is the changeover's, and the hold is open: nothing else in the
+	// procedure has a say in it.
+	if got, want := p.RotationHoldUntil(), changeoverDeadline(admitted); got.Sub(want) > time.Second || got.Sub(want) < -time.Second {
+		t.Fatalf("hold deadline = %v, want the changeover deadline %v", got, want)
+	}
+	if !p.RotationHeld() {
+		t.Fatal("a freshly opened hold does not hold the route")
+	}
+
+	// A drain that ran to the deadline leaves the hold with nothing to hold for,
+	// and the pool says so rather than the policy second-guessing it: the deadline
+	// has already elapsed, so the route serves straight through this changeover.
+	spent := newSeamlessPolicy(func() time.Time { return admitted.Add(-ChangeoverTimeout) })
+	spent.Admit(p, pool.RotationDraining, discardLogger())
+	spent.HoldTraffic(p, discardLogger())
+	if p.RotationHeld() {
+		t.Fatal("a hold past its deadline still holds the route")
+	}
+}
+
+// TestSeamlessHoldsTheRouteOutOfPicksAcrossTheChangeover is the serving-path
+// half of the mode, observed where it actually happens: after the rotate call
+// returns, so HoldTraffic has run and the hold is open.
+//
+// Before the changeover the route is picked (TestSeamlessServesTrafficAcrossThe
+// Rotation). Across it the route is not picked at all — on either of PickFor's
+// paths, and no matter what the alternatives are — which is the whole content
+// of the documented hold-back. After the changeover settles it is picked again.
+func TestSeamlessHoldsTheRouteOutOfPicksAcrossTheChangeover(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	api := newAPIServer(t)
+	// The rotate call parks here with the changeover open. Nothing after it can
+	// release the hold until this opens, so observing the hold observes the window
+	// rather than racing the commit.
+	gate := make(chan struct{})
+	var gateOnce sync.Once
+	// Opened by the cleanup too, so an early Fatal cannot leave the parked handler
+	// holding httptest.Server.Close open.
+	t.Cleanup(func() { gateOnce.Do(func() { close(gate) }) })
+	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		ips.set("198.51.100.9")
+		<-gate
+		w.WriteHeader(http.StatusOK)
+	})
+	spec := manualRoute(t, "m1.test", time.Hour, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: modeSettings(config.RotationModeSeamless),
+		ManualRoutes: []config.ManualRouteSpec{spec}}
+	cfg.Rotation.DrainTimeout = 300 * time.Millisecond
+	s := newSetup(t, cfg, nil, ips)
+	p := s.pl.Lookup(routeID(spec.RouteSpec))
+
+	// The work the mode exists to protect: a pick taken before the changeover,
+	// still held when it opens and still held when it settles.
+	pre := s.pl.PickFor(nil, nil, "t:443")
+	if pre != p {
+		t.Fatal("failed to take a pick on the route under test")
+	}
+	defer pre.Release()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.e.runProcedure(context.Background(), s.gen, spec, p, routeID(spec.RouteSpec))
+	}()
+
+	// HoldTraffic runs the moment the rotate call returns, and nothing after it can
+	// release the hold until the gate opens — so observing the hold here observes
+	// the window, not a race with the commit.
+	waitFor(t, "the changeover hold to open", 5*time.Second, func() bool { return p.RotationHeld() })
+	gateOnce.Do(func() { close(gate) })
+
+	// Held, on both of PickFor's paths: the ordinary candidate scan finds nothing,
+	// and the all-cooling fallback cannot reach the route either. There is no
+	// alternative route here, which is the honest shape of the case — during a
+	// seamless changeover a pick is answered 503, never handed to a route whose
+	// egress IP is mid-swap. (The fallback's exclusion of a held route, with a
+	// cooling alternative in play, is TestAllCoolingFallbackSkipsHeldRoute in the
+	// pool package.)
+	if got := s.pl.PickFor(nil, nil, "t:443"); got != nil {
+		got.Release()
+		t.Fatalf("held route was picked across the changeover: %s", got.URL.Host)
+	}
+	if st := snapshotHost(t, s.pl, "m1.test"); st.Available {
+		t.Fatalf("held route reports available mid-changeover: %+v", st)
+	}
+	// The hold is not a rotation in flight: the flag stays clear, so the route
+	// keeps the display state it had and the engine's post-changeover phase write
+	// is correctly inert.
+	if p.RotatingNow() {
+		t.Fatal("the seamless hold raised the rotating flag")
+	}
+	// In-flight work is untouched by the hold. That is the property the mode
+	// exists for: a tunnel opened before the changeover finishes on the egress IP
+	// it began with, and nothing about the hold touches it.
+	if got := p.InFlight(); got != 1 {
+		t.Fatalf("in-flight holders across the changeover = %d, want the pre-changeover request intact", got)
+	}
+
+	waitFor(t, "rotation committed", 5*time.Second, func() bool { return s.e.Rotations() == 1 })
+	<-done
+
+	// Settle put the route back: the hold is gone, not merely expired.
+	if p.RotationHeld() || !p.RotationHoldUntil().IsZero() {
+		t.Fatalf("settled changeover left the route held: %v", p.RotationHoldUntil())
+	}
+	// The work the hold protected was never cut: the holder taken before the
+	// changeover is still counted after it.
+	if got := p.InFlight(); got != 1 {
+		t.Fatalf("in-flight holders after the rotation = %d, want the pre-changeover request intact", got)
+	}
+	after := s.pl.PickFor(nil, nil, "t:443")
+	if after != p {
+		if after != nil {
+			after.Release()
+		}
+		t.Fatalf("pick after the changeover settled = %v, want the seamless route back", after)
+	}
+	after.Release()
+	if st := snapshotHost(t, s.pl, "m1.test"); st.Rotation.LastIP != "198.51.100.9" {
+		t.Fatalf("seamless rotation did not commit: %+v", st.Rotation)
+	}
+}
+
+// A hold never outlives its own procedure, including the one path that ends a
+// rotation without settling the changeover: shutdown cancels the context between
+// steps, the engine calls Readmit, and the route must be serving when the
+// process stops rotating it. Without the release in Readmit the route would sit
+// out of picks until the hold's deadline — up to ChangeoverTimeout — after the
+// rotation was already abandoned.
+func TestSeamlessHoldIsReleasedWhenTheProcedureIsInterrupted(t *testing.T) {
+	ips := newIPServer(t, "203.0.113.7")
+	api := newAPIServer(t)
+	gate := make(chan struct{})
+	var gateOnce sync.Once
+	openGate := func() { gateOnce.Do(func() { close(gate) }) }
+	// Opened by the test's cleanup even on an early Fatal, so the parked handler
+	// returns and httptest.Server.Close is not left waiting on it. A cleanup
+	// registered here runs before the servers' own, LIFO, so the engine is
+	// cancelled before the API server is torn down.
+	t.Cleanup(openGate)
+	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		ips.set("198.51.100.9")
+		<-gate
+		w.WriteHeader(http.StatusOK)
+	})
+	spec := manualRoute(t, "m1.test", time.Hour, apiSpec(api))
+	cfg := &config.RuntimeConfig{Rotation: modeSettings(config.RotationModeSeamless),
+		ManualRoutes: []config.ManualRouteSpec{spec}}
+	cfg.Rotation.DrainTimeout = 300 * time.Millisecond
+	s := newSetup(t, cfg, nil, ips)
+	p := s.pl.Lookup(routeID(spec.RouteSpec))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.e.runProcedure(ctx, s.gen, spec, p, routeID(spec.RouteSpec))
+	}()
+	// Let the rotate call return so the changeover opens, then cancel with the
+	// hold open. The gate is never opened, so nothing can settle this changeover:
+	// the unwind has to go through Readmit or the route stays held.
+	waitFor(t, "the changeover hold to open", 5*time.Second, func() bool { return p.RotationHeld() })
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("procedure did not unwind after cancellation")
+	}
+
+	if p.RotationHeld() || !p.RotationHoldUntil().IsZero() {
+		t.Fatalf("an interrupted seamless rotation left the route held: %v", p.RotationHoldUntil())
+	}
+	if got := s.pl.PickFor(nil, nil, "t:443"); got != p {
+		if got != nil {
+			got.Release()
+		}
+		t.Fatalf("pick after an interrupted rotation = %v, want the route serving", got)
+	}
+	// The cancellation did not commit: an abandoned rotation records nothing, and
+	// in particular the epoch stays advanced so a warm connection parked under the
+	// old egress IP is still retired.
+	if got := s.e.Rotations(); got != 0 {
+		t.Fatalf("Rotations = %d after a cancelled rotation, want 0", got)
 	}
 }
 

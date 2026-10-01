@@ -410,15 +410,22 @@ func (rp *RotationProcedure) run(ctx context.Context) bool {
 	// Admission point 2: the changeover has happened, and everything the
 	// procedure does from here until verification is waiting for the new egress
 	// IP to appear. A seamless route announces that wait now — its existing
-	// connections keep running, and the ones opened from here dial cold rather
-	// than borrow a half-established upstream connection. A disruptive route is
-	// already out of picks and has nothing to announce.
+	// connections keep running, while the route stops taking new picks for the
+	// bounded remainder of this changeover, so nothing opens against an egress
+	// IP that is mid-swap. A disruptive route is already out of picks and has
+	// nothing to announce.
 	policy.HoldTraffic(p, log)
 
 	// 4. Verify: the egress IP must actually have changed. Carriers can hand
 	// back the same address, which does not count as a rotation. A candidate
 	// that survives every check is committed through commit, which re-checks
 	// the collision set atomically with the record.
+	//
+	// The phase write is skipped on purpose for a seamless route: it lands
+	// after the hold, which took the route out of picks without raising the
+	// rotating flag, and SetRotationPhase only records a phase for a route whose
+	// rotation is actually running. The mode has no phase to report — it never
+	// stopped serving — so the write is the no-op it was designed to be.
 	p.SetRotationPhase(pool.RotationVerifying)
 	enterPhase("verifying")
 	commit := func(ip string) commitOutcome {
@@ -468,9 +475,9 @@ func (rp *RotationProcedure) run(ctx context.Context) bool {
 	changed := e.verify(ctx, rp.gen, rp.spec, p, baseline, verified, settings, apiErr != nil, log, commit)
 
 	// Admission point 3: the changeover is settled — either a candidate was
-	// committed or verification gave up.
+	// committed or verification gave up — so the route takes picks again.
 	if policy.Settle(p, rp.attempt, log) {
-		log.Debug().Str("traffic", "warm again").Msg("seamless changeover complete; connections resume borrowing")
+		log.Debug().Str("traffic", "warm again").Msg("seamless changeover complete; route takes picks again")
 	}
 
 	if rp.gone() {
