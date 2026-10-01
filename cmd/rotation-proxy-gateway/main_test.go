@@ -94,7 +94,7 @@ func TestHealthcheck(t *testing.T) {
 		isolateHealthcheckEnv(t)
 		lc := proxyserver.NewLifecycle()
 		lc.MarkReady()
-		srv := httptest.NewServer(proxyserver.AdminMux("test", time.Now(), newTestStore(), nil, nil, nil, nil, lc))
+		srv := httptest.NewServer(proxyserver.AdminMux(proxyserver.AdminOptions{Version: "test", Started: time.Now(), Store: newTestStore(), Lifecycle: lc}))
 		lc.BeginDraining()
 		defer srv.Close()
 		t.Setenv("RPGW_ADMIN_ADDR", adminAddrFor(t, srv))
@@ -509,7 +509,7 @@ func TestShutdownAllClosesProxyListenersThenAdmin(t *testing.T) {
 
 	lnA := serveSocksListener(t, srvA)
 	lnB := serveSocksListener(t, srvB)
-	lnAdmin, adminSrv := serveAdminListener(t, proxyserver.AdminMux("test", time.Now(), store, map[string]*proxyserver.Server{"mixed": srvA}, nil, nil, nil, proxyserver.NewLifecycle()))
+	lnAdmin, adminSrv := serveAdminListener(t, proxyserver.AdminMux(proxyserver.AdminOptions{Version: "test", Started: time.Now(), Store: store, Listeners: map[string]*proxyserver.Server{"mixed": srvA}, Lifecycle: proxyserver.NewLifecycle()}))
 
 	listeners := []runningListener{
 		{name: "mixed", server: srvA, ln: lnA},
@@ -682,7 +682,7 @@ func TestShutdownAllUnreadsBeforeAnyListenerCloses(t *testing.T) {
 	lnA := serveSocksListener(t, srvA)
 	lnB := serveSocksListener(t, srvB)
 	lnC := serveSocksListener(t, srvC)
-	lnAdmin, adminSrv := serveAdminListener(t, proxyserver.AdminMux("test", time.Now(), store, nil, nil, nil, nil, lc))
+	lnAdmin, adminSrv := serveAdminListener(t, proxyserver.AdminMux(proxyserver.AdminOptions{Version: "test", Started: time.Now(), Store: store, Lifecycle: lc}))
 
 	listeners := []runningListener{
 		{name: "mixed", server: srvA, ln: lnA},
