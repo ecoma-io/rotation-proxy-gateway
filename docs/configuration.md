@@ -7,15 +7,17 @@ live in a YAML file that is validated and hot-reloaded every second.
 
 ## Bootstrap environment (restart only)
 
-| Variable                 |         Default | Meaning                                                                |
-| ------------------------ | --------------: | ---------------------------------------------------------------------- |
-| `RPGW_CONFIG_FILE`       |   `config.yaml` | Runtime YAML file path                                                 |
-| `RPGW_ADMIN_ADDR`        | `0.0.0.0:30120` | Always-on admin listener; network policy controls exposure             |
-| `RPGW_MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress listener                                            |
-| `RPGW_V4_LISTEN_ADDR`    |        `:30122` | v4-egress-only listener                                                |
-| `RPGW_V6_LISTEN_ADDR`    |        `:30123` | v6-egress-only listener                                                |
-| `RPGW_SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown                        |
-| `RPGW_ACCOUNT`           |         _unset_ | `username:password` — require `Proxy-Authorization` on proxy listeners |
+| Variable                    |         Default | Meaning                                                                |
+| --------------------------- | --------------: | ---------------------------------------------------------------------- |
+| `RPGW_CONFIG_FILE`          |   `config.yaml` | Runtime YAML file path                                                 |
+| `RPGW_ADMIN_ADDR`           | `0.0.0.0:30120` | Always-on admin listener; network policy controls exposure             |
+| `RPGW_MIXED_LISTEN_ADDR`    |        `:30121` | Mixed v4/v6 egress listener                                            |
+| `RPGW_V4_LISTEN_ADDR`       |        `:30122` | v4-egress-only listener                                                |
+| `RPGW_V6_LISTEN_ADDR`       |        `:30123` | v6-egress-only listener                                                |
+| `RPGW_SHUTDOWN_GRACE`       |           `55s` | Total shared drain budget for graceful shutdown                        |
+| `RPGW_ACCOUNT`              |         _unset_ | `username:password` — require `Proxy-Authorization` on proxy listeners |
+| `RPGW_COORD_REDIS_ADDR`     |         _unset_ | Cluster coordination authority; unset disables it entirely             |
+| `RPGW_COORD_WATCH_INTERVAL` |            `1s` | Authoritative reconcile period, independent of pub/sub                 |
 
 [`.env.example`](../.env.example) lists them all with their defaults — copy it
 to `.env` (Git-ignored) and either export it before a bare-metal run
@@ -40,6 +42,33 @@ credential is presented by clients as HTTP
 `Proxy-Authorization: Basic base64(username:password)`; the inbound
 authentication behavior it switches on is documented in
 [Inbound HTTP forward-proxy behavior](inbound-http.md#authentication).
+
+### `RPGW_COORD_REDIS_ADDR`
+
+Names the Redis instance that arbitrates manual-route rotation across gateway
+instances. **Unset — the default — disables cluster coordination entirely**: every
+instance rotates on its own, with no lease and no cluster epoch, which is the
+behavior of a single-instance deployment and what the e2e suite runs against.
+
+Set, the process joins the cluster: it contends for the rotation lease,
+reconciles the cluster rotation epoch onto its own routes, and releases the lease
+on clean shutdown. A URL commonly embeds a password, so this value is a secret —
+it is never logged, never reported by `/status`, and never appears in an error. An
+unreachable or unparseable address fails startup rather than degrading to
+un-coordinated rotation, because an instance that cannot reach the authority would
+otherwise rotate as if it were alone.
+
+Restart-only, like every `RPGW_` bootstrap variable. The full contract is in
+[Cluster coordination](coordination.md).
+
+### `RPGW_COORD_WATCH_INTERVAL`
+
+How often an instance re-reads the cluster rotation epoch even when no
+notification arrived. It must parse as a positive duration. This interval, not
+pub/sub, is what guarantees convergence: Redis pub/sub drops messages and cannot
+report the loss, so a dropped message costs at most this much latency and never
+correctness. It is deliberately independent of the request path — coordination
+reads happen on rotation, on config change, and on this tick, and nowhere else.
 
 ### Retired unprefixed names
 

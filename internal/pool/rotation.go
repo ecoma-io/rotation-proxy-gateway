@@ -31,6 +31,42 @@ func (p *Proxy) BeginRotation(phase RotationState) {
 	p.mu.Unlock()
 }
 
+// AdoptClusterEpoch applies a newly observed authoritative cluster epoch and
+// reports whether it moved this route's local warm-connection generation.
+//
+// This is how a cluster-wide rotation reaches this instance's warm
+// connections. It reuses the mechanism internal/warmpool already enforces — a
+// parked connection whose stamped generation differs from the route's current
+// RotationEpoch is discarded — rather than adding a second invalidation path
+// beside it.
+//
+// The Redis epoch and RotationEpoch are intentionally different ordinal spaces:
+// local BeginRotation advances RotationEpoch for every attempt, while Redis
+// advances only on a successful cluster commit. Therefore this method compares
+// the incoming authority cursor only with clusterEpoch, then increments the
+// local generation once. Assigning or maxing the Redis number into
+// RotationEpoch would let failed local attempts make a later peer rotation look
+// old, leaving a connection parked before that peer rotation eligible.
+//
+// It deliberately does not touch health: nothing here changes cooldown, auth,
+// or the rotating flag. A cluster rotation observed by an instance that is not
+// rotating the route invalidates warm connections, and nothing else.
+func (p *Proxy) AdoptClusterEpoch(cluster uint64) bool {
+	if cluster == 0 {
+		return false
+	}
+	for {
+		observed := p.clusterEpoch.Load()
+		if cluster <= observed {
+			return false
+		}
+		if p.clusterEpoch.CompareAndSwap(observed, cluster) {
+			p.rotationEpoch.Add(1)
+			return true
+		}
+	}
+}
+
 // SetRotationPhase advances the displayed phase (draining → rotating →
 // verifying) of a rotation already begun. The rotating flag and the state
 // write are guarded by the same lock that the terminal transitions
@@ -209,6 +245,35 @@ func (p *Proxy) AbandonRotation() {
 	p.nextRetryIn = 0
 	p.rotating.Store(false)
 	p.mu.Unlock()
+}
+
+// AdoptClusterEpoch raises every route's rotation epoch to at least cluster,
+// and returns the number of routes whose epoch moved.
+//
+// It is the pool-wide form of Proxy.AdoptClusterEpoch, and it is what an
+// instance calls when it learns the cluster rotation epoch advanced — whether
+// because this instance committed a rotation, because a peer published one, or
+// because the reconcile tick found the counter moved while pub/sub was silent.
+//
+// Applying it to every route, not just the rotating one, is deliberate: the
+// cluster epoch is a cluster-wide generation, and a warm connection is only
+// safe to reuse if it was established after the last rotation anywhere in the
+// fleet. Narrowing it to one route would let an instance reuse a warm
+// connection whose upstream address was rotated away by a peer.
+//
+// It never lowers any route's epoch, so a route that rotated locally keeps its
+// own higher generation.
+func (pl *Pool) AdoptClusterEpoch(cluster uint64) int {
+	if cluster == 0 {
+		return 0
+	}
+	moved := 0
+	for _, p := range pl.RoutePointers() {
+		if p.AdoptClusterEpoch(cluster) {
+			moved++
+		}
+	}
+	return moved
 }
 
 // LastIPs returns the last verified egress IP of every manual route other than

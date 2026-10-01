@@ -22,6 +22,7 @@ import (
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/configstore"
 	"rotation-proxy-gateway/internal/control"
+	"rotation-proxy-gateway/internal/coord"
 	"rotation-proxy-gateway/internal/logging"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/proxyserver"
@@ -320,6 +321,32 @@ func run() error {
 	// serves both origins; manual routes additionally carry rotation state.
 	poolStore := selectServingStore(controlPlane, runtimeCfg, served)
 	engine := rotation.New(poolStore, log)
+	// Coordination is opt-in and off by default. With no Redis address the
+	// engine has no coordinator, every instance rotates on its own, and the
+	// behavior is exactly what it was before multi-instance coordination
+	// existed — which is what keeps a single-instance deployment working with
+	// nothing new to run.
+	var coordinator *coord.Controller
+	if bootstrap.CoordRedisAddr != "" {
+		coordStore, err := coord.New(storeCtx, bootstrap.CoordRedisAddr, coord.Options{})
+		if err != nil {
+			// The address is a secret; this error is go-redis's own and never
+			// quotes it. Failing startup is right: an instance that cannot reach
+			// the coordination authority would rotate un-coordinated, which is
+			// the failure this subsystem exists to remove.
+			return err
+		}
+		coordinator = coord.NewController(coordStore, log, coord.ControllerOptions{
+			LeaseName:     coord.DefaultLeaseName,
+			RenewEvery:    0,
+			WatchInterval: bootstrap.CoordWatchInterval,
+		})
+		adopter := rotation.ClusterEpochAdopter(poolStore)
+		engine.UseCoordinator(coordinator, adopter)
+		log.Info().
+			Str("instance", coordinator.Owner()).
+			Msg("cluster coordination enabled; this instance rotates only while it holds the rotation lease")
+	}
 	// The warm pool keeps half-established upstream connections ready for the
 	// serving path to borrow (one non-blocking pop per attempt, cold dial on
 	// any miss) while never writing route health itself: cooldown, auth, and
@@ -457,6 +484,40 @@ func run() error {
 	engineCtx, engineCancel := context.WithCancel(context.Background())
 	defer engineCancel()
 	go engine.Run(engineCtx)
+
+	// The coordinator's two loops. Both are off the serving path: the lease
+	// loop renews and re-acquires, and the watch loop re-reads the cluster epoch
+	// on its own interval regardless of whether any pub/sub message arrives.
+	//
+	// The lease is released only here, on the clean-shutdown path, so a peer
+	// takes over immediately instead of waiting out the TTL. A crash never
+	// reaches this: the lease lapses on its own, and the fencing token is what
+	// makes that safe. That asymmetry is the point — a clean exit is a
+	// statement that this instance is done, and anything else must be treated as
+	// a holder that might still be running.
+	coordCtx, coordCancel := context.WithCancel(context.Background())
+	defer func() {
+		coordCancel()
+		if coordinator != nil {
+			// A failed release is not an error worth failing shutdown over: the
+			// lease lapses on its own, which is slower but equally correct.
+			if err := coordinator.Release(context.Background()); err != nil {
+				log.Debug().Str("error", sanitize.ErrorString(err)).Msg("releasing the cluster rotation lease failed; it will lapse on its own")
+			}
+		}
+	}()
+	if coordinator != nil {
+		go coordinator.RunLease(coordCtx)
+		go coordinator.Watch(coordCtx, log, func(epoch coord.Epoch) {
+			// Raised on every route, so a connection parked before a rotation
+			// performed anywhere in the fleet fails warmpool's epoch check and is
+			// discarded rather than reused against a changed egress IP.
+			if moved := controllerAdopt(coordinator, epoch, poolStore); moved > 0 {
+				log.Info().Str("epoch", epoch.String()).Int("routes", moved).
+					Msg("adopted the cluster rotation epoch; warm connections from earlier generations were discarded")
+			}
+		})
+	}
 	warm.Start()
 
 	// Ready once every proxy listener and the admin listener are bound and
@@ -629,6 +690,21 @@ func watchConfigFile(ctx context.Context, path string, generations *pool.Store, 
 // than one per listener in sequence. With the default 55s grace that is ~56s,
 // and the surrounding orchestrator's kill timer (compose stop_grace_period:
 // 60s) must stay above it.
+// controllerAdopt raises every route's local rotation epoch to the cluster
+// epoch, returning how many routes moved.
+//
+// This is the whole path from the distributed epoch to internal/warmpool: the
+// route's local epoch rises, and warmpool's existing "a warm connection's epoch
+// must equal the route's current epoch or it is discarded" check fires on the
+// next sweep or borrow. No second invalidation mechanism is added beside the
+// one the warm pool already has.
+//
+// The count is the pool's own, so /status reports routes that actually moved
+// rather than a number the caller constructed.
+func controllerAdopt(c *coord.Controller, epoch coord.Epoch, poolStore *pool.Store) int {
+	return c.AdoptAll(epoch, rotation.ClusterEpochAdopter(poolStore))
+}
+
 func shutdownAll(log zerolog.Logger, lc *proxyserver.Lifecycle, engineCancel context.CancelFunc, warmStop func(context.Context), listeners []runningListener, adminSrv *http.Server, grace time.Duration) {
 	// The deadline governs the whole drain. Creating it before stopping the
 	// rotation engine and the warm pool means their unwinding consumes the

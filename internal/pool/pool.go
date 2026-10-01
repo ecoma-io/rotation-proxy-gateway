@@ -51,12 +51,24 @@ type Proxy struct {
 	cooldownUntil atomic.Int64 // dial cooldown deadline, relNanos; 0 = none
 	authBlocked   atomic.Bool
 	rotating      atomic.Bool
-	// rotationEpoch is the route's rotation generation counter: it advances
-	// exactly when a rotation procedure begins (BeginRotation), so state
-	// stamped with an older epoch — a parked upstream connection — provably
-	// predates the route's next verified egress IP and can never be reused
-	// across a rotation, whatever way the procedure ends.
+	// rotationEpoch is the local warm-connection generation counter. It advances
+	// when a local rotation begins and whenever this process learns of a new
+	// cluster rotation epoch, so a parked connection stamped with an older value
+	// can never cross either event.
+	//
+	// It is deliberately not the cluster epoch itself. Local BeginRotation calls
+	// advance it even when a provider later returns the same IP, while Redis's
+	// cluster epoch advances only on a successful cluster commit. Comparing those
+	// two ordinal spaces would let many failed local attempts make a later, lower
+	// numbered cluster epoch look old, leaving a pre-peer-rotation connection
+	// eligible. clusterEpoch below is the authority cursor; observing a newer
+	// cursor increments this local generation instead of assigning its value.
 	rotationEpoch atomic.Uint64
+	// clusterEpoch is the highest authoritative Redis cluster epoch this Proxy
+	// has applied. It is never used to stamp or validate connections: it only
+	// tells AdoptClusterEpoch whether a newly observed cluster event needs to
+	// advance rotationEpoch.
+	clusterEpoch atomic.Uint64
 
 	// id is the route's operator-facing routing label — the name routing
 	// rules and the default set refer to. It is identity-adjacent but
