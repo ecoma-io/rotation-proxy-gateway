@@ -45,15 +45,18 @@ RPGW_V6_LISTEN_ADDR=:30123 \
 
 Environment variables are bootstrap-only and require restart:
 
-| Env                      |         Default | Meaning                                                 |
-| ------------------------ | --------------: | ------------------------------------------------------- |
-| `RPGW_CONFIG_FILE`       |   `config.yaml` | Runtime YAML path                                       |
-| `RPGW_ADMIN_ADDR`        | `0.0.0.0:30120` | Admin (HTTP) listener; network policy controls exposure |
-| `RPGW_MIXED_LISTEN_ADDR` |        `:30121` | Mixed v4/v6 egress HTTP proxy listener                  |
-| `RPGW_V4_LISTEN_ADDR`    |        `:30122` | IPv4-egress-only HTTP proxy listener                    |
-| `RPGW_V6_LISTEN_ADDR`    |        `:30123` | IPv6-egress-only HTTP proxy listener                    |
-| `RPGW_SHUTDOWN_GRACE`    |           `55s` | Total shared drain budget for graceful shutdown         |
-| `RPGW_ACCOUNT`           |         _unset_ | Require `Proxy-Authorization` on proxy listeners        |
+| Env                       |         Default | Meaning                                                  |
+| ------------------------- | --------------: | -------------------------------------------------------- |
+| `RPGW_CONFIG_FILE`        |   `config.yaml` | Runtime YAML path                                        |
+| `RPGW_ADMIN_ADDR`         | `0.0.0.0:30120` | Admin (HTTP) listener; network policy controls exposure  |
+| `RPGW_MIXED_LISTEN_ADDR`  |        `:30121` | Mixed v4/v6 egress HTTP proxy listener                   |
+| `RPGW_V4_LISTEN_ADDR`     |        `:30122` | IPv4-egress-only HTTP proxy listener                     |
+| `RPGW_V6_LISTEN_ADDR`     |        `:30123` | IPv6-egress-only HTTP proxy listener                     |
+| `RPGW_SHUTDOWN_GRACE`     |           `55s` | Total shared drain budget for graceful shutdown          |
+| `RPGW_ACCOUNT`            |         _unset_ | Require `Proxy-Authorization` on proxy listeners         |
+| `RPGW_CONFIG_STORE_DSN`   |         _unset_ | PostgreSQL DSN for the durable, revisioned config store  |
+| `RPGW_RECONCILE_INTERVAL` |         _unset_ | Optional positive Go duration for store reconcile period |
+| `RPGW_ADMIN_TOKEN`        |         _unset_ | Bearer token for `/control/*`; required with a store     |
 
 Empty proxy listener addresses disable their listener, but at least one proxy
 listener must remain enabled. All enabled addresses must be valid host:port
@@ -62,16 +65,26 @@ Every bootstrap variable carries the `RPGW_` prefix; a set legacy unprefixed
 name fails startup with an error naming its replacement, and
 [`.env.example`](.env.example) lists the full set.
 
-Runtime settings and active routes live only in `config.yaml`:
-`log-level`, `max-retries`, `cooldown`, `dial-timeout`, `proxies.auto`,
-`proxies.manual`, the `rotation` block, the optional `warm-pool` block, and
-the optional `routing` block. The process polls the file each
-second and reloads when its content hash changes, so in-place edits and atomic
-replacements both reload under any mount style. A failed parse/validation
-leaves the last-known-good pool and runtime settings serving. Do not add a
-manual reload fallback (for example SIGHUP), and do not reintroduce
-event-based watching: neither can fix the one blind spot, a rename-over a
-single-file bind mount (the mount pins the old inode) — see
+`RPGW_CONFIG_STORE_DSN` is optional. Unset keeps file-seeded mode: the runtime
+YAML is the authority and no `/control` API is mounted. Set, the file only seeds
+the first durable revision, a reconciler publishes active revisions, and
+`RPGW_ADMIN_TOKEN` becomes mandatory — a configured store with no token fails
+startup closed rather than serving an unauthenticated (or absent) control
+surface. The token is reduced immediately to an HMAC-SHA-256 digest and is
+never logged, returned, or retained in plaintext. `RPGW_ACCOUNT` governs only
+the proxy listeners' `Proxy-Authorization` (`407`); the control API's bearer
+challenge is `401` and the two are never interchanged.
+
+Runtime settings and active routes live in `config.yaml` (file-seeded mode) or
+the durable store (store mode): `log-level`, `max-retries`, `cooldown`,
+`dial-timeout`, `proxies.auto`, `proxies.manual`, the `rotation` block, the
+optional `warm-pool` block, and the optional `routing` block. In file-seeded
+mode the process polls the file each second and reloads when its content hash
+changes, so in-place edits and atomic replacements both reload under any mount
+style. A failed parse/validation leaves the last-known-good pool and runtime
+settings serving. Do not add a manual reload fallback (for example SIGHUP), and
+do not reintroduce event-based watching: neither can fix the one blind spot, a
+rename-over a single-file bind mount (the mount pins the old inode) — see
 [`docs/configuration.md`](docs/configuration.md) "Reload behavior".
 The removed HTTP era's `global:` block is rejected: a config containing
 `target-tls-insecure` or `max-body-buffer` fails validation — the
@@ -236,10 +249,27 @@ RPGW_ADMIN_ADDR=127.0.0.1:30120 ./bin/rpgw healthcheck
 ./bin/rpgw version
 ```
 
+With `RPGW_CONFIG_STORE_DSN` set, the admin listener also serves the
+authenticated control API under `/control`, every path requiring exactly one
+`Authorization: Bearer <RPGW_ADMIN_TOKEN>`:
+
+```bash
+curl -H "Authorization: Bearer $RPGW_ADMIN_TOKEN" http://127.0.0.1:30120/control/proxies
+curl -H "Authorization: Bearer $RPGW_ADMIN_TOKEN" http://127.0.0.1:30120/control/routes
+```
+
+`GET /control/{proxies,routes,routing-rules,rotations,config}` read safe state;
+`PUT /control/config` commits a durable revision with optimistic concurrency
+(`428` for a missing `expected_revision`, `412` for a stale one); `GET
+/control/analytics` answers `501` because this build has no durable analytics
+source. `/healthz`, `/readyz`, and `/status` remain unauthenticated.
+
 `failovers` counts in-band route fallbacks (a listener metric); a listener's
 `requests` counts valid proxy requests that reached route selection
 (protocol rejects never advance it); `rotations` counts completed manual-route
-rotations that observed a changed egress IP.
+rotations that observed a changed egress IP. `/status` groups the same facts
+under `cluster`, `distributed`, and `instance` scopes while keeping every
+pre-existing flat top-level key.
 
 ## Docker
 
@@ -262,9 +292,12 @@ binary `healthcheck` subcommand (no shell in the scratch image).
 ## Layout
 
 - `internal/config` — bootstrap environment, Viper YAML validation, route parsing (auto + manual), rotation settings, routing-block compilation, content-hash change poller
+- `internal/configstore` — durable, revisioned configuration store: append-only revision history, an active pointer with conditional (optimistic-concurrency) moves, checksum-validated migrations, embedded document encoding/decoding
+- `internal/control` — durable-store reconciler: polls the active revision, materializes it into a serving generation, seeds the first revision, and caches the observed pointer for `/status`
+- `internal/controlapi` — the authenticated `/control` HTTP API (`/proxies`, `/routes`, `/routing-rules`, `/rotations`, `/config`, `/analytics`): bearer-guarded, credential-free rendering, `PUT /config` optimistic concurrency
 - `internal/pool` — LRU filtering, cooldown/auth state, in-flight work, rotation state, immutable generation snapshots (config + pool + routing policy as one unit)
 - `internal/routing` — the compiled domain-routing policy: it resolves one inbound target to its candidate route set and never selects, never reads or writes health
-- `internal/proxyserver` — inbound HTTP forward proxy: request parsing, `Proxy-Authorization`, the `x-ecoma-*` control headers (`x-ecoma-proxy-family` route constraint, `x-ecoma-request-id` correlation id), the protocol-agnostic route-selection and relay engine they feed, plus the admin mux
+- `internal/proxyserver` — inbound HTTP forward proxy: request parsing, `Proxy-Authorization`, the `x-ecoma-*` control headers (`x-ecoma-proxy-family` route constraint, `x-ecoma-request-id` correlation id), the protocol-agnostic route-selection and relay engine they feed, plus the admin mux and the control-API bearer authenticator
 - `internal/socksdial` — the shared SOCKS5 dialer used by the proxy server and the rotation probes; `DialHalf` parks a half-handshake (TCP + greeting + auth) the warm pool completes later with `CompleteConnect`
 - `internal/warmpool` — background pool of half-established upstream connections, bounded per route and process-wide, epoch-invalidated by rotation, borrowed on the serving path
 - `internal/rotation` — manual-route rotation engine: scheduling under the concurrency cap, drain, probes, rotate calls, verification, backoff
