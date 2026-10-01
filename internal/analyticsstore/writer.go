@@ -57,6 +57,16 @@ type Writer struct {
 	opts   WriterOptions
 	ctx    context.Context
 	cancel context.CancelFunc
+	// flushCtx is the parent every batch context is derived from, and it is
+	// NOT w.ctx: cancel is how Stop asks the loop to make its final pass, so a
+	// context derived from w.ctx is already dead when that pass runs. This one
+	// outlives the writer and each flush bounds itself with its own timeout.
+	flushCtx context.Context
+	// stoppedCh is closed once, by Stop, and is read after any non-blocking send
+	// has already failed. That ordering is what makes an offer racing the
+	// shutdown path decidable: a queue send that succeeded is never re-examined,
+	// and only a refused send falls through to the accounting below.
+	stoppedCh chan struct{}
 	// wg tracks the flush goroutine. mu guards started/stopped, which are
 	// plain fields because Start runs before the writer is shared and Stop
 	// after; WaitGroup cannot be locked and so cannot guard them itself.
@@ -182,8 +192,14 @@ func newWriter(pool batchConn, log zerolog.Logger, opts WriterOptions) *Writer {
 		opts:   opts,
 		ctx:    ctx,
 		cancel: cancel,
-		// Buffered by the full size: a non-blocking send never waits, and a
-		// full channel is the drop signal rather than a blocking point.
+		// Deliberately not derived from ctx. Cancel is how Stop asks the flush
+		// loop to make its final pass, so a batch context derived from ctx is
+		// born cancelled and every statement in the final flush fails before
+		// being sent. This one lives until the process ends, and each flush bounds
+		// itself with its own timeout — the same relationship the process has to
+		// the writer's ctx, which is what makes the flush context outlast it.
+		flushCtx:  context.Background(),
+		stoppedCh: make(chan struct{}),
 		rotations: make(chan RotationAttempt, opts.BufferSize),
 		ips:       make(chan IPObservation, opts.BufferSize),
 		requests:  make(chan RequestSample, opts.BufferSize),
@@ -221,6 +237,13 @@ func (w *Writer) Stop() {
 	w.stopped = true
 	started := w.started
 	w.mu.Unlock()
+
+	// Closed before the final flush, not after, and that ordering is the whole
+	// point: an offer that arrives once this is closed is refused and counted as
+	// lost, while an offer that won its race and is already queued is drained by
+	// the flush below and written. Closing it afterwards would leave every
+	// sample recorded during the drain queued against a reader that has gone.
+	close(w.stoppedCh)
 
 	if !started {
 		// Never started: nothing is running, so drain-and-drop is immediate.
@@ -300,7 +323,11 @@ func (w *Writer) flushOnce() bool {
 	failures := drain(w.failureQ, len(w.failureQ))
 
 	ok := true
-	ctx, cancel := context.WithTimeout(w.ctx, 10*time.Second)
+	// Derived from flushCtx, never from w.ctx: this same function serves the
+	// periodic flushes and the one final flush that Stop triggers by cancelling
+	// w.ctx, and a context derived from a cancelled parent sends nothing at all.
+	// The timeout is the only bound this needs.
+	ctx, cancel := context.WithTimeout(w.flushCtx, 10*time.Second)
 	defer cancel()
 
 	if len(attempts) > 0 {
@@ -393,7 +420,7 @@ func (w *Writer) RecordIPObservation(o IPObservation) bool {
 		// is a guard rather than a path.
 		return false
 	}
-	queued, dropped := offer(w.ips, o)
+	queued, dropped := offer(w.ips, o, w.stoppedCh)
 	w.ipsDropped.Add(dropped)
 	return queued
 }
@@ -401,7 +428,7 @@ func (w *Writer) RecordIPObservation(o IPObservation) bool {
 // ObserveRequest enqueues a rolled-up request sample, dropping the oldest on
 // overflow. It never blocks, and it is the only method the serving path calls.
 func (w *Writer) ObserveRequest(s RequestSample) bool {
-	queued, dropped := offer(w.requests, s)
+	queued, dropped := offer(w.requests, s, w.stoppedCh)
 	w.requestsDropped.Add(dropped)
 	return queued
 }
@@ -412,7 +439,7 @@ func (w *Writer) ObserveFailure(s FailureSample) bool {
 	if s.Failures <= 0 {
 		return false
 	}
-	queued, dropped := offer(w.failureQ, s)
+	queued, dropped := offer(w.failureQ, s, w.stoppedCh)
 	w.failuresDropped.Add(dropped)
 	return queued
 }
@@ -421,7 +448,7 @@ func (w *Writer) ObserveFailure(s FailureSample) bool {
 // See offer for the distinction between whether the new observation was queued
 // and how many observations the operation lost.
 func (w *Writer) offerRotation(a RotationAttempt) (queued bool, dropped uint64) {
-	return offer(w.rotations, a)
+	return offer(w.rotations, a, w.stoppedCh)
 }
 
 // offer enqueues onto a channel, evicting the oldest when full. It returns two
@@ -439,7 +466,24 @@ func (w *Writer) offerRotation(a RotationAttempt) (queued bool, dropped uint64) 
 // send could queue value. That result is (false, 2). Every return path is
 // non-blocking; database slowness must cost bounded history, never request
 // latency.
-func offer[T any](ch chan T, value T) (queued bool, dropped uint64) {
+//
+// A fourth outcome is specific to shutdown: once the writer has stopped, nothing
+// will ever read these queues again, so queueing a sample is a silent loss rather
+// than a success. That is (false, 1) — refused, never queued, exactly one
+// observation lost — which is the same answer as a refused send against a full
+// queue, so every caller accounts for it with the counter it already owns.
+//
+// The stop check comes first, and it is a non-blocking read so the serving path
+// never waits on shutdown state. That leaves a window of one in-flight offer per
+// queue: a producer that read "not stopped" can have its send land after the
+// final flush has drained. Closing it exactly would mean taking the writer mutex
+// on the request path, which costs more than the single sample is worth — and
+// Stop's final flush runs after the close, so an offer that won its race is
+// queued before the drain and written.
+func offer[T any](ch chan T, value T, stoppedCh <-chan struct{}) (queued bool, dropped uint64) {
+	if isStopped(stoppedCh) {
+		return false, 1
+	}
 	// Fast path: room in the queue.
 	select {
 	case ch <- value:
@@ -468,6 +512,17 @@ func offer[T any](ch chan T, value T) (queued bool, dropped uint64) {
 			// queued — count the refused new observation.
 			return false, 1
 		}
+	}
+}
+
+// isStopped reports whether Stop has run. The channel is read without blocking
+// so the serving path never waits on shutdown state.
+func isStopped(stoppedCh <-chan struct{}) bool {
+	select {
+	case <-stoppedCh:
+		return true
+	default:
+		return false
 	}
 }
 

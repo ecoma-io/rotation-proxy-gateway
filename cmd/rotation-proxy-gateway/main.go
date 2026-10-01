@@ -764,19 +764,6 @@ func shutdownAll(log zerolog.Logger, lc *proxyserver.Lifecycle, engineCancel con
 	// the sessions they exist to accelerate.
 	warmStop(ctx)
 	log.Debug().Msg("warm pool stopped")
-	// The analytics writer stops next, for the same reason: its final flush must
-	// happen while the process that produced the samples is still inside its
-	// grace budget, and it must happen after the rotation engine so a rotation
-	// unwinding right now still has somewhere to put its terminal attempt. Its
-	// own grace is a bound inside this budget, so a database that stopped
-	// answering costs the writer its flush and nothing else — the listeners
-	// still drain underneath it, because Stop returns on its own deadline rather
-	// than waiting for the shared one. It is idempotent, so a startup failure
-	// that unwinds through run() twice cannot double-flush.
-	for _, release := range analyticsReleases {
-		release()
-	}
-	log.Debug().Msg("analytics writer stopped")
 	start := time.Now()
 
 	// Step 3a: close every listen socket before draining any of them. Each
@@ -823,6 +810,29 @@ func shutdownAll(log zerolog.Logger, lc *proxyserver.Lifecycle, engineCancel con
 	} else {
 		log.Info().Msg("admin listener closed")
 	}
+
+	// The analytics writer stops last of all the subsystems, and only because
+	// everything that produces samples has now finished producing them. The
+	// listener drain is what produces them: a request that completes during the
+	// drain is observed when its tunnel closes, which is inside the drain, and a
+	// rotation procedure unwinding after its engine was cancelled above records
+	// its terminal attempt whenever it reaches one. Stopping the writer before
+	// that — where it used to sit, between the warm pool and the drain — makes
+	// every one of those samples a silent loss, because the writer's queues are
+	// drained exactly once and the process then exits.
+	//
+	// The writer's own grace is a bound INSIDE the budget above rather than an
+	// addition to it: Stop returns on its own deadline instead of waiting for the
+	// shared context, so a database that stopped answering costs the writer its
+	// final flush and nothing else. What is left of the budget is what the flush
+	// gets, which is why this cannot simply be moved earlier to be safe — an
+	// early stop protects a flush that would have had seconds, at the price of
+	// every sample the drain went on to produce. It is idempotent, so a startup
+	// failure that unwinds through run() twice cannot double-flush.
+	for _, release := range analyticsReleases {
+		release()
+	}
+	log.Debug().Msg("analytics writer stopped")
 
 	// Terminal: nothing can accept a connection now, so /readyz stops answering
 	// "ready" permanently even if something answers the admin socket late.

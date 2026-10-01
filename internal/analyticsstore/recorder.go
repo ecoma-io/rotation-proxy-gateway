@@ -207,6 +207,15 @@ func (r *Recorder) RecordFailure(s FailureSample) {
 
 // Stop flushes and stops the writer, bounded by its shutdown grace. A nil
 // recorder's Stop does nothing, so the deferred call in main needs no branch.
+//
+// The recorder deliberately stays enabled afterwards. Recording after Stop is a
+// real case — a request can complete during the listener drain, a rotation
+// procedure can unwind after its engine was cancelled — and it must degrade into
+// a counted loss, not into a silent one. Turning the recorder off here would
+// make every Record* call a no-op, which hides the sample with no counter moved
+// and /status reporting a quiet store instead of one that lost data at
+// shutdown. The writer refuses those offers and counts them, so the loss shows
+// up where an operator is already looking.
 func (r *Recorder) Stop() {
 	if !r.Enabled() {
 		return
