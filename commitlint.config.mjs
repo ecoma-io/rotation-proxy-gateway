@@ -32,12 +32,17 @@ export default {
         // proxyserver and which the HTTP era gives its own seam: request
         // parsing, `Proxy-Authorization`, and the x-ecoma-* control headers are
         // ingress concerns, while proxyserver keeps the route-selection and
-        // relay engine they feed. The migration phases that follow add
-        // `store` (durable configuration and analytics), `coord` (Redis lease,
-        // fencing, and the distributed rotation epoch), and `api` (the admin
-        // resource endpoints); they are added when those packages land, so a
-        // scope never names a package that does not exist.
+        // relay engine they feed. `store` covers the two durable substrates the
+        // migration adds — configstore (the revisioned configuration store) and
+        // analyticsstore (durable rotation history and aggregates) — which share
+        // a scope because they share what they are: PostgreSQL-backed history
+        // the runtime writes and never reads back. The migration phases that
+        // follow add `coord` (Redis lease, fencing, and the distributed
+        // rotation epoch) and `api` (the admin resource endpoints); they are
+        // added when those packages land, so a scope never names a package that
+        // does not exist.
         "inbound",
+        "store",
       ],
     ],
     "body-max-line-length": [0],

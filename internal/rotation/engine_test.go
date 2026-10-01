@@ -904,7 +904,9 @@ func TestVerifyContinuesAfterALateCollision(t *testing.T) {
 		}
 		return commitDone
 	}
-	if !s.e.verify(context.Background(), s.gen, spec, p, "203.0.113.7", true, fastSettings(), false, discardLogger(), commit) {
+	// The trailing nil is the probe counter: this seam drives verify directly and
+	// asserts on the candidates it commits, not on how many probes it spent.
+	if !s.e.verify(context.Background(), s.gen, spec, p, "203.0.113.7", true, fastSettings(), false, discardLogger(), commit, nil) {
 		t.Fatal("verify = false, want the post-collision candidate committed")
 	}
 	if len(candidates) != 2 || candidates[0] != "198.51.100.9" || candidates[1] != "198.51.100.10" {
@@ -916,7 +918,7 @@ func TestVerifyContinuesAfterALateCollision(t *testing.T) {
 	if s.e.verify(context.Background(), s.gen, spec, p, "192.0.2.1", true, fastSettings(), false, discardLogger(), func(string) commitOutcome {
 		aborted.Add(1)
 		return commitAborted
-	}) {
+	}, nil) {
 		t.Fatal("verify = true after an aborted commit, want false")
 	}
 	if aborted.Load() != 1 {

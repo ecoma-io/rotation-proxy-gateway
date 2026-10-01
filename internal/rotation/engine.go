@@ -40,6 +40,116 @@ const (
 // the proxy server's duration fields.
 func dlog(d time.Duration) string { return d.Truncate(time.Millisecond).String() }
 
+// RotationOutcome is how one rotation attempt ended. It is the engine's own
+// small vocabulary, kept separate from the durable store's so this package does
+// not depend on where an attempt is recorded.
+type RotationOutcome string
+
+const (
+	// OutcomeRotated: the route committed a verified egress IP that differed
+	// from its baseline.
+	OutcomeRotated RotationOutcome = "rotated"
+	// OutcomeUnchangedIP: verification ran to its deadline and the egress IP
+	// never changed. The route keeps serving in the stale state.
+	OutcomeUnchangedIP RotationOutcome = "unchanged_ip"
+	// OutcomeAPIFailed: the provider's rotate call failed. Verification still
+	// ran, because a provider can rotate in spite of a failed call — so this
+	// outcome only means the observed IP did not change either.
+	OutcomeAPIFailed RotationOutcome = "api_failed"
+	// OutcomeAborted: the attempt unwound without a terminal rotation state —
+	// shutdown, or a reload removed or replaced the route. Deliberately not a
+	// provider failure, and never counted as one.
+	OutcomeAborted RotationOutcome = "aborted"
+)
+
+// Attempt is one rotation procedure, from drain to terminal outcome, as the
+// engine states it.
+//
+// Every field is a fixed label, a count, or an address the engine already
+// holds in rotation state. The attempt's error text is deliberately absent: a
+// rotate-API failure's message can quote the provider's URL, and that detail
+// belongs in the process log, where internal/sanitize governs it. A recorder
+// receiving an Attempt therefore cannot persist a rotate-API URL, a header, a
+// body, or a route credential — none of them is in the struct.
+type Attempt struct {
+	// EventID is the attempt's idempotency key, minted by the engine when the
+	// attempt completes. A recorder reuses it across every retry, so a replay
+	// of the same attempt is a no-op rather than a second history row.
+	EventID string
+	// RouteHost, RouteKind and RouteOrigin identify the route. RouteHost is
+	// the URL host only — never the full canonical route ID, which embeds the
+	// route's SOCKS userinfo and must not reach a durable row.
+	RouteHost   string
+	RouteKind   string
+	RouteOrigin string
+	// Mode names how this attempt was driven. The engine drives manual routes
+	// only, so it carries ModeManual on every attempt — stated per attempt
+	// rather than assumed by the recorder, so a future driver cannot be filed
+	// under today's rows' mode.
+	Mode string
+	// RotationEpoch is the route's rotation generation this attempt ran under,
+	// read at the attempt's start.
+	RotationEpoch uint64
+	StartedAt     time.Time
+	EndedAt       time.Time
+	Outcome       RotationOutcome
+	// FailureKind is a fixed label ("none" when the attempt reached a verified
+	// terminal state), never error text.
+	FailureKind string
+	// BaselineIP and ObservedIP are the egress addresses the attempt learned,
+	// already canonical in the pool's sense; empty when it learned none.
+	BaselineIP string
+	ObservedIP string
+	// APIAttempts and ProbeAttempts count this attempt's provider call and its
+	// verify probes.
+	APIAttempts   int
+	ProbeAttempts int
+	// ConfigRevision is the durable configuration revision serving at the
+	// attempt's start, or 0 when this instance runs on its local seed file.
+	ConfigRevision int64
+	// ConsecutiveSameIP is the run of same-IP outcomes ending at this attempt.
+	ConsecutiveSameIP int
+	// Revisit reports that ObservedIP was an address this route had already
+	// verified earlier in its lifetime — the engine's commit-time decision,
+	// passed through rather than reconstructed by a reader.
+	Revisit bool
+}
+
+// History receives completed rotation attempts and the egress addresses they
+// verified.
+//
+// It is an interface so this package stays independent of the durable store,
+// and a nil History is the disabled state. Every method MUST be non-blocking:
+// the engine calls them from its procedure goroutines, and a rotation must
+// never wait on — or know about — a database. Implementations are expected to
+// buffer and return.
+type History interface {
+	// RecordRotationAttempt reports one finished attempt. The engine calls it
+	// exactly once per attempt, at the moment the attempt's terminal decision
+	// was made, with the EventID it minted for it.
+	RecordRotationAttempt(a Attempt)
+
+	// RecordIPObservation reports one egress address a route was verified
+	// serving from, with the revisit flag the commit already decided.
+	RecordIPObservation(o IPObservation)
+}
+
+// IPObservation is one egress address a route was observed serving from.
+type IPObservation struct {
+	RouteHost   string
+	RouteKind   string
+	RouteOrigin string
+	// IP is the address as the engine holds it, already canonical by the pool's
+	// definition; a recorder canonicalizes again on the way in.
+	IP string
+	// Source is "baseline" or "rotation".
+	Source string
+	At     time.Time
+	// Revisit is the engine's commit-time decision for this address.
+	Revisit       bool
+	RotationEpoch uint64
+}
+
 // Engine schedules and runs rotation procedures for manual routes. Run drives
 // one Engine; all methods are safe for concurrent use.
 type Engine struct {
@@ -53,6 +163,17 @@ type Engine struct {
 	// had already verified; it is the global aggregate of the per-route
 	// ipRevisitCount, never larger than rotations.
 	ipRevisits atomic.Uint64
+
+	// history receives each completed rotation attempt. It is an interface, not
+	// a concrete store, so this package does not depend on the durable
+	// analytics substrate — the engine states what it observed and the store
+	// decides where it goes. A nil History discards every attempt, which is the
+	// default and the reason the e2e suite measures no analytics at all.
+	//
+	// Every method on it is required to be non-blocking: the engine calls them
+	// from its procedure goroutines, and a rotation must never wait on a
+	// database.
+	history History
 
 	// dial and probeTLS are seams for tests. Production dials through the
 	// route's SOCKS endpoint and always verifies the ip-check certificate.
@@ -83,6 +204,20 @@ func New(store *pool.Store, log zerolog.Logger) *Engine {
 		},
 	}
 }
+
+// UseHistory attaches where completed attempts and verified egress addresses go.
+//
+// It is a method rather than a New parameter because it is optional and the
+// decision belongs to the operator, not the engine: with no History — the
+// default — the engine discards every attempt, starts nothing, and behaves
+// exactly as it did before the durable analytics substrate existed. Passing nil
+// restores that state.
+//
+// It is safe to call before Run and from a single goroutine at startup. It is
+// not safe to call while procedures are in flight, because it writes the
+// history field without synchronization; the engine does not need a live swap,
+// and a data race in exchange for one is a bad trade.
+func (e *Engine) UseHistory(h History) { e.history = h }
 
 // Rotations reports how many rotations completed with a verified new egress IP.
 func (e *Engine) Rotations() uint64 { return e.rotations.Load() }
@@ -162,6 +297,11 @@ func (e *Engine) bootPrecheck(ctx context.Context, gen *pool.Generation) {
 			log.Warn().Msg("route egress IP changed between boot probes without a rotation; provider IPs are not sticky")
 		}
 		p.SetBaselineIP(second)
+		// The route's starting address belongs in the same history a rotation
+		// commit writes to, so "which IPs has this route ever served from"
+		// covers it — and a rotation that later returns to this address is
+		// visibly a revisit rather than a first sighting.
+		e.recordBaselineObservation(p, second, e.Now())
 		log.Debug().Str("egress_ip", second).Msg("boot baseline set")
 	}
 }
@@ -268,6 +408,31 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 	}
 
 	p.BeginRotation(pool.RotationDraining)
+	// The rotation epoch is read after BeginRotation, which is what advances it,
+	// so it names the generation this attempt actually ran under. Read once
+	// here: a later read could observe the next attempt's increment and stamp
+	// this attempt with a generation it predates.
+	epoch := p.RotationEpoch()
+	// One identity for this whole procedure, minted once and reused by whichever
+	// terminal path ends it. It is what makes recording the attempt twice — which
+	// two overlapping abort paths could otherwise do — a no-op at the store's
+	// primary key rather than a duplicate history row.
+	attemptID := newAttemptID()
+	// Probe and API counters, accumulated where each call actually happens, so
+	// the recorded attempt says what it cost rather than what it could have.
+	var (
+		apiAttempts   int
+		probeAttempts int
+	)
+	// abort records the attempt as an unwind rather than a provider failure.
+	// Every early return below is one of the two: the procedure could not reach
+	// a terminal rotation state, because the engine is shutting down or a
+	// reload removed or replaced the route. That is a different event from a
+	// rotation that ran and failed, and an operator asking "did this route's IP
+	// fail to rotate" must not have to read a restart into the answer.
+	abort := func() {
+		e.recordAbort(p, gen, attemptID, epoch, started)
+	}
 	drainEv := log.Debug().Str("phase", "draining").Str("drain_timeout", dlog(settings.DrainTimeout))
 	if n := p.InFlight(); n > 0 {
 		drainEv = drainEv.Int("in_flight", n)
@@ -284,13 +449,16 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 			break
 		}
 		if gone() {
+			abort()
 			return true
 		}
 		if !sleepCtx(ctx, drainPoll) {
+			abort()
 			return true
 		}
 	}
 	if gone() {
+		abort()
 		return true
 	}
 
@@ -300,6 +468,7 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 	enterPhase("rotating")
 	baseline, verified := e.baselineProbe(ctx, gen, spec, settings.IPCheckTimeout, log)
 	if gone() {
+		abort()
 		return true
 	}
 	if !verified {
@@ -307,12 +476,14 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 	}
 
 	// 3. Call the provider rotate API, directly — never through the pool.
+	apiAttempts++
 	retryAfter, apiErr := e.callRotateAPI(ctx, spec.API)
 	// The provider call can sit in flight for its whole timeout; a reload
 	// that removed or replaced the route meanwhile is caught here, at the
 	// phase boundary, instead of after a verify window of probes through the
 	// removed route's endpoint.
 	if gone() {
+		abort()
 		return true
 	}
 
@@ -347,6 +518,9 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 			// rotation failure either: unwinding as an abort is what lets the
 			// caller stop without marking the route stale or backing it off.
 			log.Debug().Str("egress_ip", ip).Msg("route left the live pool before the commit")
+			// Not recorded here: verify returns on this outcome, and the caller
+			// sees the same route-gone state through its own gone() check, so
+			// recording the abort there covers this path exactly once.
 			return commitAborted
 		case err != nil: // pool.ErrRotationCollision
 			return commitLateCollision
@@ -364,36 +538,55 @@ func (e *Engine) rotate(ctx context.Context, gen *pool.Generation, spec config.M
 		}
 		e.setDue(id, e.Now().Add(spec.RotateInterval))
 		log.Info().Str("egress_ip", ip).Str("next_in", dlog(spec.RotateInterval)).Msg("rotation complete")
+		// Recorded here, at the one place the rotation is known to have
+		// succeeded and the revisit flag is known: the commit. A recorder never
+		// re-derives either from the pool's counters, which it cannot see and
+		// which would be a second, divergent account of the same event. Enqueue
+		// only — this runs on a procedure goroutine, and a rotation must not
+		// wait on a database.
+		e.recordRotated(p, gen, attemptID, ip, e.Now(), revisit, epoch, started, baseline, verified, apiAttempts, probeAttempts)
 		return commitDone
 	}
-	changed := e.verify(ctx, gen, spec, p, baseline, verified, settings, apiErr != nil, log, commit)
+	changed := e.verify(ctx, gen, spec, p, baseline, verified, settings, apiErr != nil, log, commit, &probeAttempts)
 
 	if gone() {
+		// verify returned because the procedure was told to stop, not because
+		// the IP did or did not change. Recording it as unchanged_ip would blame
+		// the provider for a shutdown.
+		abort()
 		return true
 	}
 	if apiErr != nil {
 		log.Warn().Str("error", sanitize.ErrorString(apiErr)).Msg("rotate API call failed")
 	}
-	if !changed {
-		consecutive := e.bumpConsecutive(id)
-		backoff := BackoffFor(spec.RotateInterval, consecutive, settings.RetryBackoffMax)
-		// A provider Retry-After hint may extend the wait, but never past the
-		// configured ceiling: an unbounded hint would let one response silence
-		// the route's rotation retries for days.
-		backoff = min(max(retryAfter, backoff), settings.RetryBackoffMax)
-		// Mark the pool that is serving now: a reload may have swapped the
-		// generation between the gone() check and here, and jumpToBack must
-		// land on the route the live pool actually picks from.
-		e.store.Load().Pool.MarkStale(p, backoff, consecutive)
-		e.setDue(id, e.Now().Add(backoff))
-		warnEv := log.Warn().Int("consecutive_same_ip", consecutive).Str("retry_in", dlog(backoff))
-		if retryAfter > 0 {
-			// The provider's raw hint, before the ceiling clamp: the gap
-			// between it and retry_in is the clamp at work.
-			warnEv = warnEv.Str("retry_after_hint", dlog(retryAfter))
-		}
-		warnEv.Msg("rotation did not change the egress IP; retrying")
+	if changed {
+		// The commit closure already recorded this attempt, at the instant the
+		// rotation became true. There is nothing terminal left to record here.
+		return false
 	}
+	consecutive := e.bumpConsecutive(id)
+	backoff := BackoffFor(spec.RotateInterval, consecutive, settings.RetryBackoffMax)
+	// A provider Retry-After hint may extend the wait, but never past the
+	// configured ceiling: an unbounded hint would let one response silence
+	// the route's rotation retries for days.
+	backoff = min(max(retryAfter, backoff), settings.RetryBackoffMax)
+	// Mark the pool that is serving now: a reload may have swapped the
+	// generation between the gone() check and here, and jumpToBack must
+	// land on the route the live pool actually picks from.
+	e.store.Load().Pool.MarkStale(p, backoff, consecutive)
+	e.setDue(id, e.Now().Add(backoff))
+	warnEv := log.Warn().Int("consecutive_same_ip", consecutive).Str("retry_in", dlog(backoff))
+	if retryAfter > 0 {
+		// The provider's raw hint, before the ceiling clamp: the gap
+		// between it and retry_in is the clamp at work.
+		warnEv = warnEv.Str("retry_after_hint", dlog(retryAfter))
+	}
+	warnEv.Msg("rotation did not change the egress IP; retrying")
+	// The attempt ran to a terminal state that was not a rotation. Recorded
+	// here, where that decision was just made and where the consecutive-same-IP
+	// run and the observed address are both in hand — a reader reconstructing
+	// them later would be guessing at values that move.
+	e.recordUnchanged(p, gen, attemptID, epoch, started, baseline, verified, consecutive, apiErr != nil, apiAttempts, probeAttempts)
 	return false
 }
 
@@ -422,7 +615,7 @@ const (
 // the only record of why. A candidate that survives every check is handed to
 // commit, which re-checks the collision set atomically with the record; it
 // reports whether that commit happened.
-func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.ManualRouteSpec, p *pool.Proxy, baseline string, verified bool, settings config.RotationSettings, apiFailed bool, log zerolog.Logger, commit func(ip string) commitOutcome) bool {
+func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.ManualRouteSpec, p *pool.Proxy, baseline string, verified bool, settings config.RotationSettings, apiFailed bool, log zerolog.Logger, commit func(ip string) commitOutcome, probes *int) bool {
 	deadline := e.Now().Add(settings.IPCheckTimeout)
 	for attempt := 0; ; attempt++ {
 		if ctx.Err() != nil {
@@ -445,6 +638,9 @@ func (e *Engine) verify(ctx context.Context, gen *pool.Generation, spec config.M
 			remaining = d
 		}
 		ip, err := e.probeIP(ctx, gen, spec, remaining)
+		if probes != nil {
+			*probes++
+		}
 		if err != nil {
 			log.Debug().Int("attempt", attempt+1).Str("error", sanitize.ErrorString(err)).Msg("ip check probe failed")
 			continue
