@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"io"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -192,12 +191,4 @@ func (c helperConfig) env() []string {
 		out = append(out, "RPGW_HELPER_WATCH="+c.WatchInterval.String())
 	}
 	return out
-}
-
-// envOr returns an environment variable, for the helper's own reads.
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }

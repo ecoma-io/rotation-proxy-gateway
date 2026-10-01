@@ -340,10 +340,10 @@ func (s *Store) Phase(ctx context.Context, c Commit, state RotationState, epoch 
 	case err != nil:
 		return fmt.Errorf("record rotation phase: %w", err)
 	}
-	switch {
-	case res == 1:
+	switch res {
+	case 1:
 		return nil
-	case res == 0:
+	case 0:
 		return ErrFenced
 	default:
 		return ErrNotHolder
