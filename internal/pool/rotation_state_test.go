@@ -97,6 +97,200 @@ func TestAllCoolingFallbackSkipsRotatingRoute(t *testing.T) {
 	}
 }
 
+// TestChangeoverHoldSkipsRouteUntilReleased covers the seamless changeover
+// hold as the serving path sees it. HoldRotationUntil is the same eligibility
+// mechanism BeginRotation raises, so the assertions are the ones
+// TestPickForSkipsRotatingRoute makes: the held route leaves ordinary picks,
+// and comes back when the hold is released.
+//
+// The clock is the pool's own, pinned past processStart, because the hold is
+// stored through relNanos and read back through the real clock by RotationHeld —
+// the same arrangement TestRotationPredicatesAndRoutePointers needs.
+func TestChangeoverHoldSkipsRouteUntilReleased(t *testing.T) {
+	c := &clock{now: processStart.Add(time.Hour)}
+	pl := newManualPool(t, c, "socks5://m1:1", "socks5://m2:2")
+	held := pl.entries[0]
+
+	if got := held.RotationHoldUntil(); !got.IsZero() {
+		t.Fatalf("fresh route has a hold deadline: %v", got)
+	}
+	// Prime the LRU so m2 would normally be next; the hold must win.
+	pl.PickFor(nil, nil, "t:443")
+	held.HoldRotationUntil(c.now.Add(5 * time.Second))
+	if !held.RotationHeld() {
+		t.Fatal("held route does not report RotationHeld")
+	}
+	for range 3 {
+		if got := pl.PickFor(nil, nil, "t:443").URL.Host; got != "m2:2" {
+			t.Fatalf("pick = %s, want m2:2 while m1 is held", got)
+		}
+	}
+	if a := findStatus(t, pl.Snapshot(), "m1:1"); a.Available {
+		t.Fatalf("held route reports available: %+v", a)
+	}
+
+	// A hold does not claim a rotation is running: the flag stays clear, so the
+	// route keeps the display state it had. That is what separates this from
+	// BeginRotation, and it is why the phase write the engine makes after the
+	// changeover is correctly a no-op here.
+	if held.RotatingNow() {
+		t.Fatal("held route reports a running rotation")
+	}
+	if st := findStatus(t, pl.Snapshot(), "m1:1").Rotation; st.State != "idle" {
+		t.Fatalf("held route display state = %q, want idle", st.State)
+	}
+
+	held.ReleaseRotationHold()
+	if held.RotationHeld() || !held.RotationHoldUntil().IsZero() {
+		t.Fatal("released route still reports a hold")
+	}
+	// The released route is pickable again, and the hold left the LRU order
+	// alone: m2 was served three times above, so m1 is the fresher route.
+	if got := pl.PickFor(nil, nil, "t:443").URL.Host; got != "m1:1" {
+		t.Fatalf("pick after release = %s, want m1:1", got)
+	}
+}
+
+// TestChangeoverHoldExpiresWithoutRelease is the bound that makes the hold safe:
+// it is a deadline, not a flag, so a procedure that dies without closing it
+// cannot keep the route out of picks past that deadline. This is the property
+// that lets the rotation policy open a hold without having to prove, on every
+// path out of a procedure, that something releases it.
+//
+// The deadline is anchored to the real clock rather than the injected one,
+// because that is the clock heldAt is read against in production: the bound has
+// to hold in wall time, not only in the pool's own. A one-millisecond deadline
+// and a real sleep cover both readings.
+func TestChangeoverHoldExpiresWithoutRelease(t *testing.T) {
+	c := &clock{now: processStart.Add(time.Hour)}
+	pl := newManualPool(t, c, "socks5://m1:1", "socks5://m2:2")
+	p := pl.entries[0]
+
+	p.HoldRotationUntil(time.Now().Add(time.Millisecond))
+	time.Sleep(5 * time.Millisecond)
+	if p.RotationHeld() {
+		t.Fatal("hold outlived its deadline on the real clock")
+	}
+	if got := pl.PickFor(nil, nil, "t:443").URL.Host; got != "m1:1" {
+		t.Fatalf("pick = %s, want m1:1 after the hold expired", got)
+	}
+
+	// A deadline already elapsed opens no hold at all. This is what a changeover
+	// looks like when its drain spent the whole budget.
+	p.HoldRotationUntil(time.Now().Add(-time.Second))
+	if p.RotationHeld() {
+		t.Fatal("a hold with an elapsed deadline reports held")
+	}
+	if got := pl.PickFor(nil, nil, "t:443").URL.Host; got != "m2:2" {
+		t.Fatalf("pick = %s, want m2:2; an elapsed hold changed the pick order", got)
+	}
+}
+
+// TestAllCoolingFallbackSkipsHeldRoute is the all-cooling half of the hold. The
+// fallback is the one path that reaches a route with no cooldown to offer, which
+// makes it the path a changeover hold has to reach too: a held route must not be
+// handed out as the soonest-recovering option while every other route is
+// cooling, because the hold is exactly the statement that this route's egress IP
+// is mid-swap.
+func TestAllCoolingFallbackSkipsHeldRoute(t *testing.T) {
+	c := &clock{now: processStart.Add(time.Hour)}
+	pl := newManualPool(t, c, "socks5://m1:1", "socks5://m2:2")
+
+	// m1 cooling, m2 held: the fallback must not select m2 even though it has
+	// no cooldown at all and so recovers soonest; it selects the cooling m1.
+	pl.ReportFailure(pl.entries[0], nil)
+	pl.entries[1].HoldRotationUntil(c.now.Add(5 * time.Second))
+
+	if got := pl.PickFor(nil, nil, "t:443"); got == nil || got.URL.Host != "m1:1" {
+		t.Fatalf("fallback pick = %v, want cooling m1:1", got)
+	}
+
+	pl.entries[1].ReleaseRotationHold()
+	if got := pl.PickFor(nil, nil, "t:443"); got == nil || got.URL.Host != "m2:2" {
+		t.Fatalf("pick after release = %v, want m2:2", got)
+	}
+}
+
+// TestChangeoverHoldIsScopedToOneRouteAndEndsWithTheProcedure proves the two
+// things a hold must not do: leak onto another route, or outlive the procedure
+// that opened it. Both matter because the pool is shared — a cooldown on one
+// route is visible to a listener serving another, and so is a hold.
+//
+// A terminal transition clears the hold as well as the flag. A disruptive
+// rotation never opens one, so that only happens if a route carries both; the
+// assertion is that whichever transition ends a rotation ends the hold with it,
+// so a route the engine returned to service is genuinely serving.
+func TestChangeoverHoldIsScopedToOneRouteAndEndsWithTheProcedure(t *testing.T) {
+	c := &clock{now: processStart.Add(time.Hour)}
+	pl := newManualPool(t, c, "socks5://m1:1", "socks5://m2:2")
+	held, other := pl.entries[0], pl.entries[1]
+
+	held.HoldRotationUntil(c.now.Add(5 * time.Second))
+	if other.RotationHeld() {
+		t.Fatal("a hold on one route leaked onto another")
+	}
+
+	// The three terminal transitions of a rotation, each reopening the hold first
+	// so it is the transition under test and not the previous case's leftover.
+	for _, tc := range []struct {
+		name string
+		end  func()
+	}{
+		{"EndRotation", func() { held.EndRotation("203.0.113.9", c.now) }},
+		{"MarkStale", func() { pl.MarkStale(held, time.Second, 1) }},
+		{"AbandonRotation", held.AbandonRotation},
+	} {
+		held.HoldRotationUntil(c.now.Add(5 * time.Second))
+		tc.end()
+		if held.RotationHeld() {
+			t.Fatalf("%s left the route held", tc.name)
+		}
+	}
+
+	// SetRotationPhase and AdmitRotationEpoch are not terminal and must leave a
+	// hold exactly where it was: they are the mid-procedure steps, and the engine
+	// runs the first of them while the hold is open.
+	held.HoldRotationUntil(c.now.Add(5 * time.Second))
+	held.SetRotationPhase(RotationVerifying)
+	if !held.RotationHeld() {
+		t.Fatal("SetRotationPhase released a hold it does not own")
+	}
+	held.AdmitRotationEpoch()
+	if !held.RotationHeld() {
+		t.Fatal("AdmitRotationEpoch released a hold it does not own")
+	}
+	held.ReleaseRotationHold()
+	if held.RotationHeld() {
+		t.Fatal("ReleaseRotationHold left the route held")
+	}
+}
+
+// TestChangeoverHoldDoesNotAdvanceEpoch keeps the hold out of the rotation
+// epoch's contract. The epoch is the warm pool's generation stamp and advances
+// exactly once per procedure, at Admit; a hold that moved it would retire
+// connections stamped under the *new* egress IP, which is the opposite of what
+// the hold is for. (TestRotationEpochAdvancesOnlyAtBegin pins the same property
+// for the disruptive path.)
+func TestChangeoverHoldDoesNotAdvanceEpoch(t *testing.T) {
+	c := &clock{now: processStart.Add(time.Hour)}
+	pl := newManualPool(t, c, "socks5://m1:1")
+	p := pl.entries[0]
+
+	p.AdmitRotationEpoch()
+	before := p.RotationEpoch()
+	p.HoldRotationUntil(c.now.Add(5 * time.Second))
+	if got := p.RotationEpoch(); got != before {
+		t.Fatalf("epoch moved on HoldRotationUntil: %d, want %d", got, before)
+	}
+	p.ReleaseRotationHold()
+	if got := p.RotationEpoch(); got != before {
+		t.Fatalf("epoch moved on ReleaseRotationHold: %d, want %d", got, before)
+	}
+	if p.RotatingNow() {
+		t.Fatal("the seamless hold raised the rotating flag")
+	}
+}
+
 func TestInFlightAccounting(t *testing.T) {
 	c := &clock{now: time.Unix(0, 0)}
 	pl := newManualPool(t, c, "socks5://m1:1")

@@ -467,3 +467,46 @@ func TestValidListenerHostname(t *testing.T) {
 // The atomic generation store lives in internal/pool (which already imports
 // this package); its nil-rejection, publication, and in-flight snapshot
 // behavior is covered by internal/pool/generation_test.go.
+
+// TestLoadRuntimeRotationMode pins the mode setting through the real funnel —
+// fileConfig → rotationFileConfig → parseRotationSettings → validate — because
+// the mode is the one rotation setting whose value must never be silently
+// reinterpreted: an unknown spelling has to fail validation rather than fall
+// back to a default that would change a route's admission behavior.
+func TestLoadRuntimeRotationMode(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		old     string
+		new     string
+		want    RotationMode
+		wantErr string
+	}{
+		{name: "absent keeps the default", old: "  max-concurrent: 1\n", new: "  max-concurrent: 1\n", want: DefaultRotationMode},
+		{name: "explicit disruptive", old: "  max-concurrent: 1\n", new: "  mode: disruptive\n  max-concurrent: 1\n", want: RotationModeDisruptive},
+		{name: "explicit seamless", old: "  max-concurrent: 1\n", new: "  mode: seamless\n  max-concurrent: 1\n", want: RotationModeSeamless},
+		{name: "unknown spelling is rejected", old: "  max-concurrent: 1\n", new: "  mode: SEAMLESS\n  max-concurrent: 1\n", wantErr: "rotation.mode"},
+		// An explicit empty value is indistinguishable from an absent key once
+		// mapstructure has run, so it resolves to the default rather than
+		// failing; only an unknown non-empty spelling is an error.
+		{name: "empty value means unset", old: "  max-concurrent: 1\n", new: "  mode: \"\"\n  max-concurrent: 1\n", want: DefaultRotationMode},
+		{name: "third mode is rejected", old: "  max-concurrent: 1\n", new: "  mode: eventually\n  max-concurrent: 1\n", wantErr: "rotation.mode"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := strings.Replace(validRuntimeConfig, tc.old, tc.new, 1)
+			cfg, err := LoadRuntime(writeRuntimeConfig(t, content))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %v, want %q", err, tc.wantErr)
+				}
+				assertNoSecretLeak(t, err)
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.Rotation.ResolveMode(); got != tc.want {
+				t.Fatalf("ResolveMode() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

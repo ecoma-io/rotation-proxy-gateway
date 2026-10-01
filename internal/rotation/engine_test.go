@@ -70,6 +70,20 @@ type ipServer struct {
 	counter atomic.Int32
 	hits    atomic.Int32 // fully served requests in every mode; tests await probe arrivals
 	hang    atomic.Int64 // handler delay, exercising probe timeouts
+
+	// parkEntered, once non-nil, is closed as the handler is entered and the
+	// handler then blocks until parkRelease is closed. Parking the probe — and
+	// not the rotate call — is what lets a test wait for a procedure to reach a
+	// given step: the rotate call runs before the changeover opens, so a
+	// procedure parked there has not opened the hold a caller is waiting for.
+	// It also removes the dependence on the rotate client's own timeout, which
+	// is a deadline rather than a barrier.
+	arrivals      atomic.Int32
+	parkFrom      atomic.Int32 // arrival number at which the handler starts parking
+	parkEntered   chan struct{}
+	parkEnterOnce sync.Once
+	parkRelease   chan struct{}
+	parkRelOnce   sync.Once
 }
 
 func newIPServer(t *testing.T, initial string) *ipServer {
@@ -81,6 +95,10 @@ func newIPServer(t *testing.T, initial string) *ipServer {
 		if d := time.Duration(s.hang.Load()); d > 0 {
 			time.Sleep(d)
 		}
+		if s.parkEntered != nil && s.arrivals.Add(1) >= s.parkFrom.Load() {
+			s.parkEnterOnce.Do(func() { close(s.parkEntered) })
+			<-s.parkRelease
+		}
 		if s.unique.Load() {
 			n := int(s.counter.Add(1))
 			_, _ = fmt.Fprintf(w, "loc=XX\nip=10.%d.%d.%d\n", (n>>16)&255, (n>>8)&255, n&255)
@@ -88,10 +106,28 @@ func newIPServer(t *testing.T, initial string) *ipServer {
 		}
 		_, _ = fmt.Fprintf(w, "loc=XX\nip=%s\ntls=1.3\n", s.static.Load())
 	}))
-	t.Cleanup(s.srv.Close)
+	t.Cleanup(func() { s.releasePark(); s.srv.Close() })
 	s.rootCAs = x509.NewCertPool()
 	s.rootCAs.AddCert(s.srv.Certificate())
 	return s
+}
+
+// parkArm lets the first skip requests be served normally and parks the one
+// after them, until releasePark. The entered channel it returns is closed once
+// the parked request has actually arrived, so a caller can wait for the step to
+// begin without polling. Parking nothing by accident — skip = 0 — parks the very
+// first request, which is the baseline probe.
+func (s *ipServer) parkArm(skip int32) chan struct{} {
+	s.parkEntered = make(chan struct{})
+	s.parkRelease = make(chan struct{})
+	s.parkFrom.Store(skip + 1)
+	return s.parkEntered
+}
+
+func (s *ipServer) releasePark() {
+	if s.parkRelease != nil {
+		s.parkRelOnce.Do(func() { close(s.parkRelease) })
+	}
 }
 
 func (s *ipServer) set(ip string) { s.static.Store(ip) }

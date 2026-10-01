@@ -33,6 +33,32 @@ func reachable(t *testing.T, addr string) bool {
 	return true
 }
 
+// waitForDraining polls /readyz until it answers 503 and reports whether it got
+// there inside budget.
+//
+// The transition belongs to the process, not to the signal: Signal only says the
+// byte was written, and a loaded machine can take a noticeable moment to run the
+// handler that flips readiness. A test that samples /readyz before that instant
+// sees the 200 it is asserting is already gone, and reports a drain-ordering bug
+// that is really a scheduling artifact — which is why this failure appeared only
+// under CPU contention. The barrier is the log record the process writes when it
+// goes unready, which is emitted after the flip, so it never reports readiness
+// that has not happened yet.
+func waitForDraining(t *testing.T, g *Gateway, budget time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		if code, body := g.AdminPath("/readyz"); code == http.StatusServiceUnavailable {
+			return strings.Contains(body, "draining")
+		}
+		if strings.Contains(g.Logs(), `"msg":"readiness unready`) {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
 // The end-to-end invariant: on SIGTERM the process answers 503 on /readyz and
 // keeps accepting on all four listeners for a real head start, then closes
 // them. /healthz stays 200 throughout — it is liveness, and a probe that fails
@@ -55,6 +81,12 @@ func TestE2E_ReadyzUnreadyBeforeAnyListenerCloses(t *testing.T) {
 	}
 
 	g.Signal(syscall.SIGTERM)
+
+	// The transition is the process's to make, so wait for it before asserting
+	// on it; without this the first sample races the signal handler.
+	if !waitForDraining(t, g, 3*time.Second) {
+		t.Fatalf("/readyz never went 503 inside the budget\nlogs:\n%s", g.Logs())
+	}
 
 	// The head start is 5s; sample well inside it. Every listener must still
 	// accept for the whole span, and /readyz must never come back 200.
@@ -117,13 +149,11 @@ func TestE2E_TunnelOpenedDuringHeadStartIsServed(t *testing.T) {
 	}), "RPGW_SHUTDOWN_GRACE="+grace.String())
 
 	g.Signal(syscall.SIGTERM)
-	// Wait for the transition, then open a tunnel inside the window.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if code, _ := g.AdminPath("/readyz"); code == http.StatusServiceUnavailable {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	// Wait for the transition, then open a tunnel inside the window. The budget
+	// is short because it only has to cover the process picking the signal up:
+	// the window being sampled is the 5s head start that follows it.
+	if !waitForDraining(t, g, 3*time.Second) {
+		t.Fatalf("/readyz never went 503 inside the head start\nlogs:\n%s", g.Logs())
 	}
 	GetVia(t, ProxyClient(g.MixedAddr), target.URL+"/head-start", "e2e-echo:/head-start")
 

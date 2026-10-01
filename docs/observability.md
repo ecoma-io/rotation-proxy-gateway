@@ -111,6 +111,13 @@ set of safe labels, never raw error text. `targetCooldowns` counts the route's
 never the targets themselves. Manual routes additionally carry a `rotation`
 object (`state`, `lastIP`, `lastRotationAt`, `nextRetryIn`, `consecutiveSameIP`,
 `rotationCount`, `ipRevisitCount`) — see [rotation states](rotation.md#states).
+`available` is the same predicate `PickFor` applies, so a route reporting
+`false` is one the gateway will not pick for any target — auth-blocked, cooling,
+or out of picks for a rotation reason. A `seamless` route held across a changeover
+reports `false` while it is held, and returns to `true` when the changeover
+settles or the hold's bound passes; its `rotation.state` stays whatever it was,
+because a hold is not a rotation in flight.
+
 `rotationCount` is that route's successful rotations and `ipRevisitCount` the
 subset of them that returned to an address the route had already verified; both
 are always present, so a zero is explicit, and both are per-route counters that

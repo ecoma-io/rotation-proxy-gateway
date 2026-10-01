@@ -15,13 +15,15 @@ import (
 // EndRotation or MarkStale returns it to serving; in-flight requests picked
 // before BeginRotation keep running and drain on their own.
 //
-// It is also the only writer of the rotation epoch, advanced after the
-// rotating flag is set: anything stamped with an older epoch was established
-// before this procedure began and — however the procedure ends — predates the
-// route's next verified egress IP. The flag-then-epoch order means a reader
-// that still sees rotating == false also still sees the old epoch, so nothing
-// can start through the beginning of a rotation and validate as the new
-// generation.
+// It raises the rotating flag and then advances the rotation epoch: anything
+// stamped with an older epoch was established before this procedure began and —
+// however the procedure ends — predates the route's next verified egress IP.
+// The flag-then-epoch order means a reader that still sees rotating == false
+// also still sees the old epoch, so nothing can start through the beginning of
+// a rotation and validate as the new generation.
+//
+// A mode that keeps the route serving across the rotation advances the epoch
+// without the flag, through AdmitRotationEpoch.
 func (p *Proxy) BeginRotation(phase RotationState) {
 	p.rotating.Store(true)
 	p.rotationEpoch.Add(1)
@@ -29,6 +31,77 @@ func (p *Proxy) BeginRotation(phase RotationState) {
 	p.rotationState = phase
 	p.nextRetryIn = 0
 	p.mu.Unlock()
+}
+
+// AdmitRotationEpoch advances the route's rotation epoch while leaving it
+// eligible for picks and its display state untouched.
+//
+// It is the seamless mode's epoch step, and it exists because BeginRotation
+// bundles two effects that a mode serving traffic across the rotation needs
+// separately. Advancing the epoch alone is what makes the old generation
+// unusable: every warm connection parked against this route carries the epoch
+// it was dialed under, and the warm pool discards any whose stamp no longer
+// matches the route's current epoch — so bumping it retires exactly the
+// half-established connections that could otherwise be borrowed, and hands over
+// to connections established after the provider changed the egress IP. No
+// second eligibility mechanism is involved: the epoch is consulted by the warm
+// pool, never by PickFor.
+//
+// The flag-then-epoch ordering argument on BeginRotation is not needed here and
+// does not hold for this call, deliberately: a route that raises no flag has no
+// window in which it is simultaneously ineligible and advertising a new epoch,
+// and callers that only serve traffic across the rotation have nothing to
+// protect against that case.
+func (p *Proxy) AdmitRotationEpoch() {
+	p.rotationEpoch.Add(1)
+}
+
+// HoldRotationUntil takes the route out of picks until until, without touching
+// the rotation epoch and without recording a rotation phase.
+//
+// It is the second half of the seamless mode's changeover. AdmitRotationEpoch
+// retires the old generation while the route keeps serving; this is the brief
+// window, over the changeover itself, in which the route stops taking new picks
+// so no connection can be opened against an egress IP that is mid-swap — in
+// flight requests keep their existing tunnels and drain on their own, which is
+// what the mode promises. BeginRotation is the other way to stop a route serving
+// and differs in three ways that matter here: it advances the epoch, it holds
+// the route out for as long as the procedure runs rather than for a bounded
+// window, and it records a display phase.
+//
+// The window is a deadline rather than a flag, which is what makes the bound
+// structural: PickFor asks heldAt and a nowNano past until serves the route
+// again even if the procedure that opened the window was canceled before
+// releasing it. A hold therefore cannot outlive its bound, and no caller has to
+// prove the release ran. The route's display state is untouched, so a held route
+// keeps reporting the phase it had — the mode has no phase to report, because it
+// never stopped serving.
+func (p *Proxy) HoldRotationUntil(until time.Time) {
+	p.mu.Lock()
+	p.rotationHoldUntil.Store(relNanos(until))
+	p.mu.Unlock()
+}
+
+// ReleaseRotationHold ends a changeover hold opened by HoldRotationUntil and
+// returns the route to picks. It is idempotent and never advances the epoch, so
+// the old generation stays retired and a warm connection parked under it is
+// still discarded. Releasing with no hold open does nothing.
+func (p *Proxy) ReleaseRotationHold() {
+	p.mu.Lock()
+	p.rotationHoldUntil.Store(0)
+	p.mu.Unlock()
+}
+
+// RotationHoldUntil reports the deadline of an open changeover hold, or the zero
+// time when the route is not held. It exists for tests and for the status view's
+// callers that need to tell an open hold from no hold at all; nothing on the
+// serving path needs it, because heldAt already answers that question.
+func (p *Proxy) RotationHoldUntil() time.Time {
+	d := p.rotationHoldUntil.Load()
+	if d == 0 {
+		return time.Time{}
+	}
+	return processStart.Add(time.Duration(d))
 }
 
 // SetRotationPhase advances the displayed phase (draining → rotating →
@@ -88,6 +161,7 @@ func (p *Proxy) EndRotation(ip string, at time.Time) bool {
 		p.ipRevisitCount++
 	}
 	p.rotating.Store(false)
+	p.rotationHoldUntil.Store(0)
 	p.mu.Unlock()
 	return revisit
 }
@@ -173,6 +247,7 @@ func (pl *Pool) MarkStale(p *Proxy, nextRetryIn time.Duration, consecutiveSameIP
 	p.nextRetryIn = nextRetryIn
 	p.consecutiveSameIP = consecutiveSameIP
 	p.rotating.Store(false)
+	p.rotationHoldUntil.Store(0)
 	p.mu.Unlock()
 	pl.jumpToBack(p)
 }
@@ -208,6 +283,7 @@ func (p *Proxy) AbandonRotation() {
 	}
 	p.nextRetryIn = 0
 	p.rotating.Store(false)
+	p.rotationHoldUntil.Store(0)
 	p.mu.Unlock()
 }
 
