@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,7 +39,7 @@ func mountFixture(t *testing.T) (*pool.Store, *rotation.Engine, *controlPlane) {
 		CooldownMax:  time.Minute,
 	}
 	generations := pool.NewStore(cfg, pool.NewRoutes(cfg.AllRoutes(), cfg.CooldownBase, cfg.CooldownMax))
-	return generations, rotation.New(generations, zerolog.Nop()), &controlPlane{store: &stubRepository{}}
+	return generations, rotation.New(generations, zerolog.Nop()), &controlPlane{store: newStubRepository()}
 }
 
 // A store configured with no admin token refuses to start.
@@ -229,30 +230,78 @@ func TestMountedControlAPIKeepsNoPlaintextToken(t *testing.T) {
 	}
 }
 
-// stubRepository is a durable store with nothing in it. It exists so the mount
-// tests can build a control plane without a database, and it fails every read
-// with the one error that means "no revision has been committed yet" — the state
-// a fresh cluster is genuinely in.
-type stubRepository struct{}
-
-func (stubRepository) Active(context.Context) (configstore.Active, error) {
-	return configstore.Active{}, configstore.ErrNoActiveRevision
+// stubRepository is an in-memory durable store. The mount tests use it to build
+// a control plane without a database, and it starts genuinely empty: Active
+// fails with ErrNoActiveRevision, which is the state a fresh cluster is in.
+//
+// It is a working store rather than a refuse-everything stub because
+// TestSelectServingStoreReconcilesIntoTheServingGeneration — the regression test
+// for the durable-revision wiring — needs a peer to commit a second revision and
+// then reconcile it. A stub that failed Commit would force that test to reach for
+// its own double, leaving two stubs of the same interface to keep in step.
+type stubRepository struct {
+	mu      sync.Mutex
+	records map[configstore.Revision]configstore.Record
+	active  *configstore.Active
+	next    int64
 }
 
-func (stubRepository) Get(context.Context, configstore.Revision) (configstore.Record, error) {
-	return configstore.Record{}, fmt.Errorf("%w: nothing committed", configstore.ErrNoRevision)
+func newStubRepository() *stubRepository {
+	return &stubRepository{records: make(map[configstore.Revision]configstore.Record)}
 }
 
-func (stubRepository) Commit(context.Context, configstore.Revision, configstore.Document, configstore.Meta) (configstore.Record, error) {
-	return configstore.Record{}, fmt.Errorf("stubRepository: Commit is not exercised by the mount tests")
+func (s *stubRepository) Active(context.Context) (configstore.Active, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active == nil {
+		return configstore.Active{}, configstore.ErrNoActiveRevision
+	}
+	return *s.active, nil
 }
 
-func (stubRepository) Activate(context.Context, configstore.Revision, configstore.Revision) error {
-	return fmt.Errorf("stubRepository: Activate is not exercised by the mount tests")
+func (s *stubRepository) Get(_ context.Context, rev configstore.Revision) (configstore.Record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.records[rev]
+	if !ok {
+		return configstore.Record{}, fmt.Errorf("%w: revision %d", configstore.ErrNoRevision, rev)
+	}
+	return rec, nil
 }
 
-func (stubRepository) Migrate(context.Context) error { return nil }
+// Commit appends a record and makes it active. It ignores expectedRevision
+// because no test here exercises a stale writer; the optimistic-concurrency
+// refusal is the real store's contract and is covered against a live
+// PostgreSQL, not here.
+func (s *stubRepository) Commit(_ context.Context, _ configstore.Revision, doc configstore.Document, meta configstore.Meta) (configstore.Record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.next++
+	rec := configstore.Record{
+		Revision:   configstore.Revision(s.next),
+		DocVersion: doc.Version,
+		Document:   doc.JSON,
+		Author:     meta.Author,
+		Note:       meta.Note,
+	}
+	s.records[rec.Revision] = rec
+	s.active = &configstore.Active{Record: rec}
+	return rec, nil
+}
 
-func (stubRepository) SchemaVersion(context.Context) (int, error) { return 1, nil }
+func (s *stubRepository) Activate(_ context.Context, from, to configstore.Revision) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.records[to]
+	if !ok {
+		return fmt.Errorf("%w: revision %d", configstore.ErrNoRevision, to)
+	}
+	s.active = &configstore.Active{Record: rec}
+	return nil
+}
 
-func (stubRepository) Close() {}
+func (s *stubRepository) Migrate(context.Context) error { return nil }
+
+func (s *stubRepository) SchemaVersion(context.Context) (int, error) { return 1, nil }
+
+func (s *stubRepository) Close() {}

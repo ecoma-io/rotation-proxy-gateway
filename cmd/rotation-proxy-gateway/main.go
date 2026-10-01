@@ -172,11 +172,12 @@ func warnUnavailableKindListeners(log zerolog.Logger, cfg *config.RuntimeConfig,
 //
 // generations and reconciler.pool are the same *pool.Store, and that identity is
 // the substrate's central invariant: the reconciler publishes a durable revision
-// into the one generation store the proxy listeners, the admin mux, the rotation
-// engine and the warm pool all read. A reconciler publishing into a store nothing
-// serves would still apply every process-global effect of a revision — the log
-// level, the "configuration reloaded" line — which is what made the broken
-// wiring self-concealing: the logs announced a revision the gateway never served.
+// into the one generation store the proxy listeners, the admin mux, the control
+// API, the rotation engine and the warm pool all read. A reconciler publishing
+// into a store nothing serves would still apply every process-global effect of a
+// revision — the log level, the "configuration reloaded" line — which is what
+// made the broken wiring self-concealing: the logs announced a revision the
+// gateway never served.
 type controlPlane struct {
 	store       configstore.Repository
 	generations *pool.Store
@@ -621,10 +622,11 @@ func run() error {
 // announced a revision the gateway never served.
 //
 // It also stamps the boot generation with the revision it came from, so /status
-// reports the revision actually serving rather than zero. The stamp goes
-// through the same publication path every later revision uses, so there is no
-// second way for a generation to acquire a revision, and the reconfigure is a
-// no-op on identity, retaining every route's health and rotation state.
+// and the control API's configuration endpoints report the revision actually
+// serving rather than zero. The stamp goes through the same publication path
+// every later revision uses, so there is no second way for a generation to
+// acquire a revision, and the reconfigure is a no-op on identity, retaining
+// every route's health and rotation state.
 //
 // In file mode controlPlane is nil: there is no durable store, the local YAML is
 // the whole configuration, and the poller republishes into the store built here.

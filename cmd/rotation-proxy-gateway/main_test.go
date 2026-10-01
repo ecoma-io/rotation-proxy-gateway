@@ -913,7 +913,7 @@ func TestSelectServingStoreReconcilesIntoTheServingGeneration(t *testing.T) {
 	// The store openControlPlane hands the reconciler, and the store run() would
 	// serve from — the two the fix must make identical.
 	generations := pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.AllRoutes(), runtimeCfg.CooldownBase, runtimeCfg.CooldownMax))
-	repo := &stubRepository{}
+	repo := newStubRepository()
 	reconciler := control.NewReconciler(repo, generations, zerolog.Nop(), control.Options{})
 
 	// Revision 1: the boot generation, the same revision openControlPlane's Seed
@@ -990,47 +990,3 @@ func mustRuntime(t *testing.T, document string) *config.RuntimeConfig {
 	}
 	return cfg
 }
-
-// stubRepository is an in-memory configstore.Repository: enough to exercise the
-// reconciler's read/commit/apply path without a live PostgreSQL, which CI does
-// not provide. It is deliberately minimal — the store's own contract is tested
-// against a real database in internal/configstore — and exists here only to pin
-// the cmd wiring.
-type stubRepository struct {
-	active *configstore.Active
-	next   int64
-}
-
-func (s *stubRepository) Active(context.Context) (configstore.Active, error) {
-	if s.active == nil {
-		return configstore.Active{}, configstore.ErrNoActiveRevision
-	}
-	return *s.active, nil
-}
-
-func (s *stubRepository) Get(context.Context, configstore.Revision) (configstore.Record, error) {
-	return configstore.Record{}, configstore.ErrNoRevision
-}
-
-func (s *stubRepository) Commit(_ context.Context, _ configstore.Revision, doc configstore.Document, meta configstore.Meta) (configstore.Record, error) {
-	s.next++
-	rec := configstore.Record{
-		Revision:   configstore.Revision(s.next),
-		DocVersion: doc.Version,
-		Document:   doc.JSON,
-		Author:     meta.Author,
-		Note:       meta.Note,
-	}
-	s.active = &configstore.Active{Record: rec}
-	return rec, nil
-}
-
-func (s *stubRepository) Activate(context.Context, configstore.Revision, configstore.Revision) error {
-	return nil
-}
-
-func (s *stubRepository) Migrate(context.Context) error { return nil }
-
-func (s *stubRepository) SchemaVersion(context.Context) (int, error) { return 1, nil }
-
-func (s *stubRepository) Close() {}
