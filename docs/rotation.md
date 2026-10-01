@@ -123,7 +123,8 @@ Each attempt runs: **drain → baseline probe → rotate call → verify**.
 
 1. **Drain.** In `disruptive` mode the route stops receiving new picks
    immediately and stays ineligible for the whole procedure; in `seamless` mode
-   it keeps taking picks and only the changeover step below takes them away. The procedure waits for the route's
+   it keeps taking picks and only the changeover step below takes them away. The
+   procedure waits for the route's
    in-flight connections to finish, bounded by `drain-timeout`; expiry proceeds
    anyway, and the in-flight requests keep running on their existing tunnels —
    they finish on the old egress IP, none are broken. Draining a route that
@@ -146,13 +147,13 @@ Each attempt runs: **drain → baseline probe → rotate call → verify**.
    changeover settles — a hold bounded by the changeover timeout, measured from
    the moment the attempt was admitted. In `disruptive` mode the route is already
    out of picks and there is nothing to hold. Then the gateway re-probes until
-   `ip-check-timeout` elapses. The
-   attempt **succeeds only if the reported IP differs from the baseline and is
-   not the current IP of any other manual route** (a cross-route collision does
-   not count). Every comparison is made under one canonical IP identity: two
-   spellings of one address — IPv4 and its IPv4-mapped IPv6 form, expanded and
-   compressed IPv6 — are one address, so a provider that switches spellings has
-   not rotated anything. Success records the new IP as the route's baseline, closes
+   `ip-check-timeout` elapses. The attempt **succeeds only if the reported IP
+   differs from the baseline and is not the current IP of any other manual
+   route** (a cross-route collision does not count). Every comparison is made
+   under one canonical IP identity: two spellings of one address — IPv4 and its
+   IPv4-mapped IPv6 form, expanded and compressed IPv6 — are one address, so a
+   provider that switches spellings has not rotated anything. Success records the
+   new IP as the route's baseline, closes
    any changeover hold, and advances
    the route's `rotationCount` — plus its `ipRevisitCount` when the new address
    is one the route had already verified (see [states](#states)) — clears both
