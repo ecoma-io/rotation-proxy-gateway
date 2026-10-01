@@ -55,7 +55,7 @@ func TestTwoProcessesFenceAReplacedHolder(t *testing.T) {
 	// which will not arrive until it has been stopped, expired, and replaced.
 	a := startCoordHelper(t, dir, "a", helperConfig{
 		Addr: addr, Namespace: namespace, Listen: aAddr,
-		LeaseName: leaseName, Route: route,
+		LeaseName: leaseName, Route: route, WaitForCommit: true,
 	})
 	t1 := awaitAcquisition(t, a, 20*time.Second)
 
@@ -66,6 +66,16 @@ func TestTwoProcessesFenceAReplacedHolder(t *testing.T) {
 		LeaseName: leaseName, Route: route,
 	})
 	t.Cleanup(func() { b.stop() })
+
+	// Wait until A's rotation procedure is genuinely in flight — verified but
+	// not committed. Stopping it earlier would prove nothing: there would be no
+	// uncommitted write left to fence.
+	if line, ok := a.stdout.waitFor("verified", 20*time.Second); !ok {
+		t.Fatalf("instance A never reached the in-flight phase; stdout:\n%s\nstderr:\n%s",
+			drain(a.stdout), drain(a.stderr))
+	} else {
+		t.Logf("A is mid-procedure: %s", line)
+	}
 
 	// Stop A for longer than the lease TTL. The lease is written with a short
 	// TTL here so the test stays fast; the expiry itself is Redis's, not the
@@ -229,18 +239,19 @@ func TestTwoProcessesEpochFeedsWarmInvalidation(t *testing.T) {
 	})
 	t.Cleanup(func() { b.stop() })
 
-	adopted := waitForField(t, b.stdout, "adopted_epoch", 20*time.Second)
-	if adopted == "" {
-		t.Fatalf("instance B never adopted a cluster epoch; stderr:\n%s", drain(b.stderr))
-	}
-	if adopted != epoch.String() {
+	if _, adopted := b.stdout.waitForField("adopted_epoch", 20*time.Second); adopted == "" {
+		t.Fatalf("instance B never adopted a cluster epoch; stdout:\n%s\nstderr:\n%s",
+			drain(b.stdout), drain(b.stderr))
+	} else if adopted != epoch.String() {
 		t.Fatalf("instance B adopted %s, want the committed cluster epoch %s", adopted, epoch)
 	}
-	// B saw it through the reconcile tick, not through a pub/sub message: no
-	// message was published for this path, so a dropped message cannot be what
-	// made it converge.
-	if got := waitForField(t, b.stdout, "notifications", 2*time.Second); got != "" && got != "0" {
-		t.Logf("instance B also received %s pub/sub notification(s); convergence did not depend on it", got)
+
+	// Convergence came from the reconcile tick, not from a notification. This
+	// test publishes nothing, so if B adopted the epoch at all it did so by
+	// re-reading the authority on its own schedule — which is the property that
+	// makes a dropped pub/sub message cost one interval instead of correctness.
+	if _, moved := b.stdout.waitForField("routes_moved", 2*time.Second); moved == "0" {
+		t.Logf("instance B observed the epoch but had no routes to move; the reconcile read still happened")
 	}
 }
 

@@ -172,6 +172,7 @@ type helperConfig struct {
 	Listen        string
 	LeaseName     string
 	Route         string
+	WaitForCommit bool
 	WatchInterval time.Duration
 }
 
@@ -183,6 +184,9 @@ func (c helperConfig) env() []string {
 		"RPGW_HELPER_LISTEN=" + c.Listen,
 		"RPGW_HELPER_LEASE=" + c.LeaseName,
 		"RPGW_HELPER_ROUTE=" + c.Route,
+	}
+	if c.WaitForCommit {
+		out = append(out, "RPGW_HELPER_WAIT=1")
 	}
 	if c.WatchInterval > 0 {
 		out = append(out, "RPGW_HELPER_WATCH="+c.WatchInterval.String())
