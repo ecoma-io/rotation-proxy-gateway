@@ -29,24 +29,39 @@ type Poller struct {
 	interval time.Duration
 	changes  chan struct{}
 	last     [sha256.Size]byte
+	log      zerolog.Logger
 }
 
-// NewPoller seeds the baseline with the content present now, so the initial
-// load is never itself reported as a change and the first write after startup
-// is always seen. The bootstrap load read this same file moments before, so a
-// seed failure is a narrow race: the zero baseline makes the first successful
-// read signal once, and that reload of identical content is harmless.
+// NewPoller builds a poller and seeds its baseline with the content present
+// now, so a configuration already applied by the caller is never reported back
+// to it as a change. Callers that want the first successful read to signal — a
+// caller that has not yet loaded the file — re-baseline with Seed's zero-hash
+// counterpart below.
+//
+// A seed failure is a narrow race rather than an error: the zero baseline makes
+// the first successful read signal once, and re-applying identical content is
+// harmless.
 func NewPoller(path string, interval time.Duration, log zerolog.Logger) *Poller {
-	last, err := hashFile(path)
-	if err != nil {
-		log.Debug().Str("error", sanitize.ErrorString(err)).Msg("config poll baseline seed skipped")
-	}
-	return &Poller{
+	p := &Poller{
 		path:     path,
 		interval: interval,
 		changes:  make(chan struct{}, 1),
-		last:     last,
+		log:      log,
 	}
+	p.Seed()
+	return p
+}
+
+// Seed records the file's current content as the baseline without signalling a
+// change. It is idempotent, so a caller may seed after loading the file without
+// having to know whether construction already did.
+func (p *Poller) Seed() {
+	last, err := hashFile(p.path)
+	if err != nil {
+		p.log.Debug().Str("error", sanitize.ErrorString(err)).Msg("config poll baseline seed skipped")
+		return
+	}
+	p.last = last
 }
 
 // Changes receives one coalesced signal per detected content change.

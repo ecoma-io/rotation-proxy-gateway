@@ -14,17 +14,17 @@ import (
 // resolve to the default set or to no route at all, never back to the whole
 // pool.
 type routingFileConfig struct {
-	Rules         []routingRuleFileConfig `mapstructure:"rules"`
-	DefaultRoutes []string                `mapstructure:"default-routes"`
+	Rules         []routingRuleFileConfig `mapstructure:"rules" json:"rules"`
+	DefaultRoutes []string                `mapstructure:"default-routes" json:"default-routes"`
 }
 
 type routingRuleFileConfig struct {
-	Match  routingMatchFileConfig `mapstructure:"match"`
-	Routes []string               `mapstructure:"routes"`
+	Match  routingMatchFileConfig `mapstructure:"match" json:"match"`
+	Routes []string               `mapstructure:"routes" json:"routes"`
 }
 
 type routingMatchFileConfig struct {
-	Domains []string `mapstructure:"domains"`
+	Domains []string `mapstructure:"domains" json:"domains"`
 }
 
 // maxRouteIDLength bounds the operator-facing route id. It is generous — ids

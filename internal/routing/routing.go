@@ -16,6 +16,7 @@ package routing
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"rotation-proxy-gateway/internal/socksdial"
@@ -54,6 +55,64 @@ type compiledRule struct {
 	exact  map[string]struct{}
 	wilds  []string
 	routes *Set
+}
+
+// Configure renders the compiled policy back into the specification it was
+// built from. It exists for one caller: writing a durable configuration
+// document, where the value that gets stored must be the policy as configured
+// rather than its compiled form.
+//
+// The distinction matters in two directions. An exact pattern and its
+// wildcard form round-trip through their original spelling, because the
+// compiler records a wildcard as a dotted suffix and un-compiling ".example.com"
+// could only guess between "*.example.com" and a literal ".example.com" — so
+// the wildcard marker is restored and the trailing-DNS-dot normalization is
+// not. Candidate sets round-trip as sorted lists, since the compiled form
+// deliberately drops duplicate and order information that a document has no
+// need to preserve.
+//
+// The result is a specification, not a router: Compile must still run before it
+// can serve, so nothing here bypasses validation.
+func (r *Router) Configure() Spec {
+	if r == nil {
+		return Spec{}
+	}
+	spec := Spec{}
+	if len(r.rules) > 0 {
+		spec.Rules = make([]RuleSpec, 0, len(r.rules))
+		for i := range r.rules {
+			rule := &r.rules[i]
+			rules := make([]RuleSpec, 1)
+			rules[0].Routes = rule.routes.sorted()
+			for host := range rule.exact {
+				rules[0].Domains = append(rules[0].Domains, host)
+			}
+			for _, suffix := range rule.wilds {
+				rules[0].Domains = append(rules[0].Domains, "*"+suffix)
+			}
+			sort.Strings(rules[0].Domains)
+			spec.Rules = append(spec.Rules, rules[0])
+		}
+	}
+	if r.defaults != nil {
+		spec.DefaultRoutes = r.defaults.sorted()
+	}
+	return spec
+}
+
+// sorted renders a candidate set as a stable list. The compiled form holds a
+// set, so iteration order is arbitrary; sorting is what makes a document
+// round-trip byte-identically for the same policy.
+func (s *Set) sorted() []string {
+	if s == nil {
+		return nil
+	}
+	out := make([]string, 0, len(s.ids))
+	for id := range s.ids {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Set is an immutable candidate route set — the outcome of one Match. A nil

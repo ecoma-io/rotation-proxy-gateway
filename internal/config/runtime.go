@@ -192,6 +192,21 @@ type BootstrapConfig struct {
 	// demands from clients. Nil keeps the no-authentication default. Like every
 	// bootstrap value it is restart-only.
 	Account *InboundAccount
+	// ConfigStoreDSN points at the durable, revisioned configuration store. It
+	// is bootstrap-only and restart-only for the same reason the listener
+	// addresses are: the store connection is opened before the process serves,
+	// and nothing about it changes while it runs.
+	//
+	// It is a secret — it commonly carries the database password — so it is
+	// never logged, never formatted into an error, and never reported by
+	// /status. An empty value keeps the file-seeded mode: the process reads its
+	// runtime YAML and serves it, with no durable store and no reconciler.
+	ConfigStoreDSN string
+	// ReconcileInterval overrides the control-plane reconcile period. Zero
+	// takes the package default. It exists as bootstrap rather than runtime
+	// configuration because it describes this instance's connection to the
+	// store, not the traffic policy the store governs.
+	ReconcileInterval time.Duration
 }
 
 // RuntimeConfig is the immutable set of values used by new client operations.
@@ -225,61 +240,61 @@ type fileConfig struct {
 }
 
 type cooldownFileConfig struct {
-	Base string `mapstructure:"base"`
-	Max  string `mapstructure:"max"`
+	Base string `mapstructure:"base" json:"base"`
+	Max  string `mapstructure:"max" json:"max"`
 }
 
 type rotationFileConfig struct {
-	MaxConcurrent   any    `mapstructure:"max-concurrent"`
-	DrainTimeout    string `mapstructure:"drain-timeout"`
-	RotateOnStart   *bool  `mapstructure:"rotate-on-start"`
-	IPCheckURL      string `mapstructure:"ip-check-url"`
-	IPCheckTimeout  string `mapstructure:"ip-check-timeout"`
-	IPCheckInterval string `mapstructure:"ip-check-interval"`
-	RetryBackoffMax string `mapstructure:"retry-backoff-max"`
+	MaxConcurrent   any    `mapstructure:"max-concurrent" json:"max-concurrent"`
+	DrainTimeout    string `mapstructure:"drain-timeout" json:"drain-timeout"`
+	RotateOnStart   *bool  `mapstructure:"rotate-on-start" json:"rotate-on-start"`
+	IPCheckURL      string `mapstructure:"ip-check-url" json:"ip-check-url"`
+	IPCheckTimeout  string `mapstructure:"ip-check-timeout" json:"ip-check-timeout"`
+	IPCheckInterval string `mapstructure:"ip-check-interval" json:"ip-check-interval"`
+	RetryBackoffMax string `mapstructure:"retry-backoff-max" json:"retry-backoff-max"`
 }
 
 // warmPoolFileConfig keeps the counts as `any` so viper's weak typing cannot
 // silently truncate a mistyped bound (2.5 → 2), the same anti-coercion rule
 // as max-retries.
 type warmPoolFileConfig struct {
-	Enabled                 *bool  `mapstructure:"enabled"`
-	MinIdlePerProxy         any    `mapstructure:"min-idle-per-proxy"`
-	MaxIdlePerProxy         any    `mapstructure:"max-idle-per-proxy"`
-	MaxTotalIdle            any    `mapstructure:"max-total-idle"`
-	MaxReplenishConcurrency any    `mapstructure:"max-replenish-concurrency"`
-	MaxReplenishPerRoute    any    `mapstructure:"max-replenish-per-route"`
-	IdleTTL                 string `mapstructure:"idle-ttl"`
+	Enabled                 *bool  `mapstructure:"enabled" json:"enabled"`
+	MinIdlePerProxy         any    `mapstructure:"min-idle-per-proxy" json:"min-idle-per-proxy"`
+	MaxIdlePerProxy         any    `mapstructure:"max-idle-per-proxy" json:"max-idle-per-proxy"`
+	MaxTotalIdle            any    `mapstructure:"max-total-idle" json:"max-total-idle"`
+	MaxReplenishConcurrency any    `mapstructure:"max-replenish-concurrency" json:"max-replenish-concurrency"`
+	MaxReplenishPerRoute    any    `mapstructure:"max-replenish-per-route" json:"max-replenish-per-route"`
+	IdleTTL                 string `mapstructure:"idle-ttl" json:"idle-ttl"`
 }
 
 type proxiesFileConfig struct {
-	Auto   []autoProxyFileConfig   `mapstructure:"auto"`
-	Manual []manualProxyFileConfig `mapstructure:"manual"`
+	Auto   []autoProxyFileConfig   `mapstructure:"auto" json:"auto"`
+	Manual []manualProxyFileConfig `mapstructure:"manual" json:"manual"`
 }
 
 type autoProxyFileConfig struct {
 	// ID is a pointer so an absent `id` key is distinguishable from an
 	// explicit `id: ""`: absent is legal (the route is unnamed), while an
 	// explicitly empty id is a configuration smell and is rejected.
-	ID    *string `mapstructure:"id"`
-	Proxy string  `mapstructure:"proxy"`
-	Kind  string  `mapstructure:"kind"`
+	ID    *string `mapstructure:"id" json:"id"`
+	Proxy string  `mapstructure:"proxy" json:"proxy"`
+	Kind  string  `mapstructure:"kind" json:"kind"`
 }
 
 type manualProxyFileConfig struct {
-	ID             *string       `mapstructure:"id"`
-	Proxy          string        `mapstructure:"proxy"`
-	Kind           string        `mapstructure:"kind"`
-	RotateInterval string        `mapstructure:"rotate-interval"`
-	API            apiFileConfig `mapstructure:"api"`
+	ID             *string       `mapstructure:"id" json:"id"`
+	Proxy          string        `mapstructure:"proxy" json:"proxy"`
+	Kind           string        `mapstructure:"kind" json:"kind"`
+	RotateInterval string        `mapstructure:"rotate-interval" json:"rotate-interval"`
+	API            apiFileConfig `mapstructure:"api" json:"api"`
 }
 
 type apiFileConfig struct {
-	URL     string            `mapstructure:"url"`
-	Method  string            `mapstructure:"method"`
-	Headers map[string]string `mapstructure:"headers"`
-	Body    string            `mapstructure:"body"`
-	Timeout string            `mapstructure:"timeout"`
+	URL     string            `mapstructure:"url" json:"url"`
+	Method  string            `mapstructure:"method" json:"method"`
+	Headers map[string]string `mapstructure:"headers" json:"headers"`
+	Body    string            `mapstructure:"body" json:"body"`
+	Timeout string            `mapstructure:"timeout" json:"timeout"`
 }
 
 // legacyEnvNames pairs each retired unprefixed bootstrap variable with its
@@ -348,6 +363,24 @@ func LoadBootstrap() (*BootstrapConfig, error) {
 			return nil, fmt.Errorf("RPGW_ACCOUNT %w", err)
 		}
 		cfg.Account = account
+	}
+	// The store DSN is read with the plain string rule (empty means unset):
+	// there is no meaningful "empty DSN disables the store but keeps the
+	// defaults" reading, and trimming would silently discard a DSN whose
+	// password legitimately ends in whitespace.
+	envStr("RPGW_CONFIG_STORE_DSN", &cfg.ConfigStoreDSN)
+	// Parsed inline for the same reason as the shutdown grace: a malformed value
+	// must fail startup rather than fall back to a default the operator did not
+	// ask for.
+	if raw, ok := os.LookupEnv("RPGW_RECONCILE_INTERVAL"); ok && raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return nil, fmt.Errorf("RPGW_RECONCILE_INTERVAL %q must be a Go duration", raw)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("RPGW_RECONCILE_INTERVAL must be positive, got %s", d)
+		}
+		cfg.ReconcileInterval = d
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err

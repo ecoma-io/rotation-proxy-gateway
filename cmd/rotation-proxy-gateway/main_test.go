@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"rotation-proxy-gateway/internal/config"
+	"rotation-proxy-gateway/internal/configstore"
+	"rotation-proxy-gateway/internal/control"
 	"rotation-proxy-gateway/internal/logging"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/proxyserver"
@@ -889,3 +891,146 @@ func TestShutdownAllNoHeadStartWithoutABudget(t *testing.T) {
 		}
 	}
 }
+
+// Regression for issue #104: a durable revision committed by another instance
+// must reach the generation this process serves from.
+//
+// The defect was invisible from the outside: openControlPlane built a store for
+// the reconciler and run() built a second one for the listeners, but every
+// process-global effect of a reconciled revision (the log level, the
+// "configuration reloaded" line) still applied — so the logs announced a
+// revision the gateway was not serving. This test pins the wiring, not the
+// reconciler's own correctness: it asserts that the store selectServingStore
+// returns is the same one the reconciler publishes into.
+func TestSelectServingStoreReconcilesIntoTheServingGeneration(t *testing.T) {
+	ctx := context.Background()
+
+	seedJSON := `{"version":1,"log-level":"info","max-retries":2,
+		"cooldown":{"base":"15s","max":"10m"},"dial-timeout":"10s",
+		"proxies":{"auto":[{"id":"egress-a","proxy":"good.example:1080","kind":"v4"}]}}`
+	runtimeCfg := mustRuntime(t, seedJSON)
+
+	// The store openControlPlane hands the reconciler, and the store run() would
+	// serve from — the two the fix must make identical.
+	generations := pool.NewStore(runtimeCfg, pool.NewRoutes(runtimeCfg.AllRoutes(), runtimeCfg.CooldownBase, runtimeCfg.CooldownMax))
+	repo := &stubRepository{}
+	reconciler := control.NewReconciler(repo, generations, zerolog.Nop(), control.Options{})
+
+	// Revision 1: the boot generation, the same revision openControlPlane's Seed
+	// commits first from the local file.
+	revision1, err := reconciler.Seed(ctx, runtimeCfg)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	cp := &controlPlane{store: repo, generations: generations, reconciler: reconciler}
+	serving := selectServingStore(cp, runtimeCfg, revision1)
+
+	// The stamp selectServingStore applies must be on the store the reconciler
+	// publishes into, not a copy of it.
+	if got := serving.Load().ConfigRevision; got != int64(revision1) {
+		t.Fatalf("serving generation stamped revision %d, want %d", got, revision1)
+	}
+
+	// A peer commits revision 2: a second route, a different log level.
+	changedJSON := `{"version":1,"log-level":"debug","max-retries":7,
+		"cooldown":{"base":"15s","max":"10m"},"dial-timeout":"10s",
+		"proxies":{"auto":[
+			{"id":"egress-a","proxy":"good.example:1080","kind":"v4"},
+			{"id":"egress-b","proxy":"other.example:1080","kind":"v6"}
+		]}}`
+	changed := mustRuntime(t, changedJSON)
+	doc, err := configstore.NewDocument(changed)
+	if err != nil {
+		t.Fatalf("encode revision 2: %v", err)
+	}
+	if _, err := repo.Commit(ctx, revision1, doc, configstore.Meta{Author: "peer", Note: "second revision"}); err != nil {
+		t.Fatalf("peer commit: %v", err)
+	}
+
+	// One reconcile tick, exactly as the Run loop performs.
+	if err := reconciler.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	// The serving store — the one selectServingStore returned, the one the
+	// listeners and /status read — must now be serving revision 2. On the
+	// pre-fix wiring this store was a second object the reconciler never
+	// touched, so it still read revision 1 with one route.
+	gen := serving.Load()
+	if gen.ConfigRevision != int64(revision1)+1 {
+		t.Errorf("serving generation revision = %d, want %d — the durable revision never reached the serving store", gen.ConfigRevision, int64(revision1)+1)
+	}
+	if got := len(gen.Config.AllRoutes()); got != 2 {
+		t.Errorf("serving route count = %d, want 2 — revision 2's route set did not materialize", got)
+	}
+	if gen.Config.LogLevel != "debug" {
+		t.Errorf("serving log level = %q, want %q", gen.Config.LogLevel, "debug")
+	}
+
+	// File mode has no durable store and no reconciler: selectServingStore must
+	// build a local store rather than dereferencing a nil control plane, and must
+	// leave its revision unstamped.
+	local := selectServingStore(nil, runtimeCfg, configstore.NoRevision)
+	if local.Load().ConfigRevision != 0 {
+		t.Errorf("file-mode generation revision = %d, want 0 (not from the durable store)", local.Load().ConfigRevision)
+	}
+	if len(local.Load().Config.AllRoutes()) != 1 {
+		t.Errorf("file-mode route count = %d, want 1", len(local.Load().Config.AllRoutes()))
+	}
+}
+
+// mustRuntime decodes a document body into a validated RuntimeConfig, failing
+// the test on any validation error.
+func mustRuntime(t *testing.T, document string) *config.RuntimeConfig {
+	t.Helper()
+	cfg, err := config.DecodeDocument([]byte(document))
+	if err != nil {
+		t.Fatalf("decode document: %v", err)
+	}
+	return cfg
+}
+
+// stubRepository is an in-memory configstore.Repository: enough to exercise the
+// reconciler's read/commit/apply path without a live PostgreSQL, which CI does
+// not provide. It is deliberately minimal — the store's own contract is tested
+// against a real database in internal/configstore — and exists here only to pin
+// the cmd wiring.
+type stubRepository struct {
+	active *configstore.Active
+	next   int64
+}
+
+func (s *stubRepository) Active(context.Context) (configstore.Active, error) {
+	if s.active == nil {
+		return configstore.Active{}, configstore.ErrNoActiveRevision
+	}
+	return *s.active, nil
+}
+
+func (s *stubRepository) Get(context.Context, configstore.Revision) (configstore.Record, error) {
+	return configstore.Record{}, configstore.ErrNoRevision
+}
+
+func (s *stubRepository) Commit(_ context.Context, _ configstore.Revision, doc configstore.Document, meta configstore.Meta) (configstore.Record, error) {
+	s.next++
+	rec := configstore.Record{
+		Revision:   configstore.Revision(s.next),
+		DocVersion: doc.Version,
+		Document:   doc.JSON,
+		Author:     meta.Author,
+		Note:       meta.Note,
+	}
+	s.active = &configstore.Active{Record: rec}
+	return rec, nil
+}
+
+func (s *stubRepository) Activate(context.Context, configstore.Revision, configstore.Revision) error {
+	return nil
+}
+
+func (s *stubRepository) Migrate(context.Context) error { return nil }
+
+func (s *stubRepository) SchemaVersion(context.Context) (int, error) { return 1, nil }
+
+func (s *stubRepository) Close() {}
