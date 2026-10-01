@@ -217,10 +217,11 @@ HTTP/1.1`. An origin-form target on a proxy listener is a request for a
   then the warm pool, then every listen socket closed and all proxy listeners
   plus admin drained concurrently against one shared `RPGW_SHUTDOWN_GRACE`
   budget (default 55s; one deadline for the whole process, not a window per
-  listener), then force-closed established tunnels. `/healthz` stays `200`
-  throughout: it is liveness, and a probe that failed while the process is
-  stopping correctly would invite the orchestrator to kill it mid-drain. Keep
-  the surrounding orchestrator's kill timer above the budget
+  listener), then force-closed established tunnels, and the analytics writer
+  last of all. `/healthz` stays `200` throughout: it is liveness, and a probe
+  that failed while the process is stopping correctly would invite the
+  orchestrator to kill it mid-drain. Keep the surrounding orchestrator's kill
+  timer above the budget
   (`stop_grace_period: 60s` in compose). A readiness signal is necessary but
   not sufficient for a zero-downtime rollout — that needs ≥2 replicas and a
   load balancer that honours it, which is deployment-side; see

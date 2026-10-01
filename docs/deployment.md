@@ -104,6 +104,18 @@ Graceful shutdown runs in a fixed order, and the order is the contract:
 4. **Close every listen socket**, then **drain all of them concurrently**,
    together with the admin listener, against one shared budget
    (`RPGW_SHUTDOWN_GRACE`, default `55s`).
+5. **Stop the analytics writer last**, once every subsystem that produces
+   observations has stopped producing them.
+
+Step 5 is last for a reason that is easy to get backwards. Requests are
+observed when their tunnels close, and the tunnels close _during_ the drain of
+step 4; a rotation procedure that was mid-flight when the engine was cancelled
+records its terminal attempt whenever it reaches one. A writer stopped before
+the drain therefore has no reader left for any of it, and the samples are lost
+without a counter moving. Its own shutdown grace is a bound _inside_ the shared
+budget rather than an addition to it — it gives up on its own deadline instead
+of waiting for the shared one — so a database that has stopped answering costs
+the writer its final flush and nothing else.
 
 Step 4 closes all sockets before draining any of them, which is a change in
 failure profile worth knowing about. Draining one listener at a time used to
