@@ -371,11 +371,17 @@ func (w *Writer) RecordRotationAttempt(a RotationAttempt) bool {
 		w.log.Warn().Msg("analytics: rotation attempt with no event id was refused")
 		return false
 	}
-	if !w.offerRotation(a) {
-		w.rotationsDropped.Add(1)
-		return false
+	queued, dropped := w.offerRotation(a)
+	if dropped != 0 {
+		w.rotationsDropped.Add(dropped)
+		// Rotation history is sparse, operator-facing evidence of a provider
+		// transition — unlike high-volume request samples, every loss is worth
+		// making visible immediately. The record itself is deliberately omitted:
+		// route identity and provider detail must never move from durable data
+		// into a log line just because the queue overflowed.
+		w.log.Warn().Uint64("dropped", dropped).Msg("analytics: rotation history queue overflow; observation discarded")
 	}
-	return true
+	return queued
 }
 
 // RecordIPObservation enqueues one egress-IP observation, dropping the oldest
@@ -387,21 +393,17 @@ func (w *Writer) RecordIPObservation(o IPObservation) bool {
 		// is a guard rather than a path.
 		return false
 	}
-	if !offer(w.ips, o) {
-		w.ipsDropped.Add(1)
-		return false
-	}
-	return true
+	queued, dropped := offer(w.ips, o)
+	w.ipsDropped.Add(dropped)
+	return queued
 }
 
 // ObserveRequest enqueues a rolled-up request sample, dropping the oldest on
 // overflow. It never blocks, and it is the only method the serving path calls.
 func (w *Writer) ObserveRequest(s RequestSample) bool {
-	if !offer(w.requests, s) {
-		w.requestsDropped.Add(1)
-		return false
-	}
-	return true
+	queued, dropped := offer(w.requests, s)
+	w.requestsDropped.Add(dropped)
+	return queued
 }
 
 // ObserveFailure enqueues a bucketed failure sample, dropping the oldest on
@@ -410,61 +412,61 @@ func (w *Writer) ObserveFailure(s FailureSample) bool {
 	if s.Failures <= 0 {
 		return false
 	}
-	if !offer(w.failureQ, s) {
-		w.failuresDropped.Add(1)
-		return false
-	}
-	return true
+	queued, dropped := offer(w.failureQ, s)
+	w.failuresDropped.Add(dropped)
+	return queued
 }
 
 // offerRotation enqueues a rotation attempt, evicting the oldest when full.
-// See offer for what the boolean means.
-func (w *Writer) offerRotation(a RotationAttempt) bool {
+// See offer for the distinction between whether the new observation was queued
+// and how many observations the operation lost.
+func (w *Writer) offerRotation(a RotationAttempt) (queued bool, dropped uint64) {
 	return offer(w.rotations, a)
 }
 
-// offer enqueues onto a channel, evicting the oldest when full.
+// offer enqueues onto a channel, evicting the oldest when full. It returns two
+// independent facts: whether value was queued, and how many observations the
+// operation lost.
 //
-// The boolean is "the value was queued", NOT "a value was lost". Evicting the
-// oldest and enqueueing the newest is the bounding behavior a full queue is
-// supposed to have — the newest observation is the one worth keeping — so that
-// path returns true. The alternative reading would make every overflow report a
-// drop while the queue in fact still holds the newest sample, and a caller that
-// increments its drop counter on false would then report losses that did not
-// happen while the evicted history stays invisible.
+// A full queue that evicts the oldest and queues value succeeds for the caller —
+// the newest observation, the one an operator debugging the current event needs,
+// survives — but it has still lost the evicted observation. Its result is
+// (true, 1). Conflating those facts is how the original code made /status report
+// zero drops while durable history was being silently discarded.
 //
-// It returns false only when the value could not be queued at all: the flusher
-// drained the queue between the eviction and this send, so the value was
-// dropped rather than blocking the caller.
-func offer[T any](ch chan T, value T) bool {
+// The rare producer race after an eviction can lose both observations: the
+// oldest was removed, then another producer filled the freed slot before this
+// send could queue value. That result is (false, 2). Every return path is
+// non-blocking; database slowness must cost bounded history, never request
+// latency.
+func offer[T any](ch chan T, value T) (queued bool, dropped uint64) {
 	// Fast path: room in the queue.
 	select {
 	case ch <- value:
-		return true
+		return true, 0
 	default:
 	}
-	// Full: evict the oldest to make room for the newest. The evicted sample is
-	// lost and the caller cannot see it — that cost is the price of never
-	// blocking, and the writer's drop counters are the honest accounting for a
-	// writer that cannot keep up with its traffic, not a per-call signal.
-	// A non-blocking receive guard means an empty queue (raced with the flusher)
-	// simply falls through to a second send attempt below.
+	// Full: evict the oldest to make room for the newest. The non-blocking
+	// receive guard means an empty queue (raced with the flusher) simply falls
+	// through to a second send attempt below.
 	select {
 	case <-ch:
 		select {
 		case ch <- value:
-			return true
+			return true, 1
 		default:
 			// The flusher drained the queue between the eviction and this send;
-			// the value is dropped rather than blocking.
-			return false
+			// both the evicted oldest observation and value are lost.
+			return false, 2
 		}
 	default:
 		select {
 		case ch <- value:
-			return true
+			return true, 0
 		default:
-			return false
+			// No observation was removed by this call, but value could not be
+			// queued — count the refused new observation.
+			return false, 1
 		}
 	}
 }

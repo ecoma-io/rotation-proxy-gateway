@@ -74,27 +74,29 @@ func TestOfferRotationEvictsOldestAndCountsDrop(t *testing.T) {
 	const size = 2
 	w := NewWriter(nil, zerolog.Nop(), WriterOptions{BufferSize: size, FlushInterval: time.Hour})
 
-	if !w.offerRotation(RotationAttempt{EventID: EventID("a")}) {
-		t.Fatal("first offer should succeed with room in the buffer")
+	if queued, dropped := w.offerRotation(RotationAttempt{EventID: EventID("a")}); !queued || dropped != 0 {
+		t.Fatalf("first offer = (queued=%t, dropped=%d), want (true, 0)", queued, dropped)
 	}
-	if !w.offerRotation(RotationAttempt{EventID: EventID("b")}) {
-		t.Fatal("second offer should succeed with room in the buffer")
+	if queued, dropped := w.offerRotation(RotationAttempt{EventID: EventID("b")}); !queued || dropped != 0 {
+		t.Fatalf("second offer = (queued=%t, dropped=%d), want (true, 0)", queued, dropped)
 	}
-	// The third offer evicts a and enqueues c. That is the queue's bounding
-	// behavior working as designed, so offerRotation reports success — the value
-	// it was handed did get queued.
-	if !w.offerRotation(RotationAttempt{EventID: EventID("c")}) {
-		t.Fatal("an offer that evicts the oldest must still report that it queued the value")
+	// The third offer evicts a and queues c. Those are independent facts: the
+	// newest observation survives, but /status must still honestly count a.
+	if queued, dropped := w.offerRotation(RotationAttempt{EventID: EventID("c")}); !queued || dropped != 1 {
+		t.Fatalf("overflow offer = (queued=%t, dropped=%d), want (true, 1)", queued, dropped)
 	}
-	if got := w.rotationsDropped.Load(); got != 0 {
-		t.Fatalf("rotationsDropped = %d, want 0 — a bounded eviction is not a drop", got)
+	if got := w.RecordRotationAttempt(RotationAttempt{EventID: EventID("d")}); !got {
+		t.Fatal("a public offer that evicts the oldest must still queue the newest value")
 	}
-	// The oldest was evicted, so the queue holds b then c.
-	if first := <-w.rotations; first.EventID != EventID("b") {
-		t.Fatalf("first remaining = %q, want %q", first.EventID, EventID("b"))
+	if got := w.rotationsDropped.Load(); got != 1 {
+		t.Fatalf("rotationsDropped = %d, want 1 after the public overflow", got)
 	}
-	if second := <-w.rotations; second.EventID != EventID("c") {
-		t.Fatalf("second remaining = %q, want %q", second.EventID, EventID("c"))
+	// The public offer evicted b, so the queue holds c then d.
+	if first := <-w.rotations; first.EventID != EventID("c") {
+		t.Fatalf("first remaining = %q, want %q", first.EventID, EventID("c"))
+	}
+	if second := <-w.rotations; second.EventID != EventID("d") {
+		t.Fatalf("second remaining = %q, want %q", second.EventID, EventID("d"))
 	}
 }
 
@@ -293,8 +295,11 @@ func TestDroppedCountersAreIndependent(t *testing.T) {
 	w.rotations <- RotationAttempt{EventID: EventID("kept")}
 	w.ips <- IPObservation{IP: "1.2.3.4"}
 
-	if !w.offerRotation(RotationAttempt{EventID: EventID("newest")}) {
+	if !w.RecordRotationAttempt(RotationAttempt{EventID: EventID("newest")}) {
 		t.Fatal("the rotation offer into a full queue must still queue the newest value")
+	}
+	if got := w.Count(); got.DroppedRotationAttempts != 1 {
+		t.Fatalf("DroppedRotationAttempts = %d, want 1 for the evicted oldest attempt", got.DroppedRotationAttempts)
 	}
 	if got := w.Count(); got.DroppedIPObservations != 0 || got.DroppedRequestSamples != 0 || got.DroppedFailureSamples != 0 {
 		t.Fatalf("a rotation overflow must not be attributed to another queue: %+v", got)
