@@ -1036,6 +1036,68 @@ func TestRotationsReportTheResolvedConcurrencyCap(t *testing.T) {
 	}
 }
 
+// /rotations reports manual routes, and an auto route of the same egress kind
+// must not be swept in with them.
+//
+// Config validation rejects duplicate canonical route URLs, not duplicate kinds,
+// so an auto v6 route and a manual v6 route coexist. A report that joined the two
+// sides by kind would list the auto route as though it were a rotation
+// candidate — and hand it the manual route's id, because the kind map holds one
+// spec per kind. Origin is the property that actually distinguishes them.
+func TestRotationsReportsOnlyManualRoutesWhenKindsCollide(t *testing.T) {
+	doc := []byte(`{
+	  "version": 1,
+	  "log-level": "info",
+	  "max-retries": 2,
+	  "cooldown": {"base": "5s", "max": "5m"},
+	  "dial-timeout": "10s",
+	  "proxies": {
+	    "auto": [{"id": "auto-v6", "proxy": "auto.example.com:1080", "kind": "v6"}],
+	    "manual": [{
+	      "id": "manual-v6",
+	      "proxy": "manual.example.com:1080",
+	      "kind": "v6",
+	      "rotate-interval": "30m",
+	      "api": {"url": "https://api.example.com/rotate", "method": "POST", "timeout": "15s"}
+	    }]
+	  }
+	}`)
+	cfg, err := configstore.Decode(configstore.Document{Version: config.DocumentVersion, JSON: doc})
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	store := newFakeStore()
+	store.seedActive(configstore.Document{Version: config.DocumentVersion, JSON: doc}, 7)
+	mux := New(Options{
+		Auth:        tokenAuth{token: testToken},
+		Generations: pool.NewStore(cfg, pool.NewRoutes(cfg.AllRoutes(), cfg.CooldownBase, cfg.CooldownMax)),
+		ConfigStore: store,
+		Log:         zerolog.Nop(),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, PathRotations, nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s = %d, want 200", PathRotations, rec.Code)
+	}
+	var raw struct {
+		Routes []struct {
+			Route string `json:"route"`
+			ID    string `json:"id"`
+		} `json:"routes"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.Routes) != 1 || raw.Routes[0].Route != "manual.example.com:1080" {
+		t.Fatalf("rotations routes = %+v, want only the manual route", raw.Routes)
+	}
+	if raw.Routes[0].ID != "manual-v6" {
+		t.Errorf("rotation route id = %q, want the manual route's id", raw.Routes[0].ID)
+	}
+}
+
 func hasSetting(settings []map[string]any, name, value string) bool {
 	for _, s := range settings {
 		if s["name"] == name && s["value"] == value {

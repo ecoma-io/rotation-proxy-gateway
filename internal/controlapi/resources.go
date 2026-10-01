@@ -133,17 +133,21 @@ func (a *api) handleRotations(w http.ResponseWriter, _ *http.Request) {
 		State *pool.RotationStatus `json:"state,omitempty"`
 	}
 
-	// Manual routes keyed by the identity the pool reports them under, so each
-	// route joins its rotation state without the two sides having to agree on an
-	// ordering this code would then have to keep in step.
+	// Manual routes keyed by full route identity, so each joins its own rotation
+	// state. Kind alone is not an identity here: validation rejects a duplicate
+	// canonical route URL, not a duplicate kind, so an auto v6 route and a manual
+	// v6 route coexist happily. Keyed by kind, the auto route would be reported as
+	// a rotation candidate carrying the manual route's id.
 	manual := make(map[string]config.ManualRouteSpec, len(cfg.ManualRoutes))
 	for _, route := range cfg.ManualRoutes {
-		manual[kindKey(route.Kind)] = route
+		manual[routeIdentity(route.RouteSpec)] = route
 	}
 
 	routes := []routeRotation{}
 	for _, status := range snapshotRoutes(gen) {
-		route, ok := manual[kindKey(status.Kind)]
+		// status.Proxy is host:port, and spec.URL.Host is too, so the two halves of
+		// this key cannot disagree on spelling.
+		route, ok := manual[identityKey(status.Proxy, status.Kind, config.RouteOriginManual)]
 		if !ok {
 			continue
 		}
@@ -182,12 +186,22 @@ func (a *api) handleRotations(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// kindKey is the join key between a configured route and its pool status entry:
-// the egress kind. One key per kind is sufficient because a pool generation is
-// built from one configuration, which never holds two routes of the same kind
-// and origin.
-func kindKey(kind config.EgressKind) string {
-	return string(kind)
+// identityKey joins a configured manual route to its pool status entry by the
+// three facts that make a route itself: its endpoint, egress kind, and origin.
+//
+// Origin is the load-bearing part. The pool status carries it, so an auto route
+// that happens to share a manual route's kind and endpoint can never be mistaken
+// for a rotation candidate — which is exactly what a kind-only join did, and what
+// a kind+endpoint join still would. The endpoint is host:port on both sides, so
+// the key holds no credential.
+func identityKey(hostPort string, kind config.EgressKind, origin config.RouteOrigin) string {
+	return hostPort + "|" + string(kind) + "|" + string(origin)
+}
+
+// routeIdentity is identityKey for a configured spec, deriving the endpoint from
+// the route URL the same way the pool snapshot does.
+func routeIdentity(spec config.RouteSpec) string {
+	return identityKey(spec.URL.Host, spec.Kind, spec.Origin)
 }
 
 // rotationWithCanonicalIP re-canonicalizes a route's reported egress IP through
