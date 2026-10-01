@@ -396,12 +396,6 @@ func (a *api) failPrecondition(w http.ResponseWriter, status int, message string
 	})
 }
 
-// maxRequestEnvelopeBytes is the request-side bound restated under the name a
-// reader of this file needs. maxRequestBytes is the store's document ceiling
-// plus room for the envelope; saying it here makes it plain that a body over the
-// limit is refused before parsing rather than halfway through it.
-const maxRequestEnvelopeBytes = maxRequestBytes
-
 // compile-time assertions that the duration and timestamp renderings in these
 // views are the ones the rest of the process already uses. The pool formats
 // rotation timestamps as RFC 3339 in UTC, and a second format in the control API

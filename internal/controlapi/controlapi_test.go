@@ -431,15 +431,13 @@ func TestCorrelationIDIsEchoedAndControlHeadersConsumed(t *testing.T) {
 
 	// A control header is consumed, never echoed, whatever it says. Echoing one
 	// back would tell a caller its value was honored by an endpoint that has no
-	// such notion. The name is canonicalized because http.Header.Get matches a
-	// canonical key, and a lowercase spelling would otherwise let a real echo
-	// hide behind a case difference.
+	// such notion.
 	//
 	// The request id is excluded, and that is not an oversight: it is the one
 	// x-ecoma-* header this API deliberately echoes, under the rules above. Its
 	// grammar admits no "v6" — the echo grammar is [A-Za-z0-9-_.:] — so an
 	// unaccepted value is dropped rather than reflected.
-	for _, name := range []string{"x-ecoma-proxy-family", "x-ecoma-unknown-control", "x-ecoma-forwarded"} {
+	for _, name := range []string{"X-Ecoma-Proxy-Family", "X-Ecoma-Unknown-Control", "X-Ecoma-Forwarded"} {
 		req, err := http.NewRequest(http.MethodGet, h.srv.URL+PathProxies, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -450,7 +448,7 @@ func TestCorrelationIDIsEchoedAndControlHeadersConsumed(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("%s: status = %d, want 200", name, resp.StatusCode)
 		}
-		if got := resp.Header.Get(http.CanonicalHeaderKey(name)); got != "" {
+		if got := resp.Header.Get(name); got != "" {
 			t.Errorf("%s: the control header was echoed back as %q", name, got)
 		}
 	}
