@@ -734,9 +734,13 @@ func (w *Writer) writeFailureEvents(ctx context.Context, samples []FailureSample
 }
 
 // execBatch runs a pgx batch, reporting the first error but having queued (and
-// thus attempted) every statement. A partial success is fine: the event tables
-// dedupe on replay and the aggregate tables add deltas that this process will
-// not re-present, so the next flush continues from wherever the batch left off.
+// thus attempted) every statement. pgx v5 sends a batch inside an implicit
+// transaction, so one failing statement rolls the whole batch back: a batch that
+// reports an error wrote nothing at all. The loop still drains every result
+// rather than returning at the first, because an undrained result would strand
+// the batch's connection. Callers treat any error as "these samples were not
+// written"; none of them is re-queued, so the loss is bounded by one flush
+// window and counted by the caller rather than retried silently.
 func (w *Writer) execBatch(ctx context.Context, batch *pgx.Batch, queued int) error {
 	results := w.pool.SendBatch(ctx, batch)
 	var firstErr error
