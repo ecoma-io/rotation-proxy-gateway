@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/ecoma-io/rotation-proxy-gateway/compare/v0.6.0...v0.7.0) (2026-10-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* migrate inbound gateway to HTTP forward proxy ([#93](https://github.com/ecoma-io/rotation-proxy-gateway/issues/93))
+
+### Features
+
+* migrate inbound gateway to HTTP forward proxy ([#93](https://github.com/ecoma-io/rotation-proxy-gateway/issues/93)) ([d0d8b45](https://github.com/ecoma-io/rotation-proxy-gateway/commit/d0d8b45a61583a15cf304df2d6f0efd63d194648))
+
 ## [0.6.0](https://github.com/ecoma-io/rotation-proxy-gateway/compare/v0.5.0...v0.6.0) (2026-09-30)
 
 
