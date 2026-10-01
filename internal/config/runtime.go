@@ -207,6 +207,8 @@ type BootstrapConfig struct {
 	// configuration because it describes this instance's connection to the
 	// store, not the traffic policy the store governs.
 	ReconcileInterval time.Duration
+	// AdminToken is the bearer token required to access control/admin endpoints.
+	AdminToken string
 }
 
 // RuntimeConfig is the immutable set of values used by new client operations.
@@ -369,6 +371,7 @@ func LoadBootstrap() (*BootstrapConfig, error) {
 	// defaults" reading, and trimming would silently discard a DSN whose
 	// password legitimately ends in whitespace.
 	envStr("RPGW_CONFIG_STORE_DSN", &cfg.ConfigStoreDSN)
+	envStr("RPGW_ADMIN_TOKEN", &cfg.AdminToken)
 	// Parsed inline for the same reason as the shutdown grace: a malformed value
 	// must fail startup rather than fall back to a default the operator did not
 	// ask for.

@@ -10,7 +10,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -384,8 +383,67 @@ func (s *Server) CloseConns() int {
 // tests and for any single-listener embedding. A process serves one AdminMux
 // for all of its views; the process owns the lifecycle that mux reports.
 func (s *Server) AdminMux() *http.ServeMux {
-	return AdminMux(s.version, s.startTime, s.store, map[string]*Server{s.listener: s}, nil, nil, nil, NewLifecycle())
+	return AdminMux(AdminOptions{
+		Version:   s.version,
+		Started:   s.startTime,
+		Store:     s.store,
+		Listeners: map[string]*Server{s.listener: s},
+		Lifecycle: NewLifecycle(),
+	})
 }
+
+// AdminOptions is everything the admin mux serves from.
+//
+// It is a struct rather than a positional argument list because the list had
+// grown to eight parameters and the control API needed two more, and because
+// the mux is mounted from tests in six files as well as from main: a struct is
+// what keeps those call sites readable and lets a new field default to
+// "absent" instead of shifting a bare nil.
+type AdminOptions struct {
+	// Version and Started are this instance's identity and age.
+	Version string
+	Started time.Time
+	// Store is the serving generation store. Required.
+	Store *pool.Store
+	// Listeners is the named listener view set the status totals aggregate.
+	Listeners map[string]*Server
+	// Rotations and IPRevisits, when non-nil, report the rotation engine's
+	// process-lifetime aggregates: completed rotations, and the subset of them
+	// that committed an address the same route had already verified. Both are
+	// omitted entirely when no engine backs the process, so the key's absence
+	// keeps meaning what it meant.
+	Rotations  func() uint64
+	IPRevisits func() uint64
+	// Warm, when non-nil, reports the warm-pool view (bounds, gauges,
+	// lifecycle counters); it is omitted entirely when no warm pool backs the
+	// process.
+	Warm func() warmpool.Status
+	// Lifecycle is what /readyz reports; a nil Lifecycle is answered as ready,
+	// which is correct for a single-listener embedding that owns no drain
+	// sequence.
+	Lifecycle *Lifecycle
+	// Cluster is the cluster/durable scope of /status. Its zero value reports
+	// "no durable store configured", which is a supported deployment.
+	Cluster ClusterStatus
+	// Control, when non-nil, is the authenticated control API mounted behind
+	// this mux's unauthenticated endpoints.
+	//
+	// It is mounted here rather than on its own listener so one admin port
+	// carries the whole operator surface, and so the fail-closed check has a
+	// single place to live: the caller must have built Control through
+	// NewControlAuthenticator with a non-empty token, and a control handler
+	// built without one answers 401 to everything (see ControlAuthenticator).
+	Control http.Handler
+}
+
+// ControlAPIMountPrefix is the path prefix the control API is served under.
+//
+// The prefix is not decoration. The admin listener's other three paths are
+// unauthenticated by necessity — an orchestrator's probes cannot carry a bearer
+// token — so everything that *can* be authenticated lives under one prefix that
+// a network policy can be written against, and a request to an unknown path
+// under it answers 404 without revealing which resources exist.
+const ControlAPIMountPrefix = "/control"
 
 // AdminMux serves aggregate health/status for all proxy listener views sharing
 // a runtime generation store. Existing status fields remain global totals;
@@ -393,14 +451,14 @@ func (s *Server) AdminMux() *http.ServeMux {
 // commands (protocol rejects never advance it) and failovers counts in-band
 // route fallbacks, distinct from rotations. The pool snapshot comes from the
 // current generation so /status changes atomically with serving behavior.
-// rotations and ipRevisits, when non-nil, report the rotation engine's
-// process-lifetime aggregates: completed rotations, and the subset of them
-// that committed an address the same route had already verified. warm, when
-// non-nil, reports the warm-pool view (bounds, gauges, lifecycle counters); it
-// is omitted entirely when no warm pool backs the process. lc is the process
-// lifecycle /readyz reports; a nil lc is answered as ready, which is correct
-// for a single-listener embedding that owns no drain sequence.
-func AdminMux(version string, started time.Time, store *pool.Store, listeners map[string]*Server, rotations func() uint64, ipRevisits func() uint64, warm func() warmpool.Status, lc *Lifecycle) *http.ServeMux {
+//
+// /healthz, /readyz, and /status stay unauthenticated: an orchestrator's liveness
+// and readiness probes cannot carry a bearer token, and /status is safe
+// unauthenticated because it reports no credentials and no durable-store
+// address — every figure in it is this instance's own counters or the revision
+// it already serves. The authenticated control API, when configured, is mounted
+// alongside them on the same listener under /control.
+func AdminMux(opts AdminOptions) *http.ServeMux {
 	mux := http.NewServeMux()
 	// Liveness, unconditionally. It never reports the drain: see lifecycle.go
 	// for why a liveness probe that fails while a process is stopping
@@ -411,47 +469,18 @@ func AdminMux(version string, started time.Time, store *pool.Store, listeners ma
 	})
 	// Readiness, the mirror image: 503 from the instant the drain starts, while
 	// every listener is still accepting.
-	ready := lc
+	ready := opts.Lifecycle
 	if ready == nil {
 		ready = &Lifecycle{}
 		ready.MarkReady()
 	}
 	mux.HandleFunc(ReadyPath, ready.serveReadyz)
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		perListener := make(map[string]ListenerStatus, len(listeners))
-		var requests, failovers uint64
-		for name, listener := range listeners {
-			status := listener.ListenerStatus()
-			perListener[name] = status
-			requests += status.Requests
-			failovers += status.Failovers
-		}
-		gen := store.Load()
-		status := map[string]any{
-			"version":   version,
-			"uptime":    time.Since(started).Truncate(time.Second).String(),
-			"requests":  requests,
-			"failovers": failovers,
-			"listeners": perListener,
-			"pool":      gen.Pool.Snapshot(),
-			// The revision is read from the generation /status already loads,
-			// so reporting it costs no query against the control database and
-			// cannot drift from what is serving. Zero means this instance is
-			// running on its local seed configuration rather than a durable
-			// revision.
-			"configRevision": gen.ConfigRevision,
-		}
-		if rotations != nil {
-			status["rotations"] = rotations()
-		}
-		if ipRevisits != nil {
-			status["ipRevisits"] = ipRevisits()
-		}
-		if warm != nil {
-			status["warmPool"] = warm()
-		}
-		_ = json.NewEncoder(w).Encode(status)
+		writeStatus(w, opts.Version, opts.Started, opts.Store, opts.Listeners,
+			opts.Rotations, opts.IPRevisits, opts.Warm, opts.Cluster)
 	})
+	if opts.Control != nil {
+		mux.Handle(ControlAPIMountPrefix+"/", http.StripPrefix(ControlAPIMountPrefix, opts.Control))
+	}
 	return mux
 }

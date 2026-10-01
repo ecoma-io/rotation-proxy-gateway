@@ -22,6 +22,7 @@ import (
 	"rotation-proxy-gateway/internal/config"
 	"rotation-proxy-gateway/internal/configstore"
 	"rotation-proxy-gateway/internal/control"
+	"rotation-proxy-gateway/internal/controlapi"
 	"rotation-proxy-gateway/internal/logging"
 	"rotation-proxy-gateway/internal/pool"
 	"rotation-proxy-gateway/internal/proxyserver"
@@ -268,8 +269,61 @@ func openControlPlane(ctx context.Context, bootstrap *config.BootstrapConfig) (*
 	return &controlPlane{store: repo, generations: generations, reconciler: reconciler}, materialized.Config, revision, nil
 }
 
+// mountControlAPI decides whether this process serves the authenticated control
+// API, and refuses to start when the answer should be yes and the credential is
+// not there.
+//
+// Three outcomes, and the middle one is the point:
+//
+//   - No durable store configured → not mounted. /config would have nothing to
+//     commit through, and the remaining resources only answer from the serving
+//     generation, which /status already reports. A control surface in a
+//     file-seeded deployment would be a smaller, staler copy of /status behind a
+//     token, so it is absent rather than present-and-worse.
+//   - Durable store, no RPGW_ADMIN_TOKEN → refuse to start. The control API can
+//     commit a cluster-wide configuration revision; serving it with no
+//     credential would put the only write path in the system behind nothing.
+//     Failing closed here is the whole reason this function returns an error
+//     rather than a nil handler: a nil handler would mount nothing and start
+//     happily, which reads as "no control API configured" when in fact the
+//     operator asked for one and missed a variable.
+//   - Durable store and a token → mounted, with the token reduced to a digest
+//     that the authenticator keeps and the process then discards.
+//
+// The token is never logged, never echoed, and never kept in the
+// authenticator; see proxyserver.NewControlAuthenticator.
+func mountControlAPI(bootstrap *config.BootstrapConfig, cp *controlPlane, generations *pool.Store, engine *rotation.Engine, log zerolog.Logger) (http.Handler, error) {
+	if cp == nil {
+		return nil, nil
+	}
+	if bootstrap.AdminToken == "" {
+		// The message names the variable and nothing else. It deliberately does
+		// not print the DSN either: an operator who reached this error has a
+		// store configured and needs to know which credential is missing, not
+		// where the database is.
+		return nil, errors.New("RPGW_CONFIG_STORE_DSN is set, so the control API is required, but RPGW_ADMIN_TOKEN is empty: set it to a bearer token, or unset RPGW_CONFIG_STORE_DSN to run without a control API")
+	}
+	auth := proxyserver.NewControlAuthenticator(bootstrap.AdminToken)
+	// Belt and braces: the constructor returns nil for an empty token, and a nil
+	// authenticator refuses every request. Reaching this branch would mean the
+	// two facts above disagreed, and mounting a control API that answers 401 to
+	// everything would be a silent outage for the operator rather than a startup
+	// failure they can act on.
+	if auth == nil {
+		return nil, errors.New("RPGW_ADMIN_TOKEN did not yield a usable control credential; refusing to start")
+	}
+	log.Info().Str("mount", proxyserver.ControlAPIMountPrefix).Msg("control API mounted")
+	return controlapi.New(controlapi.Options{
+		Auth:        auth,
+		Generations: generations,
+		ConfigStore: cp.store,
+		Rotations:   engine.Rotations,
+		IPRevisits:  engine.IPRevisits,
+		Log:         log,
+	}), nil
+}
+
 func run() error {
-	// or healthy. The bootstrap env and config may be invalid, or a listener
 	// bind may fail — in every such startup failure the notify channel stays
 	// armed until the deferred signal.Stop, and a SIGTERM arriving before the
 	// select loop below simply queues on the buffered channel: without this
@@ -368,8 +422,35 @@ func run() error {
 	// and written only by the shutdown path. It is created before the admin mux
 	// so the handler closure and shutdownAll share one machine.
 	lc := proxyserver.NewLifecycle()
+	// The control API is mounted here and nowhere else, so the fail-closed
+	// decision has one site. See mountControlAPI for why the three outcomes are
+	// what they are.
+	controlHandler, err := mountControlAPI(bootstrap, controlPlane, poolStore, engine, log)
+	if err != nil {
+		return err
+	}
 	adminSrv := &http.Server{
-		Handler:           proxyserver.AdminMux(version, started, poolStore, listenerViews, engine.Rotations, engine.IPRevisits, warm.Snapshot, lc),
+		Handler: proxyserver.AdminMux(proxyserver.AdminOptions{
+			Version:    version,
+			Started:    started,
+			Store:      poolStore,
+			Listeners:  listenerViews,
+			Rotations:  engine.Rotations,
+			IPRevisits: engine.IPRevisits,
+			Warm:       warm.Snapshot,
+			Lifecycle:  lc,
+			// The cluster scope names what /status can say without a query. It
+			// reports the revision this instance serves from its own generation
+			// and the store's presence, and stops there: /status is
+			// unauthenticated, so every figure in it has to be free.
+			Cluster: proxyserver.ClusterStatus{
+				ConfigRevision:  poolStore.Load().ConfigRevision,
+				StoreConfigured: controlPlane != nil,
+				ActiveRevision:  poolStore.Load().ConfigRevision,
+				Synced:          true,
+			},
+			Control: controlHandler,
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
