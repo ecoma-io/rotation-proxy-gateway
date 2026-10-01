@@ -3,7 +3,6 @@ package rotation
 import (
 	"context"
 	"net/http"
-	"sync"
 	"testing"
 	"time"
 
@@ -628,19 +627,18 @@ func TestSeamlessHoldIsBoundedByTheChangeoverBudget(t *testing.T) {
 func TestSeamlessHoldsTheRouteOutOfPicksAcrossTheChangeover(t *testing.T) {
 	ips := newIPServer(t, "203.0.113.7")
 	api := newAPIServer(t)
-	// The rotate call parks here with the changeover open. Nothing after it can
-	// release the hold until this opens, so observing the hold observes the window
-	// rather than racing the commit.
-	gate := make(chan struct{})
-	var gateOnce sync.Once
-	// Opened by the cleanup too, so an early Fatal cannot leave the parked handler
-	// holding httptest.Server.Close open.
-	t.Cleanup(func() { gateOnce.Do(func() { close(gate) }) })
+	// The rotate call returns at once and reports the swap, so the changeover
+	// opens on its own rather than because a client deadline let a parked call
+	// give up: with the call still parked, HoldTraffic has not run and the hold
+	// this test observes cannot exist.
 	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		ips.set("198.51.100.9")
-		<-gate
 		w.WriteHeader(http.StatusOK)
 	})
+	// Verification runs inside the changeover and can only reach a commit once
+	// the parked probe is released, so parking it keeps the window open for the
+	// assertions below instead of racing the commit.
+	verifying := ips.parkArm(1)
 	spec := manualRoute(t, "m1.test", time.Hour, apiSpec(api))
 	cfg := &config.RuntimeConfig{Rotation: modeSettings(config.RotationModeSeamless),
 		ManualRoutes: []config.ManualRouteSpec{spec}}
@@ -662,11 +660,18 @@ func TestSeamlessHoldsTheRouteOutOfPicksAcrossTheChangeover(t *testing.T) {
 		s.e.runProcedure(context.Background(), s.gen, spec, p, routeID(spec.RouteSpec))
 	}()
 
-	// HoldTraffic runs the moment the rotate call returns, and nothing after it can
-	// release the hold until the gate opens — so observing the hold here observes
-	// the window, not a race with the commit.
-	waitFor(t, "the changeover hold to open", 5*time.Second, func() bool { return p.RotationHeld() })
-	gateOnce.Do(func() { close(gate) })
+	// Verification cannot begin before HoldTraffic has run, so arriving there
+	// means the changeover is open — and the probe stays parked until the
+	// assertions below are done, so what is observed here is the window rather
+	// than a race with the commit.
+	select {
+	case <-verifying:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the procedure to enter verification")
+	}
+	if !p.RotationHeld() {
+		t.Fatal("the changeover did not open a hold by the time verification began")
+	}
 
 	// Held, on both of PickFor's paths: the ordinary candidate scan finds nothing,
 	// and the all-cooling fallback cannot reach the route either. There is no
@@ -695,6 +700,9 @@ func TestSeamlessHoldsTheRouteOutOfPicksAcrossTheChangeover(t *testing.T) {
 		t.Fatalf("in-flight holders across the changeover = %d, want the pre-changeover request intact", got)
 	}
 
+	// Releasing the parked probe lets verification finish and the changeover
+	// settle; the commit then closes it.
+	ips.releasePark()
 	waitFor(t, "rotation committed", 5*time.Second, func() bool { return s.e.Rotations() == 1 })
 	<-done
 
@@ -722,26 +730,32 @@ func TestSeamlessHoldsTheRouteOutOfPicksAcrossTheChangeover(t *testing.T) {
 
 // A hold never outlives its own procedure, including the one path that ends a
 // rotation without settling the changeover: shutdown cancels the context between
-// steps, the engine calls Readmit, and the route must be serving when the
-// process stops rotating it. Without the release in Readmit the route would sit
-// out of picks until the hold's deadline — up to ChangeoverTimeout — after the
-// rotation was already abandoned.
+// steps and the route must be serving when the process stops rotating it.
+// Without a release on that path the route would sit out of picks until the
+// hold's deadline — up to ChangeoverTimeout — after the rotation was already
+// abandoned.
+//
+// What this pins is the abort outcome, not which call performs the release:
+// Settle closes a changeover the procedure reached, and Readmit covers the ones
+// it never reached, so a cancellation landing between them is released either
+// way. Readmit's own release is covered by TestSeamlessReadmitReleasesAnOpenHold.
 func TestSeamlessHoldIsReleasedWhenTheProcedureIsInterrupted(t *testing.T) {
 	ips := newIPServer(t, "203.0.113.7")
 	api := newAPIServer(t)
-	gate := make(chan struct{})
-	var gateOnce sync.Once
-	openGate := func() { gateOnce.Do(func() { close(gate) }) }
-	// Opened by the test's cleanup even on an early Fatal, so the parked handler
-	// returns and httptest.Server.Close is not left waiting on it. A cleanup
-	// registered here runs before the servers' own, LIFO, so the engine is
-	// cancelled before the API server is torn down.
-	t.Cleanup(openGate)
+	// The rotate call returns at once and reports the swap. It runs before
+	// HoldTraffic, so a procedure waiting to enter verification is waiting for a
+	// changeover that has already opened — which is the state under test, and is
+	// exactly why the wait is on the probe rather than on this call.
 	api.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		ips.set("198.51.100.9")
-		<-gate
 		w.WriteHeader(http.StatusOK)
 	})
+	// The first probe after the rotate call is the baseline probe, which runs
+	// before the changeover opens; the second is verification, which runs after
+	// it. Parking that second one holds the procedure inside the changeover, and
+	// the route's own 600ms ip-check budget is then the only thing that could end
+	// it — so the wait below reads a barrier, not a deadline.
+	verifying := ips.parkArm(1)
 	spec := manualRoute(t, "m1.test", time.Hour, apiSpec(api))
 	cfg := &config.RuntimeConfig{Rotation: modeSettings(config.RotationModeSeamless),
 		ManualRoutes: []config.ManualRouteSpec{spec}}
@@ -756,10 +770,18 @@ func TestSeamlessHoldIsReleasedWhenTheProcedureIsInterrupted(t *testing.T) {
 		defer close(done)
 		s.e.runProcedure(ctx, s.gen, spec, p, routeID(spec.RouteSpec))
 	}()
-	// Let the rotate call return so the changeover opens, then cancel with the
-	// hold open. The gate is never opened, so nothing can settle this changeover:
-	// the unwind has to go through Readmit or the route stays held.
-	waitFor(t, "the changeover hold to open", 5*time.Second, func() bool { return p.RotationHeld() })
+	// Verification cannot begin before the changeover opens, so this returns with
+	// the hold open. The probe is never released before the cancel, so nothing can
+	// settle this changeover: the unwind has to return the route to picks or it
+	// stays held.
+	select {
+	case <-verifying:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the procedure to enter verification")
+	}
+	if !p.RotationHeld() {
+		t.Fatal("the changeover did not open a hold by the time verification began")
+	}
 	cancel()
 	select {
 	case <-done:
