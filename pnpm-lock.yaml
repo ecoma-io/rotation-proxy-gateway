@@ -177,7 +177,7 @@ importers:
         version: 2.1.14
       prettier:
         specifier: ^3.9.8
-        version: 3.9.9
+        version: 3.9.10
 
 packages:
 
@@ -596,8 +596,8 @@ packages:
   picocolors@1.1.1:
     resolution: {integrity: sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==}
 
-  prettier@3.9.9:
-    resolution: {integrity: sha512-Z/CJHIkdujO/OtN7nXUii0Rf3VT5SRuhjBA82Xvu2XhBUgX3nhP67T0LHceBdQLex7OOFGTox+Q5Yg8Jk2Qivg==}
+  prettier@3.9.10:
+    resolution: {integrity: sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==}
     engines: {node: '>=14'}
     hasBin: true
 
@@ -1014,7 +1014,7 @@ snapshots:
 
   picocolors@1.1.1: {}
 
-  prettier@3.9.9: {}
+  prettier@3.9.10: {}
 
   require-from-string@2.0.2: {}
 
